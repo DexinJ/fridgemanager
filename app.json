@@ -1,42 +1,72 @@
 {
   "expo": {
-    "name": "fridge-manager",
-    "slug": "fridge-manager",
+    "name": "Pantrio",
+    "slug": "pantrio",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "fridgemanager",
+
+    "scheme": "pantrio",
+
+    "owner": "dexjin",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
+
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "useAppleSignIn": true,
+      "bundleIdentifier": "com.chilltech.pantrio",
+      "googleServicesFile": "./GoogleService-Info.plist",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
+
     "android": {
+      "package": "com.chilltech.pantrio",
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
-        "backgroundColor": "#ffffff"
+        "backgroundColor": "#0A8E91"
       },
       "edgeToEdgeEnabled": true
     },
+
     "web": {
       "bundler": "metro",
       "output": "static",
       "favicon": "./assets/images/favicon.png"
     },
+
     "plugins": [
       "expo-router",
+      [
+        "@react-native-google-signin/google-signin",
+        {
+          "iosUrlScheme": "com.googleusercontent.apps.430585833748-qrjms4s5d60ul0q29hvv6l0et964p54l",
+          "iosClientId": "430585833748-qrjms4s5d60ul0q29hvv6l0et964p54l.apps.googleusercontent.com"
+        }
+      ],
       [
         "expo-splash-screen",
         {
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 200,
           "resizeMode": "contain",
-          "backgroundColor": "#ffffff"
+          "backgroundColor": "#0A8E91"
         }
-      ]
+      ],  
+      "@react-native-community/datetimepicker".
     ],
+
     "experiments": {
       "typedRoutes": true
+    },
+
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "7f8ce4a6-59fd-424d-8827-3d3ecc35882d"
+      }
     }
   }
 }
