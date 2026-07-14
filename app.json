@@ -8,10 +8,9 @@
     "scheme": "pantrio",
     "owner": "dexjin",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
-      "useAppleSignIn": true,
+      "usesAppleSignIn": true,
       "bundleIdentifier": "com.chilltech.pantrio",
       "googleServicesFile": "./GoogleService-Info.plist",
       "infoPlist": {
@@ -23,8 +22,7 @@
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#0A8E91"
-      },
-      "edgeToEdgeEnabled": true
+      }
     },
     "web": {
       "bundler": "metro",
@@ -33,6 +31,7 @@
     },
     "plugins": [
       "expo-router",
+      "expo-apple-authentication",
       [
         "@react-native-google-signin/google-signin",
         {
@@ -50,7 +49,22 @@
         }
       ],
       "@react-native-community/datetimepicker",
-      "expo-build-properties"
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "useFrameworks": "dynamic"
+          }
+        }
+      ],
+      "expo-font",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Allow Pantrio to record audio.",
+          "enableBackgroundRecording": false
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true

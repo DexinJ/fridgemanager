@@ -1,119 +1,262 @@
 import { Ionicons } from "@expo/vector-icons";
-import { Audio } from "expo-av";
+import {
+  AudioModule,
+  RecordingPresets,
+  setAudioModeAsync,
+  useAudioRecorder,
+  useAudioRecorderState,
+} from "expo-audio";
 import { useContext, useState } from "react";
 import {
+  ActivityIndicator,
+  Alert,
+  Platform,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
   View,
 } from "react-native";
+import { auth } from "../auth/firebaseClient";
 import { GlobalContext } from "../context/GlobalContext";
 import PlusMenu from "./PlusMenu";
 
+const API_URL = process.env.EXPO_PUBLIC_API_URL;
+
 export default function MessageInput({ value, onChangeText, onSend }) {
   const { settings, theme, receiving } = useContext(GlobalContext);
+
   const fontSize = settings?.ux?.fontSize || 16;
+
   const [voiceMode, setVoiceMode] = useState(false);
-  const [recording, setRecording] = useState(null);
+  const [transcribing, setTranscribing] = useState(false);
+
+  const audioRecorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+  const recorderState = useAudioRecorderState(audioRecorder);
+
+  const isBusy =
+    receiving ||
+    transcribing ||
+    recorderState.isRecording;
+
   const handleSendText = () => {
-    if (receiving) return;
-    if (value.trim().length === 0) return;
-    onSend({ text: value.trim(), imageUri: null, isUser: true });
+    if (receiving || transcribing) return;
+
+    const trimmedValue = value.trim();
+
+    if (!trimmedValue) return;
+
+    onSend({
+      text: trimmedValue,
+      imageUri: null,
+      isUser: true,
+    });
+
     onChangeText("");
   };
 
   const handleSendImage = (imageData) => {
-    if (receiving) return;
+    if (receiving || transcribing) return;
     onSend(imageData);
   };
+
   const startRecording = async () => {
+    if (receiving || transcribing || recorderState.isRecording) {
+      return;
+    }
+
     try {
-      // Ask for mic permission
-      const { granted } = await Audio.requestPermissionsAsync();
-      if (!granted) {
-        alert("Permission to access microphone is required!");
+      const permission =
+        await AudioModule.requestRecordingPermissionsAsync();
+
+      if (!permission.granted) {
+        Alert.alert(
+          "Microphone permission required",
+          "Please allow microphone access to use voice messages."
+        );
         return;
       }
-  
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
+
+      await setAudioModeAsync({
+        allowsRecording: true,
+        playsInSilentMode: true,
       });
-  
-      console.log("🎙️ Starting recording...");
-      const newRecording = new Audio.Recording();
-      await newRecording.prepareToRecordAsync(
-        Audio.RECORDING_OPTIONS_PRESET_HIGH_QUALITY
+
+      await audioRecorder.prepareToRecordAsync();
+      audioRecorder.record();
+    } catch (error) {
+      console.error("Failed to start recording:", error);
+
+      Alert.alert(
+        "Recording error",
+        "Pantrio could not start recording. Please try again."
       );
-      await newRecording.startAsync();
-  
-      setRecording(newRecording);
-    } catch (err) {
-      console.error("Failed to start recording", err);
     }
   };
-  
-  const stopRecordingAndTranscribe = async (onSend) => {
-    console.log("🛑 Stopping recording...");
+
+  const stopRecordingAndTranscribe = async () => {
+    if (!recorderState.isRecording) {
+      return;
+    }
+
     try {
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-      setRecording(null);
+      await audioRecorder.stop();
+
+      const uri = audioRecorder.uri;
+
+      await setAudioModeAsync({
+        allowsRecording: false,
+        playsInSilentMode: true,
+      });
+
+      if (!uri) {
+        throw new Error("The recording did not produce a file.");
+      }
+
+      await transcribeAudio(uri);
+    } catch (error) {
+      console.error("Failed to stop or transcribe recording:", error);
+
+      Alert.alert(
+        "Voice message error",
+        error instanceof Error
+          ? error.message
+          : "The recording could not be processed."
+      );
+    }
+  };
+
+  const transcribeAudio = async (uri) => {
+    if (!API_URL) {
+      throw new Error("EXPO_PUBLIC_API_URL is not configured.");
+    }
   
-      console.log("Recorded file stored at:", uri);
+    setTranscribing(true);
   
-      // Send to OpenAI Whisper API
+    try {
       const formData = new FormData();
+  
       formData.append("file", {
         uri,
-        type: "audio/m4a",
-        name: "recording.m4a",
-      });
-      formData.append("model", "whisper-1");
-  
-      const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.EXPO_PUBLIC_OPENAI_KEY}`,
-        },
-        body: formData,
+        type: Platform.OS === "web" ? "audio/webm" : "audio/m4a",
+        name:
+          Platform.OS === "web"
+            ? "recording.webm"
+            : "recording.m4a",
       });
   
-      const data = await response.json();
-      console.log("📝 Transcription result:", data);
+      // Get the current Firebase user
+      const user = auth.currentUser;
   
-      if (data.text) {
-        onSend({ text: data.text, imageUri: null, isUser: true });
+      if (!user) {
+        throw new Error(
+          "You must be signed in to use voice transcription."
+        );
       }
+  
+      // Get a fresh Firebase ID token
+      const token = await user.getIdToken();
+  
+      const response = await fetch(
+        `${API_URL}/api/transcriptions`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+          body: formData,
+        }
+      );
+  
+      const responseText = await response.text();
+  
+      let data;
+  
+      try {
+        data = JSON.parse(responseText);
+      } catch {
+        data = {
+          error: responseText || "Invalid server response.",
+        };
+      }
+  
+      if (!response.ok) {
+        throw new Error(
+          data?.error ||
+            data?.message ||
+            `Transcription failed with status ${response.status}.`
+        );
+      }
+  
+      const transcript = data?.text?.trim();
+  
+      if (!transcript) {
+        throw new Error(
+          "No speech was detected in the recording."
+        );
+      }
+  
+      onSend({
+        text: transcript,
+        imageUri: null,
+        isUser: true,
+      });
     } catch (error) {
-      console.error("Error stopping recording:", error);
+      console.error("Transcription failed:", error);
+  
+      Alert.alert(
+        "Voice Transcription",
+        error.message || "Failed to transcribe recording."
+      );
+    } finally {
+      setTranscribing(false);
     }
   };
-  // Voice recording logic placeholder
+
   const handlePressIn = async () => {
     await startRecording();
   };
-  
+
   const handlePressOut = async () => {
-    await stopRecordingAndTranscribe(onSend);
+    await stopRecordingAndTranscribe();
   };
+
+  const leaveVoiceMode = async () => {
+    if (recorderState.isRecording) {
+      try {
+        await audioRecorder.stop();
+      } catch (error) {
+        console.error("Failed to cancel recording:", error);
+      }
+    }
+
+    setVoiceMode(false);
+  };
+
+  const voiceButtonText = transcribing
+    ? "Transcribing..."
+    : recorderState.isRecording
+      ? "Release to Send"
+      : receiving
+        ? "Waiting..."
+        : "Hold to Talk";
 
   return (
     <View
       style={[
         styles.container,
-        { borderColor: theme.border, backgroundColor: theme.card },
+        {
+          borderColor: theme.border,
+          backgroundColor: theme.card,
+        },
       ]}
     >
-      {/* Plus menu passes images */}
       <PlusMenu onSend={handleSendImage} />
 
       {!voiceMode ? (
         <>
-          {/* Text input */}
           <TextInput
-          editable={!receiving}
+            editable={!receiving && !transcribing}
             style={[
               styles.input,
               {
@@ -126,17 +269,28 @@ export default function MessageInput({ value, onChangeText, onSend }) {
             ]}
             value={value}
             onChangeText={onChangeText}
-            placeholder={receiving ? "Waiting for response..." : "Type a message..."}
+            placeholder={
+              receiving
+                ? "Waiting for response..."
+                : transcribing
+                  ? "Transcribing..."
+                  : "Type a message..."
+            }
             placeholderTextColor={theme.textPlaceholder}
             returnKeyType="send"
             onSubmitEditing={handleSendText}
           />
 
-          {/* Mic button to switch to voice mode */}
           <TouchableOpacity
-            style={[styles.micButton, { backgroundColor: theme.actionButton }]}
+            style={[
+              styles.micButton,
+              {
+                backgroundColor: theme.actionButton,
+                opacity: receiving || transcribing ? 0.5 : 1,
+              },
+            ]}
             onPress={() => setVoiceMode(true)}
-            disabled={receiving}
+            disabled={receiving || transcribing}
           >
             <Ionicons
               name="mic"
@@ -147,36 +301,60 @@ export default function MessageInput({ value, onChangeText, onSend }) {
         </>
       ) : (
         <>
-          {/* Hold to talk button */}
           <TouchableOpacity
             style={[
               styles.voiceButton,
-              { backgroundColor: theme.inputBackground },
+              {
+                backgroundColor: theme.inputBackground,
+                borderColor: recorderState.isRecording
+                  ? theme.actionButton
+                  : theme.border,
+                opacity: receiving ? 0.5 : 1,
+              },
             ]}
             onPressIn={handlePressIn}
             onPressOut={handlePressOut}
-            disabled={receiving}
+            disabled={receiving || transcribing}
           >
-            <Text style={[styles.voiceText, { color: theme.text }]}>
-            {receiving ? "Sending..." : "Hold to Talk"}
-            </Text>
+            {transcribing ? (
+              <ActivityIndicator />
+            ) : (
+              <Text
+                style={[
+                  styles.voiceText,
+                  {
+                    color:
+                      theme.textPrimary ||
+                      theme.text ||
+                      theme.inputText,
+                  },
+                ]}
+              >
+                {voiceButtonText}
+              </Text>
+            )}
           </TouchableOpacity>
 
-          {/* Button to go back to typing mode */}
           <TouchableOpacity
-            style={[styles.micButton, { backgroundColor: theme.actionButton }]}
-            onPress={() => setVoiceMode(false)}
-            disabled={receiving}
+            style={[
+              styles.micButton,
+              {
+                backgroundColor: theme.actionButton,
+                opacity: isBusy ? 0.5 : 1,
+              },
+            ]}
+            onPress={leaveVoiceMode}
+            disabled={isBusy}
           >
-           {receiving?  (
-            <ActivityIndicator />
-           ) : (
-            <Ionicons
-              name="close-outline"
-              size={fontSize * 1.2}
-              color={theme.inputBackground}
-            />
-           )}
+            {transcribing ? (
+              <ActivityIndicator color={theme.inputBackground} />
+            ) : (
+              <Ionicons
+                name="close-outline"
+                size={fontSize * 1.2}
+                color={theme.inputBackground}
+              />
+            )}
           </TouchableOpacity>
         </>
       )}
@@ -207,6 +385,7 @@ const styles = StyleSheet.create({
   },
   voiceButton: {
     flex: 1,
+    borderWidth: 1,
     borderRadius: 20,
     marginHorizontal: 5,
     paddingVertical: 12,
