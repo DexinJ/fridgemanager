@@ -10,7 +10,7 @@ import { useGPTTools } from "./gptTools";
 import { addMessage, checkAndSummarize } from "./memoryManager";
 
 const BACKEND_WS_URL =
-  process.env.EXPO_PUBLIC_BACKEND_WS_URL || "ws://192.168.0.163:3000/chat";
+  process.env.EXPO_PUBLIC_WS_URL || "ws://192.168.0.163:3000/chat";
 
 const DEFAULT_MODEL = "gpt-5";
 

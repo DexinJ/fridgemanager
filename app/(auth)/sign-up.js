@@ -14,15 +14,15 @@ import {
 
 import { createUserWithEmailAndPassword } from "firebase/auth";
 
+import { signInWithApple } from "../../auth/appleAuth"; // ✅ CHANGED: Apple login helper
 import { auth } from "../../auth/firebaseClient";
 import {
   configureGoogleSignIn,
   signInWithGoogleNative,
 } from "../../auth/googleAuth";
-import { signInWithApple } from "../../auth/appleAuth"; // ✅ CHANGED: Apple login helper
 import { GlobalContext } from "../../context/GlobalContext";
 
-const BACKEND_HTTP_URL = "https://oversanguinely-metabolous-maxine.ngrok-free.dev";
+const BACKEND_HTTP_URL = env.EXPO_PUBLIC_API_BASE_URL || "https://oversanguinely-metabolous-maxine.ngrok-free.dev";
 
 async function saveUserProfileToBackend({ idToken, username }) {
   const resp = await fetch(`${BACKEND_HTTP_URL}/api/users`, {
