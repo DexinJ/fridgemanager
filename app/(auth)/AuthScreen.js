@@ -17,7 +17,7 @@ import {
 import { auth } from "../../auth/firebaseClient";
 
 // 🔧 Backend config (unchanged)
-const BACKEND_HTTP_URL = env.EXPO_PUBLIC_API_BASE_URL || "https://oversanguinely-metabolous-maxine.ngrok-free.dev";
+const BACKEND_HTTP_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "https://oversanguinely-metabolous-maxine.ngrok-free.dev";
   // process.env.EXPO_PUBLIC_BACKEND_HTTP_URL || "http://192.168.0.163:3000";
 
 async function saveUserProfileToBackend({ idToken, username }) {

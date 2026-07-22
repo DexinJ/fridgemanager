@@ -22,7 +22,7 @@ import {
 } from "../../auth/googleAuth";
 import { GlobalContext } from "../../context/GlobalContext";
 
-const BACKEND_HTTP_URL = env.EXPO_PUBLIC_API_BASE_URL || "https://oversanguinely-metabolous-maxine.ngrok-free.dev";
+const BACKEND_HTTP_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "https://oversanguinely-metabolous-maxine.ngrok-free.dev";
 
 async function saveUserProfileToBackend({ idToken, username }) {
   const resp = await fetch(`${BACKEND_HTTP_URL}/api/users`, {

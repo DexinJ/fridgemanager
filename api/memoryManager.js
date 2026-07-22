@@ -81,7 +81,7 @@ export async function clearChatData(setMessages, setSummary) {
 }
 
 // memoryManager.js (only the summarize functions shown)
-const BACKEND_HTTP_URL =process.env.EXPO_PUBLIC_API_BASE_URL || "https://oversanguinely-metabolous-maxine.ngrok-free.dev";
+const BACKEND_HTTP_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "https://oversanguinely-metabolous-maxine.ngrok-free.dev";
   // process.env.EXPO_PUBLIC_BACKEND_HTTP_URL || "http://192.168.0.163:3000";
 
 export async function summarizeHistory(messages, setSummary, setMessages) {

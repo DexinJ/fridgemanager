@@ -1,5 +1,4 @@
-import { useNavigation } from "@react-navigation/native";
-import { router } from "expo-router";
+import { router, useNavigation } from "expo-router";
 import React, { useCallback, useContext, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Alert, SectionList, StyleSheet, Text, View } from "react-native";
 import { useGpt } from "../../api/gpt";

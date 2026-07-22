@@ -7,6 +7,7 @@ import { PlainHeader } from "../../components/Header";
 import { GlobalContext } from "../../context/GlobalContext";
 
 function ThemedTabs() {
+  
   const {theme} = useContext(GlobalContext);
   const { loggedIn, loading } = useAuth();
   if (loading) return null;

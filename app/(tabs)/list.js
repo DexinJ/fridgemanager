@@ -3,7 +3,7 @@
 // It only adds search UI + filtering + sort-sheet modal (optional but matches your pattern).
 
 import { Ionicons } from "@expo/vector-icons";
-import { useNavigation } from "@react-navigation/native";
+import { useNavigation } from "expo-router";
 import React, { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Keyboard,
