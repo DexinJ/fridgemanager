@@ -67,7 +67,16 @@
       ],
       "expo-asset",
       "expo-image",
-      "expo-status-bar"
+      "expo-status-bar",
+      [
+        "@sentry/react-native/expo",
+        {
+          "url": "https://sentry.io/",
+          "project": "react-native",
+          "organization": "dexinjin",
+          "useNativeInit": true
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true

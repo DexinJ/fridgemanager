@@ -58,7 +58,7 @@ export default function HomeScreen() {
           <Text style={{ fontSize: fontSize, marginBottom: 20, textAlign: "center", color: theme.textSecondary }}>
             Here’s what’s happening in your fridge:
           </Text>
-
+      
           {/* Dashboard Cards */}
           <View style={{ width: "100%", marginBottom: 30 }}>
             <TouchableOpacity style={[styles.card, { backgroundColor: theme.card }]} onPress={() => router.push("/fridge")}>
