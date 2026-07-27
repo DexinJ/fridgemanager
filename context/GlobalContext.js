@@ -4,7 +4,14 @@
 // ✅ Username fetch + settings.user hydration now depend on authUser, not on useAuth.
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import React, { createContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, {
+  createContext,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useColorScheme } from "react-native";
 import { v4 as uuidv4 } from "uuid";
 import { clearChatData, loadChatData } from "../api/memoryManager";
@@ -12,21 +19,38 @@ import { clearChatData, loadChatData } from "../api/memoryManager";
 // ❌ REMOVED: import { useAuth } from "../auth/useAuth";
 
 // ✅ utils you pasted
-import { DEFAULT_ALMOST_EXPIRE_DAYS, getExpiryMeta } from "../utils/expiration";
-import { predictExpiresAtIso, toIsoOrNull } from "../utils/expiryPredictor";
-import { FOOD_TYPE_RULES, inferFoodTypeLabelFromName } from "../utils/foodTypeInference";
+import {
+  DEFAULT_ALMOST_EXPIRE_DAYS,
+  getExpiryMeta,
+} from "../utils/expiration";
+import {
+  predictExpiresAtIso,
+  toIsoOrNull,
+} from "../utils/expiryPredictor";
+import {
+  FOOD_TYPE_RULES,
+  inferFoodTypeLabelFromName,
+} from "../utils/foodTypeInference";
 import {
   buildTagMaps,
   makeDedupeTagsByType,
   makeLabelToTagId,
   makeReplaceTagByType,
 } from "../utils/itemTagLabels";
-import { migrateFridgeItems, migrateShoppingItems } from "../utils/migrations";
-import { buildTagById, findPresetTagId, normalizeToPresetTagIds } from "../utils/tags";
+import {
+  migrateFridgeItems,
+  migrateShoppingItems,
+} from "../utils/migrations";
+import {
+  buildTagById,
+  findPresetTagId,
+  normalizeToPresetTagIds,
+} from "../utils/tags";
 
 // ✅ Make sure you have this env set in Expo:
 // EXPO_PUBLIC_API_BASE_URL=http://192.168.0.163:3000
-const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "http://localhost:3000";
+const API_BASE_URL =
+  process.env.EXPO_PUBLIC_API_BASE_URL || "http://localhost:3000";
 
 export const GlobalContext = createContext();
 
@@ -38,19 +62,44 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   // --- Default settings ---
   const defaultSettings = useMemo(
     () => ({
-      ux: { systemTheme: true, darkMode: false, fontSize: 16 },
-      notifications: { turnOn: true, dailyReminders: true },
-      privacy: { incognito: false },
-      advanced: { modelChoice: "default" },
-      expiration: { expirationAlerts: true, remindDays: 5 },
-      user: { uid: null, name: "freeUser" },
+      ux: {
+        systemTheme: true,
+        darkMode: false,
+        fontSize: 16,
+      },
+      notifications: {
+        turnOn: true,
+        dailyReminders: true,
+      },
+      privacy: {
+        incognito: false,
+      },
+      advanced: {
+        modelChoice: "default",
+      },
+      expiration: {
+        expirationAlerts: true,
+        remindDays: 5,
+      },
+      user: {
+        uid: null,
+        name: "freeUser",
+      },
     }),
     []
   );
-  // ✅ store RAW data in state (we will compute `expired` at read-time)
+
+  // ✅ store RAW data in state
+  // We compute `expired` at read-time.
   const [fridgeItemsRaw, setFridgeItemsRaw] = useState([]);
   const [shoppingListItems, setShoppingListItems] = useState([]);
   const [settings, setSettings] = useState(defaultSettings);
+
+  // ✅ FIX 1:
+  // Prevent empty/default state from being saved before
+  // AsyncStorage finishes loading.
+  const [storageHydrated, setStorageHydrated] = useState(false);
+
   const [urgencyDays, setUrgencyDays] = useState({
     expired: 0,
     eat_first: 2,
@@ -59,64 +108,190 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     long_keeper: 180,
   });
 
-  // 🏷️ Preset tags ONLY (no user-created tags)
+  // 🏷️ Preset tags ONLY
   const PRESET_TAGS = useMemo(
     () => [
       // storage
-      { id: "t_storage_fridge", type: "storage", key: "fridge", label: "Fridge" },
-      { id: "t_storage_freezer", type: "storage", key: "freezer", label: "Freezer" },
-      { id: "t_storage_pantry", type: "storage", key: "pantry", label: "Pantry" },
+      {
+        id: "t_storage_fridge",
+        type: "storage",
+        key: "fridge",
+        label: "Fridge",
+      },
+      {
+        id: "t_storage_freezer",
+        type: "storage",
+        key: "freezer",
+        label: "Freezer",
+      },
+      {
+        id: "t_storage_pantry",
+        type: "storage",
+        key: "pantry",
+        label: "Pantry",
+      },
 
       // urgency buckets
-      { id: "t_urgency_expired", type: "urgency", key: "expired", label: "Expired" },
-      { id: "t_urgency_eat_first", type: "urgency", key: "eat_first", label: "Eat first" },
-      { id: "t_urgency_use_soon", type: "urgency", key: "use_soon", label: "Use soon" },
+      {
+        id: "t_urgency_expired",
+        type: "urgency",
+        key: "expired",
+        label: "Expired",
+      },
+      {
+        id: "t_urgency_eat_first",
+        type: "urgency",
+        key: "eat_first",
+        label: "Eat first",
+      },
+      {
+        id: "t_urgency_use_soon",
+        type: "urgency",
+        key: "use_soon",
+        label: "Use soon",
+      },
       {
         id: "t_urgency_lasts_a_while",
         type: "urgency",
         key: "lasts_a_while",
         label: "Lasts a while",
       },
-      { id: "t_urgency_long_keeper", type: "urgency", key: "long_keeper", label: "Long keeper" },
+      {
+        id: "t_urgency_long_keeper",
+        type: "urgency",
+        key: "long_keeper",
+        label: "Long keeper",
+      },
 
       // food types
-      { id: "t_food_produce", type: "food_type", key: "produce", label: "Produce" },
-      { id: "t_food_dairy", type: "food_type", key: "dairy", label: "Dairy" },
-      { id: "t_food_meat", type: "food_type", key: "meat", label: "Meat" },
-      { id: "t_food_seafood", type: "food_type", key: "seafood", label: "Seafood" },
-      { id: "t_food_prepared", type: "food_type", key: "prepared", label: "Prepared" },
-      { id: "t_food_condiment", type: "food_type", key: "condiment", label: "Condiments" },
-      { id: "t_food_beverage", type: "food_type", key: "beverage", label: "Beverages" },
-      { id: "t_food_snack", type: "food_type", key: "snack", label: "Snacks" },
-      { id: "t_food_bakery", type: "food_type", key: "bakery", label: "Bakery" },
-      { id: "t_food_frozen", type: "food_type", key: "frozen", label: "Frozen" },
+      {
+        id: "t_food_produce",
+        type: "food_type",
+        key: "produce",
+        label: "Produce",
+      },
+      {
+        id: "t_food_dairy",
+        type: "food_type",
+        key: "dairy",
+        label: "Dairy",
+      },
+      {
+        id: "t_food_meat",
+        type: "food_type",
+        key: "meat",
+        label: "Meat",
+      },
+      {
+        id: "t_food_seafood",
+        type: "food_type",
+        key: "seafood",
+        label: "Seafood",
+      },
+      {
+        id: "t_food_prepared",
+        type: "food_type",
+        key: "prepared",
+        label: "Prepared",
+      },
+      {
+        id: "t_food_condiment",
+        type: "food_type",
+        key: "condiment",
+        label: "Condiments",
+      },
+      {
+        id: "t_food_beverage",
+        type: "food_type",
+        key: "beverage",
+        label: "Beverages",
+      },
+      {
+        id: "t_food_snack",
+        type: "food_type",
+        key: "snack",
+        label: "Snacks",
+      },
+      {
+        id: "t_food_bakery",
+        type: "food_type",
+        key: "bakery",
+        label: "Bakery",
+      },
+      {
+        id: "t_food_frozen",
+        type: "food_type",
+        key: "frozen",
+        label: "Frozen",
+      },
 
       // state
-      { id: "t_state_opened", type: "state", key: "opened", label: "Opened" },
-      { id: "t_state_unopened", type: "state", key: "unopened", label: "Unopened" },
-      { id: "t_state_raw", type: "state", key: "raw", label: "Raw" },
-      { id: "t_state_cooked", type: "state", key: "cooked", label: "Cooked" },
-      { id: "t_state_cut", type: "state", key: "cut", label: "Cut" },
-      { id: "t_state_whole", type: "state", key: "whole", label: "Whole" },
+      {
+        id: "t_state_opened",
+        type: "state",
+        key: "opened",
+        label: "Opened",
+      },
+      {
+        id: "t_state_unopened",
+        type: "state",
+        key: "unopened",
+        label: "Unopened",
+      },
+      {
+        id: "t_state_raw",
+        type: "state",
+        key: "raw",
+        label: "Raw",
+      },
+      {
+        id: "t_state_cooked",
+        type: "state",
+        key: "cooked",
+        label: "Cooked",
+      },
+      {
+        id: "t_state_cut",
+        type: "state",
+        key: "cut",
+        label: "Cut",
+      },
+      {
+        id: "t_state_whole",
+        type: "state",
+        key: "whole",
+        label: "Whole",
+      },
     ],
     []
   );
 
-  // Keep tags in state for easy access in UI, but always treat them as preset.
+  // Keep tags in state for easy access in UI,
+  // but always treat them as preset.
   const [tags] = useState(PRESET_TAGS);
 
   // -----------------------------
-  // 🏷️ Tag indices + wrappers around utils/tags.js
+  // 🏷️ Tag indices
   // -----------------------------
   const tagById = useMemo(() => buildTagById(tags), [tags]);
 
   const normalizeCategoriesToTagIds = useCallback(
-    (categories) => normalizeToPresetTagIds({ categories, tags, tagById }),
+    (categories) =>
+      normalizeToPresetTagIds({
+        categories,
+        tags,
+        tagById,
+      }),
     [tags, tagById]
   );
 
   const resolvePresetTagId = useCallback(
-    (input) => findPresetTagId({ input, tags, tagById }),
+    (input) =>
+      findPresetTagId({
+        input,
+        tags,
+        tagById,
+      }),
     [tags, tagById]
   );
 
@@ -125,26 +300,32 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   // -----------------------------
   const allowedFoodTypeLabels = useMemo(() => {
     return (tags || [])
-      .filter((t) => t?.type === "food_type")
-      .map((t) => t.label)
+      .filter((tag) => tag?.type === "food_type")
+      .map((tag) => tag.label)
       .filter(Boolean);
   }, [tags]);
 
   const inferFoodTypeLabelFromNameSafe = useCallback(
-    (name) => inferFoodTypeLabelFromName(name, allowedFoodTypeLabels, FOOD_TYPE_RULES),
+    (name) =>
+      inferFoodTypeLabelFromName(
+        name,
+        allowedFoodTypeLabels,
+        FOOD_TYPE_RULES
+      ),
     [allowedFoodTypeLabels]
   );
 
-  // 🆕 Conversation state
+  // Conversation state
   const [messages, setMessages] = useState([]);
   const [summary, setSummary] = useState("");
   const [receiving, setReceiving] = useState(false);
   const [waiting, setWaiting] = useState(false);
 
-  // system theme from device
+  // System theme from device
   const systemScheme = useColorScheme();
 
-  // ✅ CHANGED: no useAuth() here; use authUser passed from _layout
+  // ✅ CHANGED:
+  // Use authUser passed from _layout.
   const user = authUser;
 
   // ---------------------------
@@ -207,55 +388,109 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     if (settings.ux.systemTheme) {
       setSettings((prev) => ({
         ...prev,
-        ux: { ...prev.ux, darkMode: systemScheme === "dark" },
+        ux: {
+          ...prev.ux,
+          darkMode: systemScheme === "dark",
+        },
       }));
     }
   }, [systemScheme, settings.ux.systemTheme]);
 
-  // --- Load local data on startup ---
+  // ---------------------------------------
+  // Load local data on startup
+  // ---------------------------------------
+
+  // ✅ FIX 2:
+  // Finish loading fridge items, shopping items,
+  // and settings before enabling saves.
   useEffect(() => {
+    let cancelled = false;
+
     const loadData = async () => {
       try {
-        await AsyncStorage.removeItem("hasOnboarded");
+        const [fridgeData, shoppingData, settingsData] =
+          await Promise.all([
+            AsyncStorage.getItem("@fridgeItems"),
+            AsyncStorage.getItem("@shoppingListItems"),
+            AsyncStorage.getItem("@appSettings"),
+          ]);
 
-        const [fridgeData, shoppingData, settingsData] = await Promise.all([
-          AsyncStorage.getItem("@fridgeItems"),
-          AsyncStorage.getItem("@shoppingListItems"),
-          AsyncStorage.getItem("@appSettings"),
-        ]);
+        if (cancelled) return;
 
-        if (fridgeData) setFridgeItemsRaw(migrateFridgeItems(JSON.parse(fridgeData)));
-        if (shoppingData) setShoppingListItems(migrateShoppingItems(JSON.parse(shoppingData)));
+        if (fridgeData) {
+          const parsedFridgeData = JSON.parse(fridgeData);
+
+          setFridgeItemsRaw(
+            migrateFridgeItems(parsedFridgeData)
+          );
+        }
+
+        if (shoppingData) {
+          const parsedShoppingData = JSON.parse(shoppingData);
+
+          setShoppingListItems(
+            migrateShoppingItems(parsedShoppingData)
+          );
+        }
 
         if (settingsData) {
-          const parsed = JSON.parse(settingsData);
+          const parsedSettings = JSON.parse(settingsData);
 
           setSettings((prev) => ({
             ...prev,
-            ...parsed,
-            ux: { ...prev.ux, ...(parsed.ux || {}) },
-            notifications: { ...prev.notifications, ...(parsed.notifications || {}) },
-            privacy: { ...prev.privacy, ...(parsed.privacy || {}) },
-            advanced: { ...prev.advanced, ...(parsed.advanced || {}) },
-            expiration: { ...prev.expiration, ...(parsed.expiration || {}) },
-            user: { ...prev.user, ...(parsed.user || {}) },
+            ...parsedSettings,
+            ux: {
+              ...prev.ux,
+              ...(parsedSettings.ux || {}),
+            },
+            notifications: {
+              ...prev.notifications,
+              ...(parsedSettings.notifications || {}),
+            },
+            privacy: {
+              ...prev.privacy,
+              ...(parsedSettings.privacy || {}),
+            },
+            advanced: {
+              ...prev.advanced,
+              ...(parsedSettings.advanced || {}),
+            },
+            expiration: {
+              ...prev.expiration,
+              ...(parsedSettings.expiration || {}),
+            },
+            user: {
+              ...prev.user,
+              ...(parsedSettings.user || {}),
+            },
           }));
         }
 
         await loadChatData(setMessages, setSummary);
-      } catch (e) {
-        console.error("Error loading data", e);
+      } catch (error) {
+        console.error("Error loading local data:", error);
       } finally {
-        chatHydratedRef.current = true;
-        chatLastSavedAtRef.current = Date.now();
+        if (!cancelled) {
+          chatHydratedRef.current = true;
+          chatLastSavedAtRef.current = Date.now();
+
+          // ✅ FIX 2:
+          // Saving is now allowed because startup loading
+          // has completed.
+          setStorageHydrated(true);
+        }
       }
     };
 
     loadData();
+
+    return () => {
+      cancelled = true;
+    };
   }, [defaultSettings]);
 
   // ---------------------------------------
-  // ✅ Smart chat saving (throttle + flush)
+  // Smart chat saving
   // ---------------------------------------
   useEffect(() => {
     if (!chatHydratedRef.current) return;
@@ -265,9 +500,16 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     const doSave = async () => {
       try {
         chatLastSavedAtRef.current = Date.now();
-        await AsyncStorage.setItem(KEY, JSON.stringify(messages));
-      } catch (e) {
-        console.warn("save @chatMessages failed:", e);
+
+        await AsyncStorage.setItem(
+          KEY,
+          JSON.stringify(messages)
+        );
+      } catch (error) {
+        console.warn(
+          "save @chatMessages failed:",
+          error
+        );
       }
     };
 
@@ -278,8 +520,12 @@ export const GlobalProvider = ({ children, authUser = null }) => {
 
     if (receiving) {
       const THROTTLE_MS = 800;
-      const elapsed = Date.now() - chatLastSavedAtRef.current;
-      const wait = Math.max(THROTTLE_MS - elapsed, 0);
+      const elapsed =
+        Date.now() - chatLastSavedAtRef.current;
+      const wait = Math.max(
+        THROTTLE_MS - elapsed,
+        0
+      );
 
       chatSaveTimerRef.current = setTimeout(() => {
         doSave();
@@ -304,14 +550,22 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     };
   }, [messages, receiving]);
 
-  // --- Fetch username from backend after login and store into settings.user ---
-  // ✅ CHANGED: depends on authUser (user from props), not on useAuth()
+  // ---------------------------------------
+  // Fetch username after login
+  // ---------------------------------------
   useEffect(() => {
     let cancelled = false;
 
     async function loadUserIntoSettings() {
       if (!user) {
-        setSettings((prev) => ({ ...prev, user: { uid: null, name: "freeUser" } }));
+        setSettings((prev) => ({
+          ...prev,
+          user: {
+            uid: null,
+            name: "freeUser",
+          },
+        }));
+
         return;
       }
 
@@ -319,22 +573,33 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         const token = await user.getIdToken();
         const uid = user.uid;
 
-        const resp = await fetch(`${API_BASE_URL}/api/users/${uid}`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        const response = await fetch(
+          `${API_BASE_URL}/api/users/${uid}`,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }
+        );
 
-        if (!resp.ok) {
+        if (!response.ok) {
           if (!cancelled) {
-            // keep uid but don't pretend we have a username
             setSettings((prev) => ({
               ...prev,
-              user: { ...prev.user, uid: user.uid, name: prev.user?.name || "freeUser" },
+              user: {
+                ...prev.user,
+                uid: user.uid,
+                name:
+                  prev.user?.name ||
+                  "freeUser",
+              },
             }));
           }
+
           return;
         }
 
-        const data = await resp.json();
+        const data = await response.json();
 
         if (!cancelled) {
           setSettings((prev) => ({
@@ -342,105 +607,230 @@ export const GlobalProvider = ({ children, authUser = null }) => {
             user: {
               ...prev.user,
               uid: data?.uid ?? user.uid,
-              name: data?.username ?? prev.user?.name ?? "freeUser",
+              name:
+                data?.username ??
+                prev.user?.name ??
+                "freeUser",
             },
           }));
         }
-      } catch (e) {
-        console.log("loadUserIntoSettings error:", e);
+      } catch (error) {
+        console.log(
+          "loadUserIntoSettings error:",
+          error
+        );
+
         if (!cancelled) {
           setSettings((prev) => ({
             ...prev,
-            user: { ...prev.user, uid: user.uid, name: prev.user?.name || "freeUser" },
+            user: {
+              ...prev.user,
+              uid: user.uid,
+              name:
+                prev.user?.name ||
+                "freeUser",
+            },
           }));
         }
       }
     }
 
     loadUserIntoSettings();
+
     return () => {
       cancelled = true;
     };
   }, [user]);
 
-  // --- Save all states whenever they change ---
-  // ✅ persist RAW fridge items only (no computed `expired`)
+  // ---------------------------------------
+  // Save fridge, shopping list, and settings
+  // ---------------------------------------
+
+  // ✅ FIX 3:
+  // Do not overwrite stored data with initial empty/default
+  // values during app startup.
   useEffect(() => {
-    AsyncStorage.setItem("@fridgeItems", JSON.stringify(fridgeItemsRaw));
-    AsyncStorage.setItem("@shoppingListItems", JSON.stringify(shoppingListItems));
-    AsyncStorage.setItem("@appSettings", JSON.stringify(settings));
-  }, [fridgeItemsRaw, shoppingListItems, settings]);
+    if (!storageHydrated) return;
+
+    const saveData = async () => {
+      try {
+        await Promise.all([
+          AsyncStorage.setItem(
+            "@fridgeItems",
+            JSON.stringify(fridgeItemsRaw)
+          ),
+          AsyncStorage.setItem(
+            "@shoppingListItems",
+            JSON.stringify(shoppingListItems)
+          ),
+          AsyncStorage.setItem(
+            "@appSettings",
+            JSON.stringify(settings)
+          ),
+        ]);
+      } catch (error) {
+        console.error(
+          "Error saving local data:",
+          error
+        );
+      }
+    };
+
+    saveData();
+  }, [
+    storageHydrated,
+    fridgeItemsRaw,
+    shoppingListItems,
+    settings,
+  ]);
 
   // --- Settings updater ---
-  const updateSetting = (section, key, value) => {
+  const updateSetting = (
+    section,
+    key,
+    value
+  ) => {
     setSettings((prev) => ({
       ...prev,
-      [section]: { ...prev[section], [key]: value },
+      [section]: {
+        ...prev[section],
+        [key]: value,
+      },
     }));
   };
 
   const setUsername = (name) => {
     setSettings((prev) => ({
       ...prev,
-      user: { ...prev.user, name: String(name || "freeUser") },
+      user: {
+        ...prev.user,
+        name: String(name || "freeUser"),
+      },
     }));
   };
 
   // -----------------------------
-  // ✅ Expiration status ON EACH ITEM (no derived lists)
+  // Expiration status on each item
   // -----------------------------
   const fridgeItems = useMemo(() => {
-    const { tagById, tagIdByKey } = buildTagMaps(tags || []);
-    const labelToTagId = makeLabelToTagId(tagIdByKey);
+    const {
+      tagById: mappedTagById,
+      tagIdByKey,
+    } = buildTagMaps(tags || []);
 
-    const replaceTagByType = makeReplaceTagByType(tagById);
-    const dedupeTagsByType = makeDedupeTagsByType(tagById);
+    const labelToTagId =
+      makeLabelToTagId(tagIdByKey);
 
-    return (fridgeItemsRaw || []).map((it) => {
-      const meta = getExpiryMeta(it?.expiresAt, ALMOST_EXPIRE_DAYS, urgencyDays);
-      const status = meta?.expired ? "expired" : meta?.almostExpired ? "almost" : "ok";
+    const replaceTagByType =
+      makeReplaceTagByType(mappedTagById);
 
-      const desiredUrgencyId = meta?.urgencyKey ? labelToTagId(meta.urgencyKey) : null;
+    const dedupeTagsByType =
+      makeDedupeTagsByType(mappedTagById);
 
-      const curTagIds = Array.isArray(it.tagIds) ? it.tagIds : [];
-      const nextTagIds = desiredUrgencyId
-        ? dedupeTagsByType(replaceTagByType(curTagIds, "urgency", desiredUrgencyId))
-        : dedupeTagsByType(curTagIds);
+    return (fridgeItemsRaw || []).map(
+      (item) => {
+        const meta = getExpiryMeta(
+          item?.expiresAt,
+          ALMOST_EXPIRE_DAYS,
+          urgencyDays
+        );
 
-      return {
-        ...it,
-        tagIds: nextTagIds, // visual-only urgency switch
-        expired: status,
-        urgencyKey: meta?.urgencyKey || null,
-      };
-    });
-  }, [fridgeItemsRaw, tags, getExpiryMeta, urgencyDays, ALMOST_EXPIRE_DAYS]);
+        const status = meta?.expired
+          ? "expired"
+          : meta?.almostExpired
+            ? "almost"
+            : "ok";
+
+        const desiredUrgencyId =
+          meta?.urgencyKey
+            ? labelToTagId(meta.urgencyKey)
+            : null;
+
+        const currentTagIds =
+          Array.isArray(item.tagIds)
+            ? item.tagIds
+            : [];
+
+        const nextTagIds =
+          desiredUrgencyId
+            ? dedupeTagsByType(
+                replaceTagByType(
+                  currentTagIds,
+                  "urgency",
+                  desiredUrgencyId
+                )
+              )
+            : dedupeTagsByType(
+                currentTagIds
+              );
+
+        return {
+          ...item,
+          tagIds: nextTagIds,
+          expired: status,
+          urgencyKey:
+            meta?.urgencyKey || null,
+        };
+      }
+    );
+  }, [
+    fridgeItemsRaw,
+    tags,
+    urgencyDays,
+  ]);
 
   // -----------------------------
-  // --- Fridge / Shopping helpers
+  // Fridge and shopping helpers
   // -----------------------------
-  const addToShoppingList = (name, quantity, categories) => {
-    const tagIds = normalizeCategoriesToTagIds(categories);
+  const addToShoppingList = (
+    name,
+    quantity,
+    categories
+  ) => {
+    const tagIds =
+      normalizeCategoriesToTagIds(
+        categories
+      );
+
     const now = new Date().toISOString();
 
     setShoppingListItems((prev) => [
       ...prev,
-      { id: uuidv4(), name, quantity, tagIds, createdAt: now, updatedAt: now },
+      {
+        id: uuidv4(),
+        name,
+        quantity,
+        tagIds,
+        createdAt: now,
+        updatedAt: now,
+      },
     ]);
   };
 
-  const addToFridge = (name, quantity, categories, expiresAt) => {
-    const tagIds = normalizeCategoriesToTagIds(categories);
-    const nowIso = new Date().toISOString();
+  const addToFridge = (
+    name,
+    quantity,
+    categories,
+    expiresAt
+  ) => {
+    const tagIds =
+      normalizeCategoriesToTagIds(
+        categories
+      );
 
-    let finalExpiresAt = toIsoOrNull(expiresAt);
+    const nowIso =
+      new Date().toISOString();
+
+    let finalExpiresAt =
+      toIsoOrNull(expiresAt);
 
     if (!finalExpiresAt) {
-      finalExpiresAt = predictExpiresAtIso({
-        createdAtIso: nowIso,
-        tagIds,
-        tagById,
-      });
+      finalExpiresAt =
+        predictExpiresAtIso({
+          createdAtIso: nowIso,
+          tagIds,
+          tagById,
+        });
     }
 
     setFridgeItemsRaw((prev) => [
@@ -458,44 +848,95 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   };
 
   const removeFromFridge = (id) => {
-    setFridgeItemsRaw((prev) => prev.filter((item) => item.id !== id));
+    setFridgeItemsRaw((prev) =>
+      prev.filter(
+        (item) => item.id !== id
+      )
+    );
   };
 
-  const removeFromShoppingList = (id) => {
-    setShoppingListItems((prev) => prev.filter((item) => item.id !== id));
+  const removeFromShoppingList = (
+    id
+  ) => {
+    setShoppingListItems((prev) =>
+      prev.filter(
+        (item) => item.id !== id
+      )
+    );
   };
 
-  const editFridgeItem = (id, updates = {}) => {
+  const editFridgeItem = (
+    id,
+    updates = {}
+  ) => {
     if (!id) return;
 
     setFridgeItemsRaw((prev) => {
-      const now = new Date().toISOString();
+      const now =
+        new Date().toISOString();
 
-      return prev.map((it) => {
-        if (it.id !== id) return it;
+      return prev.map((item) => {
+        if (item.id !== id) {
+          return item;
+        }
 
-        const nextName = updates.name !== undefined ? String(updates.name) : it.name;
-        const nextQty = updates.quantity !== undefined ? String(updates.quantity) : it.quantity;
+        const nextName =
+          updates.name !== undefined
+            ? String(updates.name)
+            : item.name;
 
-        let nextTagIds = Array.isArray(it.tagIds) ? it.tagIds : [];
-        if (updates.tagIds !== undefined) nextTagIds = normalizeCategoriesToTagIds(updates.tagIds);
-        else if (updates.categories !== undefined) nextTagIds = normalizeCategoriesToTagIds(updates.categories);
+        const nextQuantity =
+          updates.quantity !== undefined
+            ? String(updates.quantity)
+            : item.quantity;
+
+        let nextTagIds =
+          Array.isArray(item.tagIds)
+            ? item.tagIds
+            : [];
+
+        if (
+          updates.tagIds !== undefined
+        ) {
+          nextTagIds =
+            normalizeCategoriesToTagIds(
+              updates.tagIds
+            );
+        } else if (
+          updates.categories !== undefined
+        ) {
+          nextTagIds =
+            normalizeCategoriesToTagIds(
+              updates.categories
+            );
+        }
 
         let nextExpiresAt =
-          updates.expiresAt !== undefined ? toIsoOrNull(updates.expiresAt) : toIsoOrNull(it.expiresAt);
+          updates.expiresAt !== undefined
+            ? toIsoOrNull(
+                updates.expiresAt
+              )
+            : toIsoOrNull(
+                item.expiresAt
+              );
 
-        if (updates.expiresAt !== undefined && nextExpiresAt === null) {
-          nextExpiresAt = predictExpiresAtIso({
-            createdAtIso: it.createdAt || now,
-            tagIds: nextTagIds,
-            tagById,
-          });
+        if (
+          updates.expiresAt !== undefined &&
+          nextExpiresAt === null
+        ) {
+          nextExpiresAt =
+            predictExpiresAtIso({
+              createdAtIso:
+                item.createdAt || now,
+              tagIds: nextTagIds,
+              tagById,
+            });
         }
 
         return {
-          ...it,
+          ...item,
           name: nextName,
-          quantity: nextQty,
+          quantity: nextQuantity,
           tagIds: nextTagIds,
           expiresAt: nextExpiresAt,
           updatedAt: now,
@@ -504,148 +945,400 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     });
   };
 
-  const editShoppingListItem = (id, updates = {}) => {
+  const editShoppingListItem = (
+    id,
+    updates = {}
+  ) => {
     if (!id) return;
 
     setShoppingListItems((prev) => {
-      const now = new Date().toISOString();
+      const now =
+        new Date().toISOString();
 
-      return prev.map((it) => {
-        if (it.id !== id) return it;
+      return prev.map((item) => {
+        if (item.id !== id) {
+          return item;
+        }
 
-        const nextName = updates.name !== undefined ? String(updates.name) : it.name;
-        const nextQty = updates.quantity !== undefined ? String(updates.quantity) : it.quantity;
+        const nextName =
+          updates.name !== undefined
+            ? String(updates.name)
+            : item.name;
 
-        let nextTagIds = Array.isArray(it.tagIds) ? it.tagIds : [];
-        if (updates.tagIds !== undefined) nextTagIds = normalizeCategoriesToTagIds(updates.tagIds);
-        else if (updates.categories !== undefined) nextTagIds = normalizeCategoriesToTagIds(updates.categories);
+        const nextQuantity =
+          updates.quantity !== undefined
+            ? String(updates.quantity)
+            : item.quantity;
 
-        return { ...it, name: nextName, quantity: nextQty, tagIds: nextTagIds, updatedAt: now };
+        let nextTagIds =
+          Array.isArray(item.tagIds)
+            ? item.tagIds
+            : [];
+
+        if (
+          updates.tagIds !== undefined
+        ) {
+          nextTagIds =
+            normalizeCategoriesToTagIds(
+              updates.tagIds
+            );
+        } else if (
+          updates.categories !== undefined
+        ) {
+          nextTagIds =
+            normalizeCategoriesToTagIds(
+              updates.categories
+            );
+        }
+
+        return {
+          ...item,
+          name: nextName,
+          quantity: nextQuantity,
+          tagIds: nextTagIds,
+          updatedAt: now,
+        };
       });
     });
   };
 
   // -----------------------------
-  // ✅ Simple tag helpers for UI actions
+  // Preset-tag helpers
   // -----------------------------
-  const addPresetTagToItem = ({ list = "fridge", itemId, tagInput }) => {
-    const tagId = resolvePresetTagId(tagInput);
+  const addPresetTagToItem = ({
+    list = "fridge",
+    itemId,
+    tagInput,
+  }) => {
+    const tagId =
+      resolvePresetTagId(tagInput);
+
     if (!itemId || !tagId) return;
 
-    const apply = (it) => {
-      const cur = Array.isArray(it.tagIds) ? it.tagIds : [];
-      if (cur.includes(tagId)) return it;
-      return { ...it, tagIds: [...cur, tagId], updatedAt: new Date().toISOString() };
+    const apply = (item) => {
+      const currentTagIds =
+        Array.isArray(item.tagIds)
+          ? item.tagIds
+          : [];
+
+      if (
+        currentTagIds.includes(tagId)
+      ) {
+        return item;
+      }
+
+      return {
+        ...item,
+        tagIds: [
+          ...currentTagIds,
+          tagId,
+        ],
+        updatedAt:
+          new Date().toISOString(),
+      };
     };
 
     if (list === "shopping") {
-      setShoppingListItems((prev) => prev.map((it) => (it.id === itemId ? apply(it) : it)));
+      setShoppingListItems((prev) =>
+        prev.map((item) =>
+          item.id === itemId
+            ? apply(item)
+            : item
+        )
+      );
     } else {
-      setFridgeItemsRaw((prev) => prev.map((it) => (it.id === itemId ? apply(it) : it)));
+      setFridgeItemsRaw((prev) =>
+        prev.map((item) =>
+          item.id === itemId
+            ? apply(item)
+            : item
+        )
+      );
     }
   };
 
-  const removePresetTagFromItem = ({ list = "fridge", itemId, tagInput }) => {
-    const tagId = resolvePresetTagId(tagInput);
+  const removePresetTagFromItem = ({
+    list = "fridge",
+    itemId,
+    tagInput,
+  }) => {
+    const tagId =
+      resolvePresetTagId(tagInput);
+
     if (!itemId || !tagId) return;
 
-    const apply = (it) => {
-      const cur = Array.isArray(it.tagIds) ? it.tagIds : [];
-      if (!cur.includes(tagId)) return it;
-      return { ...it, tagIds: cur.filter((id) => id !== tagId), updatedAt: new Date().toISOString() };
+    const apply = (item) => {
+      const currentTagIds =
+        Array.isArray(item.tagIds)
+          ? item.tagIds
+          : [];
+
+      if (
+        !currentTagIds.includes(tagId)
+      ) {
+        return item;
+      }
+
+      return {
+        ...item,
+        tagIds:
+          currentTagIds.filter(
+            (id) => id !== tagId
+          ),
+        updatedAt:
+          new Date().toISOString(),
+      };
     };
 
     if (list === "shopping") {
-      setShoppingListItems((prev) => prev.map((it) => (it.id === itemId ? apply(it) : it)));
+      setShoppingListItems((prev) =>
+        prev.map((item) =>
+          item.id === itemId
+            ? apply(item)
+            : item
+        )
+      );
     } else {
-      setFridgeItemsRaw((prev) => prev.map((it) => (it.id === itemId ? apply(it) : it)));
+      setFridgeItemsRaw((prev) =>
+        prev.map((item) =>
+          item.id === itemId
+            ? apply(item)
+            : item
+        )
+      );
     }
   };
 
   // -----------------------------
-  // ✅ Streamliner: normalize name/qty + optionally retag food_type
+  // Streamline lists
   // -----------------------------
-  const streamlineLists = ({ scope = "both", retag = true, dryRun = false } = {}) => {
-    const wantShopping = scope === "shopping" || scope === "both";
-    const wantFridge = scope === "fridge" || scope === "both";
+  const streamlineLists = ({
+    scope = "both",
+    retag = true,
+    dryRun = false,
+  } = {}) => {
+    const wantShopping =
+      scope === "shopping" ||
+      scope === "both";
 
-    const normalizeName = (name) => String(name ?? "").trim().replace(/\s+/g, " ");
-    const normalizeQuantity = (qty) => String(qty ?? "").trim().replace(/\s+/g, " ");
+    const wantFridge =
+      scope === "fridge" ||
+      scope === "both";
+
+    const normalizeName = (name) =>
+      String(name ?? "")
+        .trim()
+        .replace(/\s+/g, " ");
+
+    const normalizeQuantity = (
+      quantity
+    ) =>
+      String(quantity ?? "")
+        .trim()
+        .replace(/\s+/g, " ");
 
     const isSameSet = (a, b) => {
-      const aa = Array.isArray(a) ? a : [];
-      const bb = Array.isArray(b) ? b : [];
-      if (aa.length !== bb.length) return false;
-      for (const id of aa) if (!bb.includes(id)) return false;
+      const first =
+        Array.isArray(a) ? a : [];
+
+      const second =
+        Array.isArray(b) ? b : [];
+
+      if (
+        first.length !== second.length
+      ) {
+        return false;
+      }
+
+      for (const id of first) {
+        if (!second.includes(id)) {
+          return false;
+        }
+      }
+
       return true;
     };
 
-    const replaceFoodTypeOnly = (tagIds, inferredLabel) => {
-      const inferredId = resolvePresetTagId(inferredLabel);
+    const replaceFoodTypeOnly = (
+      tagIds,
+      inferredLabel
+    ) => {
+      const inferredId =
+        resolvePresetTagId(
+          inferredLabel
+        );
+
       if (!inferredId) return null;
 
-      const current = Array.isArray(tagIds) ? tagIds : [];
-      const filtered = current.filter((id) => tagById.get(id)?.type !== "food_type");
-      return Array.from(new Set([...filtered, inferredId]));
+      const currentTagIds =
+        Array.isArray(tagIds)
+          ? tagIds
+          : [];
+
+      const filteredTagIds =
+        currentTagIds.filter(
+          (id) =>
+            tagById.get(id)?.type !==
+            "food_type"
+        );
+
+      return Array.from(
+        new Set([
+          ...filteredTagIds,
+          inferredId,
+        ])
+      );
     };
 
-    const changes = { shopping: [], fridge: [] };
+    const changes = {
+      shopping: [],
+      fridge: [],
+    };
 
-    const processOne = (listName, items) => {
-      for (const it of items) {
-        if (!it?.id) continue;
+    const processOne = (
+      listName,
+      items
+    ) => {
+      for (const item of items) {
+        if (!item?.id) continue;
 
-        const currentTags = Array.isArray(it.tagIds) ? it.tagIds : [];
-        const hasTags = currentTags.length > 0;
+        const currentTagIds =
+          Array.isArray(item.tagIds)
+            ? item.tagIds
+            : [];
 
-        const nextName = normalizeName(it.name);
-        const nextQty = normalizeQuantity(it.quantity);
+        const hasTags =
+          currentTagIds.length > 0;
 
-        let nextTags = currentTags;
+        const nextName =
+          normalizeName(item.name);
 
-        const inferred = inferFoodTypeLabelFromNameSafe(nextName);
-        const shouldApply = !!inferred && (retag || !hasTags);
+        const nextQuantity =
+          normalizeQuantity(
+            item.quantity
+          );
+
+        let nextTagIds =
+          currentTagIds;
+
+        const inferred =
+          inferFoodTypeLabelFromNameSafe(
+            nextName
+          );
+
+        const shouldApply =
+          Boolean(inferred) &&
+          (retag || !hasTags);
 
         if (shouldApply) {
-          const proposed = replaceFoodTypeOnly(currentTags, inferred);
-          if (proposed) nextTags = proposed;
+          const proposed =
+            replaceFoodTypeOnly(
+              currentTagIds,
+              inferred
+            );
+
+          if (proposed) {
+            nextTagIds = proposed;
+          }
         }
 
-        const nameChanged = nextName !== String(it.name ?? "");
-        const qtyChanged = nextQty !== String(it.quantity ?? "");
-        const tagsChanged = !isSameSet(currentTags, nextTags);
+        const nameChanged =
+          nextName !==
+          String(item.name ?? "");
 
-        if (nameChanged || qtyChanged || tagsChanged) {
+        const quantityChanged =
+          nextQuantity !==
+          String(item.quantity ?? "");
+
+        const tagsChanged =
+          !isSameSet(
+            currentTagIds,
+            nextTagIds
+          );
+
+        if (
+          nameChanged ||
+          quantityChanged ||
+          tagsChanged
+        ) {
           changes[listName].push({
-            id: it.id,
-            inferredFoodType: inferred || null,
-            before: { name: it.name, quantity: it.quantity, tagIds: currentTags },
-            after: { name: nextName, quantity: nextQty, tagIds: nextTags },
+            id: item.id,
+            inferredFoodType:
+              inferred || null,
+            before: {
+              name: item.name,
+              quantity:
+                item.quantity,
+              tagIds:
+                currentTagIds,
+            },
+            after: {
+              name: nextName,
+              quantity:
+                nextQuantity,
+              tagIds: nextTagIds,
+            },
           });
 
           if (!dryRun) {
             const patch = {
-              ...(nameChanged ? { name: nextName } : {}),
-              ...(qtyChanged ? { quantity: nextQty } : {}),
-              ...(tagsChanged ? { tagIds: nextTags } : {}),
+              ...(nameChanged
+                ? { name: nextName }
+                : {}),
+              ...(quantityChanged
+                ? {
+                    quantity:
+                      nextQuantity,
+                  }
+                : {}),
+              ...(tagsChanged
+                ? {
+                    tagIds:
+                      nextTagIds,
+                  }
+                : {}),
             };
 
-            if (listName === "shopping") editShoppingListItem(it.id, patch);
-            else editFridgeItem(it.id, patch);
+            if (
+              listName === "shopping"
+            ) {
+              editShoppingListItem(
+                item.id,
+                patch
+              );
+            } else {
+              editFridgeItem(
+                item.id,
+                patch
+              );
+            }
           }
         }
       }
     };
 
-    if (wantShopping) processOne("shopping", shoppingListItems);
-    if (wantFridge) processOne("fridge", fridgeItemsRaw);
+    if (wantShopping) {
+      processOne(
+        "shopping",
+        shoppingListItems
+      );
+    }
+
+    if (wantFridge) {
+      processOne(
+        "fridge",
+        fridgeItemsRaw
+      );
+    }
 
     return {
       scope,
       dryRun,
       changed: {
-        shopping: changes.shopping.length,
-        fridge: changes.fridge.length,
+        shopping:
+          changes.shopping.length,
+        fridge:
+          changes.fridge.length,
         details: changes,
       },
     };
@@ -665,10 +1358,19 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         "@chatSummary",
       ]);
 
-      await clearChatData(setMessages, setSummary);
-      console.log("All data cleared!");
-    } catch (e) {
-      console.error("Error clearing data", e);
+      await clearChatData(
+        setMessages,
+        setSummary
+      );
+
+      console.log(
+        "All data cleared!"
+      );
+    } catch (error) {
+      console.error(
+        "Error clearing data:",
+        error
+      );
     }
   };
 
@@ -681,7 +1383,8 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         tags,
 
         FOOD_TYPE_RULES,
-        inferFoodTypeLabelFromName: inferFoodTypeLabelFromNameSafe,
+        inferFoodTypeLabelFromName:
+          inferFoodTypeLabelFromNameSafe,
         streamlineLists,
 
         ALMOST_EXPIRE_DAYS,
@@ -705,7 +1408,8 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         editFridgeItem,
         editShoppingListItem,
 
-        normalizeToPresetTagIds: normalizeCategoriesToTagIds,
+        normalizeToPresetTagIds:
+          normalizeCategoriesToTagIds,
         addPresetTagToItem,
         removePresetTagFromItem,
 

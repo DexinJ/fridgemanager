@@ -1,10 +1,10 @@
 // app/_layout.js
+import * as Sentry from '@sentry/react-native';
 import { Stack } from "expo-router";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import "react-native-get-random-values";
 import { useAuth } from "../auth/useAuth";
 import { GlobalProvider } from "../context/GlobalContext";
-import * as Sentry from '@sentry/react-native';
 
 Sentry.init({
   dsn: 'https://9d707a565864181830d59147b126ac25@o4511787964432384.ingest.us.sentry.io/4511787964563456',
