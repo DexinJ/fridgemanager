@@ -784,7 +784,9 @@ git push origin feature/feature-name
 6. Open a pull request.
 
 ## Pantrio Support
+
 Email: jindexin6@gmail.com
+
 For bug reports, questions, or feedback, contact me by email or open a GitHub issue.
 
 ## License
