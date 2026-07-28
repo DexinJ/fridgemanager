@@ -7,22 +7,28 @@ import { useAuth } from "../auth/useAuth";
 import { GlobalProvider } from "../context/GlobalContext";
 
 Sentry.init({
-  dsn: 'https://9d707a565864181830d59147b126ac25@o4511787964432384.ingest.us.sentry.io/4511787964563456',
+  dsn: "https://9d707a565864181830d59147b126ac25@o4511787964432384.ingest.us.sentry.io/4511787964563456",
 
-  // Adds more context data to events (IP address, cookies, user, etc.)
-  // For more information, visit: https://docs.sentry.io/platforms/react-native/data-management/data-collected/
+  // Keep this only if you accept that error information may be
+  // linked to an account, IP address, or device.
   sendDefaultPii: true,
 
-  // Enable Logs
-  enableLogs: true,
+  // Prevent independent transmission of application logs.
+  enableLogs: false,
 
-  // Configure Session Replay
-  replaysSessionSampleRate: 0.1,
+  // Do not record ordinary sessions.
+  replaysSessionSampleRate: 0,
+
+  // Record replay context only when an error occurs.
   replaysOnErrorSampleRate: 1,
-  integrations: [Sentry.mobileReplayIntegration(), Sentry.feedbackIntegration()],
 
-  // uncomment the line below to enable Spotlight (https://spotlightjs.com)
-  // spotlight: __DEV__,
+  integrations: [
+    Sentry.mobileReplayIntegration({
+      maskAllText: true,
+      maskAllImages: true,
+      maskAllVectors: true,
+    }),
+  ],
 });
 
 export default Sentry.wrap(function Layout() {
