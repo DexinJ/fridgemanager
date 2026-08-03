@@ -61,6 +61,13 @@ const AI_PROVIDER_URLS = [
   { label: "Together AI", value: "https://api.together.xyz/v1" },
 ];
 
+const APPLE_AI_UNSUPPORTED_STATUSES = new Set([
+  "device_not_eligible",
+  "unsupported_os",
+  "unsupported_platform",
+  "development_build_required",
+]);
+
 export default function SettingsScreen() {
   const {
     settings,
@@ -100,10 +107,8 @@ export default function SettingsScreen() {
     settings?.advanced?.aiModel || "gpt-4o-mini"
   );
   const [aiProviderOpen, setAiProviderOpen] = useState(false);
-  const [aiProvider, setAiProvider] = useState(
-    settings?.advanced?.aiProvider ||
-      (settings?.advanced?.useCustomAi ? "custom" : "pantrio")
-  );
+  const aiProvider = settings?.advanced?.aiProvider ||
+    (settings?.advanced?.useCustomAi ? "custom" : "pantrio");
   const [appleAvailability, setAppleAvailability] = useState(null);
   const [checkingAppleAi, setCheckingAppleAi] = useState(false);
   const [savingAi, setSavingAi] = useState(false);
@@ -145,12 +150,20 @@ export default function SettingsScreen() {
   useEffect(() => {
     let active = true;
     getAppleIntelligenceAvailability().then((availability) => {
-      if (active) setAppleAvailability(availability);
+      if (!active) return;
+      setAppleAvailability(availability);
+      if (
+        aiProvider === "apple" &&
+        APPLE_AI_UNSUPPORTED_STATUSES.has(availability.status)
+      ) {
+        updateSetting("advanced", "aiProvider", "pantrio");
+        updateSetting("advanced", "useCustomAi", false);
+      }
     });
     return () => {
       active = false;
     };
-  }, []);
+  }, [aiProvider, updateSetting]);
 
   const selectAiProvider = async (nextProvider) => {
     if (nextProvider === "apple") {
@@ -172,7 +185,6 @@ export default function SettingsScreen() {
       }
     }
 
-    setAiProvider(nextProvider);
     updateSetting("advanced", "aiProvider", nextProvider);
     updateSetting("advanced", "useCustomAi", nextProvider === "custom");
   };
@@ -1048,17 +1060,38 @@ export default function SettingsScreen() {
                 { value: "pantrio", label: "Pantrio AI", detail: "Uses Pantrio's hosted AI service." },
                 { value: "apple", label: "Apple Intelligence", detail: appleAvailability?.reason || "Checking this device…" },
                 { value: "custom", label: "My own AI API", detail: "Uses an OpenAI-compatible provider and your API key." },
-              ].map((option) => (
+              ].map((option) => {
+                const appleUnsupported =
+                  option.value === "apple" &&
+                  APPLE_AI_UNSUPPORTED_STATUSES.has(appleAvailability?.status);
+                const disabled =
+                  option.value === "apple" &&
+                  (checkingAppleAi || !appleAvailability || appleUnsupported);
+
+                return (
                 <TouchableOpacity
                   key={option.value}
-                  style={stylesWithFont.aiProviderChoice}
+                  style={[
+                    stylesWithFont.aiProviderChoice,
+                    disabled && stylesWithFont.aiProviderChoiceDisabled,
+                  ]}
                   onPress={() => selectAiProvider(option.value)}
-                  disabled={checkingAppleAi && option.value === "apple"}
+                  disabled={disabled}
+                  accessibilityState={{
+                    disabled,
+                    selected: aiProvider === option.value,
+                  }}
                 >
                   <Ionicons
-                    name={aiProvider === option.value ? "radio-button-on" : "radio-button-off"}
+                    name={
+                      appleUnsupported
+                        ? "lock-closed-outline"
+                        : aiProvider === option.value
+                          ? "radio-button-on"
+                          : "radio-button-off"
+                    }
                     size={fontSize + 4}
-                    color={theme.accent}
+                    color={disabled ? theme.textSecondary : theme.accent}
                   />
                   <View style={stylesWithFont.aiProviderCopy}>
                     <Text style={stylesWithFont.aiProviderLabel}>{option.label}</Text>
@@ -1068,7 +1101,8 @@ export default function SettingsScreen() {
                     <ActivityIndicator size="small" color={theme.accent} />
                   ) : null}
                 </TouchableOpacity>
-              ))}
+                );
+              })}
             </View>
 
             {aiProvider === "custom" ? (
@@ -1362,6 +1396,9 @@ const dynamicStyles = (theme, fontSize) =>
       paddingVertical: 13,
       borderBottomWidth: StyleSheet.hairlineWidth,
       borderBottomColor: theme.border,
+    },
+    aiProviderChoiceDisabled: {
+      opacity: 0.5,
     },
     aiProviderCopy: {
       flex: 1,

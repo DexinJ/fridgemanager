@@ -48,6 +48,8 @@ import {
   normalizeToPresetTagIds,
 } from "../utils/tags";
 
+const AI_PROVIDER_VALUES = new Set(["pantrio", "apple", "custom"]);
+
 // ✅ Make sure you have this env set in Expo:
 // EXPO_PUBLIC_API_BASE_URL=http://192.168.0.163:3000
 const API_BASE_URL =
@@ -439,6 +441,14 @@ export const GlobalProvider = ({ children, authUser = null }) => {
 
         if (settingsData) {
           const parsedSettings = JSON.parse(settingsData);
+          const storedAdvanced = parsedSettings.advanced || {};
+          const restoredAiProvider = AI_PROVIDER_VALUES.has(
+            storedAdvanced.aiProvider
+          )
+            ? storedAdvanced.aiProvider
+            : storedAdvanced.useCustomAi
+              ? "custom"
+              : "pantrio";
 
           setSettings((prev) => ({
             ...prev,
@@ -457,7 +467,9 @@ export const GlobalProvider = ({ children, authUser = null }) => {
             },
             advanced: {
               ...prev.advanced,
-              ...(parsedSettings.advanced || {}),
+              ...storedAdvanced,
+              aiProvider: restoredAiProvider,
+              useCustomAi: restoredAiProvider === "custom",
             },
             expiration: {
               ...prev.expiration,
