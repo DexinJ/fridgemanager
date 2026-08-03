@@ -15,6 +15,7 @@ import React, {
 import { useColorScheme } from "react-native";
 import { v4 as uuidv4 } from "uuid";
 import { clearChatData, loadChatData } from "../api/memoryManager";
+import { clearCustomAiApiKey } from "../api/aiProviderSettings";
 
 // ❌ REMOVED: import { useAuth } from "../auth/useAuth";
 
@@ -75,7 +76,10 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         incognito: false,
       },
       advanced: {
-        modelChoice: "default",
+        aiProvider: "pantrio",
+        useCustomAi: false,
+        aiBaseUrl: "https://api.openai.com/v1",
+        aiModel: "gpt-4o-mini",
       },
       expiration: {
         expirationAlerts: true,
@@ -1357,6 +1361,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         "@chatMessages",
         "@chatSummary",
       ]);
+      await clearCustomAiApiKey();
 
       await clearChatData(
         setMessages,

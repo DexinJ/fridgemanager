@@ -8,11 +8,55 @@ import { GlobalContext } from "../context/GlobalContext";
 import { buildSystemMessage } from "./buildSystemMessage";
 import { useGPTTools } from "./gptTools";
 import { addMessage, checkAndSummarize } from "./memoryManager";
+import { getCustomAiApiKey } from "./aiProviderSettings";
+import { generateWithAppleIntelligence } from "../modules/apple-intelligence/src";
 
 const BACKEND_WS_URL =
   process.env.EXPO_PUBLIC_WS_URL || "ws://192.168.0.163:3000/chat";
 
 const DEFAULT_MODEL = "gpt-5";
+
+const objectSchema = (properties, required = []) => ({
+  type: "object",
+  properties,
+  ...(required.length ? { required } : {}),
+});
+
+const stringField = { type: "string" };
+const categoriesField = {
+  type: "object",
+  properties: {
+    storage: stringField,
+    urgency: stringField,
+    food_type: stringField,
+    state: stringField,
+  },
+  required: ["storage", "urgency", "food_type"],
+};
+
+const DIRECT_AI_TOOLS = [
+  ["addFridgeItem", "Add an item to the fridge.", objectSchema({ name: stringField, quantity: stringField, categories: categoriesField, expiresAt: stringField }, ["name", "categories", "expiresAt"])],
+  ["addShoppingItem", "Add an item to the shopping list.", objectSchema({ name: stringField, quantity: stringField, categories: categoriesField }, ["name", "categories"])],
+  ["removeFridgeItem", "Remove a named fridge item.", objectSchema({ name: stringField }, ["name"])],
+  ["removeShoppingItem", "Remove a named shopping-list item.", objectSchema({ name: stringField }, ["name"])],
+  ["findInFridge", "Find a named fridge item.", objectSchema({ name: stringField }, ["name"])],
+  ["findInShoppingList", "Find a named shopping-list item.", objectSchema({ name: stringField }, ["name"])],
+  ["getFridgeContents", "Get all fridge items.", objectSchema({})],
+  ["getShoppingListContents", "Get all shopping-list items.", objectSchema({})],
+  ["streamlineLists", "Normalize and optionally retag list items.", objectSchema({ scope: { type: "string", enum: ["shopping", "fridge", "both"] }, retag: { type: "boolean" }, dryRun: { type: "boolean" } })],
+  ["proposeAddAllToFridge", "Show a proposal for adding several items to the fridge.", objectSchema({ items: { type: "array", items: { type: "object" } }, title: stringField }, ["items"])],
+].map(([name, description, parameters]) => ({
+  type: "function",
+  function: { name, description, parameters },
+}));
+
+function assistantText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((part) => part?.text || "").join("");
+  }
+  return "";
+}
 
 // ✅ Convert your app messages into Chat Completions format
 // If a message has an image AND it is NOT the last message, replace image with "[image]"
@@ -130,7 +174,6 @@ export const useGpt = () => {
     fridgeItems,
     shoppingListItems,
     setMessages,
-    summary,
     setSummary,
     waiting,
     setWaiting,
@@ -351,6 +394,78 @@ export const useGpt = () => {
     });
   }
 
+  async function runCustomAi(messages) {
+    const apiKey = await getCustomAiApiKey();
+    const baseUrl = String(settings?.advanced?.aiBaseUrl || "").trim().replace(/\/+$/, "");
+    const model = String(settings?.advanced?.aiModel || "").trim();
+
+    if (!apiKey) throw new Error("Add an API key in Settings > Advanced.");
+    if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) throw new Error("The custom AI base URL is invalid.");
+    if (!model) throw new Error("Add a model name in Settings > Advanced.");
+
+    const conversation = [...messages];
+
+    for (let step = 0; step < 6; step += 1) {
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({ model, messages: conversation, tools: DIRECT_AI_TOOLS }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error?.message || data?.message || `AI provider request failed (${response.status}).`);
+      }
+
+      const message = data?.choices?.[0]?.message;
+      if (!message) throw new Error("The AI provider returned no message.");
+      conversation.push(message);
+
+      const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      if (!calls.length) return assistantText(message.content);
+
+      for (const call of calls) {
+        const name = call?.function?.name || "";
+        const parsed = safeJsonParse(call?.function?.arguments || "{}");
+        const handler = toolHandlers?.[name];
+        let result;
+        try {
+          result = handler
+            ? await handler(parsed.ok ? parsed.value : {})
+            : { error: `No handler for tool: ${name}` };
+        } catch (error) {
+          result = { error: error?.message || "Tool failed" };
+        }
+        conversation.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: JSON.stringify(result ?? {}),
+        });
+      }
+    }
+
+    throw new Error("The AI provider exceeded the tool-call limit.");
+  }
+
+  async function runAppleAi(messages, systemText) {
+    const prompt = messages
+      .filter((message) => message.role !== "system")
+      .map((message) => {
+        const content = typeof message.content === "string"
+          ? message.content
+          : assistantText(message.content);
+        return `${message.role}: ${content}`;
+      })
+      .join("\n\n");
+
+    return generateWithAppleIntelligence(
+      `${systemText}\n\nReply conversationally. If the user asks to change app data, explain that on-device actions are not supported yet.`,
+      prompt
+    );
+  }
+
   const streamMessage = async ({
     text,
     imageUri,
@@ -358,14 +473,17 @@ export const useGpt = () => {
     language = "en",
   }) => {
     // 1) Add user message locally
-    const token = auth.currentUser ? await auth.currentUser.getIdToken() : null;
-
     const updatedMessages = await addMessage(setMessages, {
       role: "user",
       text,
       imageUri,
     });
-    await checkAndSummarize(updatedMessages, setSummary);
+    // Custom-provider mode must never route summarization through our backend.
+    const selectedProvider = settings?.advanced?.aiProvider ||
+      (settings?.advanced?.useCustomAi ? "custom" : "pantrio");
+    if (selectedProvider === "pantrio") {
+      await checkAndSummarize(updatedMessages, setSummary);
+    }
 
     // 2) Build messages for backend (now includes image parts)
     const systemText = buildSystemMessage({
@@ -377,7 +495,32 @@ export const useGpt = () => {
     console.log("FE IMG:", img.slice(0, 30), "len=", img.length);
     const ccMessages = toChatCompletionsMessages(updatedMessages, systemText);
 
+    if (selectedProvider === "custom") {
+      const fullText = await runCustomAi(ccMessages);
+      setWaiting(false);
+      if (fullText) {
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: [{ type: "output_text", text: fullText }] },
+        ]);
+      }
+      return fullText;
+    }
+
+    if (selectedProvider === "apple") {
+      const fullText = await runAppleAi(ccMessages, systemText);
+      setWaiting(false);
+      if (fullText) {
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: [{ type: "output_text", text: fullText }] },
+        ]);
+      }
+      return fullText;
+    }
+
     // 3) Send start to backend
+    const token = auth.currentUser ? await auth.currentUser.getIdToken() : null;
     const ws = ensureWs();
     await waitWsOpen(ws);
 

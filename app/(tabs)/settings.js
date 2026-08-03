@@ -12,11 +12,13 @@
 import { Ionicons } from "@expo/vector-icons";
 import Slider from "@react-native-community/slider";
 import { useNavigation, useRouter } from "expo-router";
+import DropDownPicker from "react-native-dropdown-picker";
 import React, {
+  useCallback,
   useContext,
+  useEffect,
   useLayoutEffect,
   useMemo,
-  useRef,
   useState,
 } from "react";
 import {
@@ -25,6 +27,7 @@ import {
   Animated,
   Dimensions,
   Modal,
+  ScrollView,
   StyleSheet,
   Switch,
   Text,
@@ -33,15 +36,30 @@ import {
   View,
 } from "react-native";
 import { clearChatData } from "../../api/memoryManager";
+import {
+  getCustomAiApiKey,
+  setCustomAiApiKey,
+} from "../../api/aiProviderSettings";
 import { useAuth } from "../../auth/useAuth";
 import { HeaderWithHiddenButton } from "../../components/Header";
 import { GlobalContext } from "../../context/GlobalContext";
+import {
+  getAppleIntelligenceAvailability,
+  openAppleIntelligenceSettings,
+} from "../../modules/apple-intelligence/src";
 
 const { width } = Dimensions.get("window");
 
 // Put your API base URL somewhere central; adjust as needed.
 const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || "http://192.168.0.163:3000";
+
+const AI_PROVIDER_URLS = [
+  { label: "OpenAI", value: "https://api.openai.com/v1" },
+  { label: "OpenRouter", value: "https://openrouter.ai/api/v1" },
+  { label: "Groq", value: "https://api.groq.com/openai/v1" },
+  { label: "Together AI", value: "https://api.together.xyz/v1" },
+];
 
 export default function SettingsScreen() {
   const {
@@ -60,7 +78,7 @@ export default function SettingsScreen() {
   const { user, signOut, loggedIn } = useAuth();
 
   const [currentSubMenu, setCurrentSubMenu] = useState(null);
-  const anim = useRef(new Animated.Value(0)).current;
+  const [anim] = useState(() => new Animated.Value(0));
   const navigation = useNavigation();
   const [opened, setOpened] = useState(false);
 
@@ -74,6 +92,21 @@ export default function SettingsScreen() {
   );
   const [savingName, setSavingName] = useState(false);
   const [deletingAccount, setDeletingAccount] = useState(false);
+  const [aiApiKey, setAiApiKey] = useState("");
+  const [aiBaseUrl, setAiBaseUrl] = useState(
+    settings?.advanced?.aiBaseUrl || "https://api.openai.com/v1"
+  );
+  const [aiModel, setAiModel] = useState(
+    settings?.advanced?.aiModel || "gpt-4o-mini"
+  );
+  const [aiProviderOpen, setAiProviderOpen] = useState(false);
+  const [aiProvider, setAiProvider] = useState(
+    settings?.advanced?.aiProvider ||
+      (settings?.advanced?.useCustomAi ? "custom" : "pantrio")
+  );
+  const [appleAvailability, setAppleAvailability] = useState(null);
+  const [checkingAppleAi, setCheckingAppleAi] = useState(false);
+  const [savingAi, setSavingAi] = useState(false);
 
   const router = useRouter();
   const fontSize = settings?.ux?.fontSize ?? 16;
@@ -82,6 +115,93 @@ export default function SettingsScreen() {
     () => dynamicStyles(theme, fontSize),
     [theme, fontSize]
   );
+
+  const aiProviderItems = useMemo(() => {
+    const normalizedUrl = aiBaseUrl.trim().replace(/\/+$/, "");
+    if (!normalizedUrl || AI_PROVIDER_URLS.some((item) => item.value === normalizedUrl)) {
+      return AI_PROVIDER_URLS;
+    }
+    return [
+      { label: `Custom (${normalizedUrl})`, value: normalizedUrl },
+      ...AI_PROVIDER_URLS,
+    ];
+  }, [aiBaseUrl]);
+
+  useEffect(() => {
+    getCustomAiApiKey().then(setAiApiKey).catch(() => {});
+  }, []);
+
+  const checkAppleAi = useCallback(async () => {
+    setCheckingAppleAi(true);
+    try {
+      const availability = await getAppleIntelligenceAvailability();
+      setAppleAvailability(availability);
+      return availability;
+    } finally {
+      setCheckingAppleAi(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    getAppleIntelligenceAvailability().then((availability) => {
+      if (active) setAppleAvailability(availability);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const selectAiProvider = async (nextProvider) => {
+    if (nextProvider === "apple") {
+      const availability = await checkAppleAi();
+      if (!availability.available) {
+        if (availability.status === "not_enabled") {
+          Alert.alert(
+            "Turn on Apple Intelligence?",
+            `${availability.reason}\n\nOpen Settings, then go to Apple Intelligence & Siri to turn it on.`,
+            [
+              { text: "Not now", style: "cancel" },
+              { text: "Open Settings", onPress: openAppleIntelligenceSettings },
+            ]
+          );
+        } else {
+          Alert.alert("Apple Intelligence unavailable", availability.reason);
+        }
+        return;
+      }
+    }
+
+    setAiProvider(nextProvider);
+    updateSetting("advanced", "aiProvider", nextProvider);
+    updateSetting("advanced", "useCustomAi", nextProvider === "custom");
+  };
+
+  const saveAiProvider = async () => {
+    const baseUrl = aiBaseUrl.trim().replace(/\/+$/, "");
+    const model = aiModel.trim();
+    if (!/^https?:\/\//i.test(baseUrl)) {
+      Alert.alert("Invalid URL", "Enter a full HTTP or HTTPS API base URL.");
+      return;
+    }
+    if (!model || !aiApiKey.trim()) {
+      Alert.alert("Missing details", "Enter both a model name and API key.");
+      return;
+    }
+
+    setSavingAi(true);
+    try {
+      await setCustomAiApiKey(aiApiKey);
+      updateSetting("advanced", "aiBaseUrl", baseUrl);
+      updateSetting("advanced", "aiModel", model);
+      setAiBaseUrl(baseUrl);
+      Alert.alert("Saved", "Custom AI provider settings were saved securely.");
+    } catch (error) {
+      Alert.alert("Save failed", error?.message || "Could not save AI settings.");
+    } finally {
+      setSavingAi(false);
+    }
+  };
 
   const categories = [
     { key: "user", title: "Account", icon: "person-outline" },
@@ -271,7 +391,7 @@ export default function SettingsScreen() {
               }
 
               // Return to the authentication screen.
-              router.replace("/(auth)/AuthScreen");
+              router.replace("/(auth)/sign-in");
             } catch (e) {
               console.error("[delete account]", e);
 
@@ -299,7 +419,7 @@ export default function SettingsScreen() {
     }).start();
   };
 
-  const goBack = () => {
+  const goBack = useCallback(() => {
     setOpened(false);
 
     Animated.timing(anim, {
@@ -307,7 +427,7 @@ export default function SettingsScreen() {
       duration: 300,
       useNativeDriver: true,
     }).start(() => setCurrentSubMenu(null));
-  };
+  }, [anim]);
 
   useLayoutEffect(() => {
     navigation.setOptions({
@@ -319,7 +439,7 @@ export default function SettingsScreen() {
         />
       ),
     });
-  }, [navigation, opened, theme]);
+  }, [goBack, navigation, opened, theme]);
 
   const CustomButton = ({
     title,
@@ -330,17 +450,23 @@ export default function SettingsScreen() {
     <TouchableOpacity
       onPress={onPress}
       style={{
-        borderRadius: 6,
-        marginVertical: 5,
+        borderRadius: 12,
+        marginTop: 12,
+        paddingVertical: 12,
+        paddingHorizontal: 16,
         alignItems: "center",
+        justifyContent: "center",
+        backgroundColor: color ? `${color}18` : theme.actionButton,
+        borderWidth: color ? StyleSheet.hairlineWidth : 0,
+        borderColor: color || "transparent",
       }}
       disabled={!onPress}
     >
       <Text
         style={{
           fontSize: buttonFontSize,
-          color: color || theme.accent,
-          fontWeight: "600",
+          color: color || theme.actionButtonText || "#ffffff",
+          fontWeight: "700",
           opacity: onPress ? 1 : 0.6,
         }}
       >
@@ -350,18 +476,27 @@ export default function SettingsScreen() {
   );
 
   const renderMainMenu = () => (
-    <View style={{ width }}>
+    <ScrollView
+      style={stylesWithFont.menuPanel}
+      contentContainerStyle={stylesWithFont.mainMenu}
+      showsVerticalScrollIndicator={false}
+    >
+      <View style={stylesWithFont.menuIntro}>
+        <Text style={stylesWithFont.menuEyebrow}>PREFERENCES</Text>
+        <Text style={stylesWithFont.menuTitle}>Make Pantrio yours</Text>
+        <Text style={stylesWithFont.menuSubtitle}>
+          Manage your account, reminders, appearance, privacy, and AI provider.
+        </Text>
+      </View>
       {categories.map((cat) => (
         <TouchableOpacity
           key={cat.key}
           style={stylesWithFont.sectionHeader}
           onPress={() => openSubMenu(cat.key)}
         >
-          <Ionicons
-            name={cat.icon}
-            size={fontSize * 1.25}
-            color={theme.accent}
-          />
+          <View style={stylesWithFont.sectionIcon}>
+            <Ionicons name={cat.icon} size={fontSize * 1.25} color={theme.accent} />
+          </View>
 
           <Text style={stylesWithFont.sectionTitle}>
             {cat.title}
@@ -374,7 +509,7 @@ export default function SettingsScreen() {
           />
         </TouchableOpacity>
       ))}
-    </View>
+    </ScrollView>
   );
 
   // Urgency sliders: live update during sliding and monotonic clamp on release.
@@ -613,7 +748,7 @@ export default function SettingsScreen() {
                 <CustomButton
                   title="Log In/Sign Up"
                   onPress={() =>
-                    router.push("/(auth)/AuthScreen")
+                    router.push("/(auth)/sign-in")
                   }
                   fontSize={fontSize}
                   color={theme.danger}
@@ -903,16 +1038,93 @@ export default function SettingsScreen() {
       case "advanced":
         return (
           <View style={stylesWithFont.subMenu}>
-            <View style={stylesWithFont.settingRow}>
-              <Text style={stylesWithFont.label}>
-                Model Choice
+            <View style={stylesWithFont.settingColumn}>
+              <Text style={stylesWithFont.label}>Select AI</Text>
+              <Text style={stylesWithFont.helpText}>
+                Choose the AI Pantrio uses for chat and food planning.
               </Text>
 
-              <Text style={stylesWithFont.value}>
-                {settings?.advanced?.modelChoice ??
-                  "default"}
+              {[
+                { value: "pantrio", label: "Pantrio AI", detail: "Uses Pantrio's hosted AI service." },
+                { value: "apple", label: "Apple Intelligence", detail: appleAvailability?.reason || "Checking this device…" },
+                { value: "custom", label: "My own AI API", detail: "Uses an OpenAI-compatible provider and your API key." },
+              ].map((option) => (
+                <TouchableOpacity
+                  key={option.value}
+                  style={stylesWithFont.aiProviderChoice}
+                  onPress={() => selectAiProvider(option.value)}
+                  disabled={checkingAppleAi && option.value === "apple"}
+                >
+                  <Ionicons
+                    name={aiProvider === option.value ? "radio-button-on" : "radio-button-off"}
+                    size={fontSize + 4}
+                    color={theme.accent}
+                  />
+                  <View style={stylesWithFont.aiProviderCopy}>
+                    <Text style={stylesWithFont.aiProviderLabel}>{option.label}</Text>
+                    <Text style={stylesWithFont.helpText}>{option.detail}</Text>
+                  </View>
+                  {checkingAppleAi && option.value === "apple" ? (
+                    <ActivityIndicator size="small" color={theme.accent} />
+                  ) : null}
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            {aiProvider === "custom" ? (
+            <View style={stylesWithFont.settingColumn}>
+              <Text style={stylesWithFont.inputLabel}>API provider</Text>
+              <DropDownPicker
+                open={aiProviderOpen}
+                value={aiBaseUrl}
+                items={aiProviderItems}
+                setOpen={setAiProviderOpen}
+                setValue={setAiBaseUrl}
+                placeholder="Choose an API provider"
+                listMode="SCROLLVIEW"
+                style={stylesWithFont.dropdown}
+                dropDownContainerStyle={stylesWithFont.dropdownMenu}
+                textStyle={stylesWithFont.dropdownText}
+                placeholderStyle={stylesWithFont.dropdownPlaceholder}
+                arrowIconStyle={{ tintColor: theme.textSecondary }}
+                tickIconStyle={{ tintColor: theme.accent }}
+                zIndex={3000}
+              />
+              <Text style={stylesWithFont.selectedUrl}>{aiBaseUrl}</Text>
+
+              <Text style={stylesWithFont.inputLabel}>Model</Text>
+              <TextInput
+                style={stylesWithFont.aiInput}
+                value={aiModel}
+                onChangeText={setAiModel}
+                autoCapitalize="none"
+                autoCorrect={false}
+                placeholder="gpt-4o-mini"
+                placeholderTextColor={theme.textPlaceholder}
+              />
+
+              <Text style={stylesWithFont.inputLabel}>API key</Text>
+              <TextInput
+                style={stylesWithFont.aiInput}
+                value={aiApiKey}
+                onChangeText={setAiApiKey}
+                autoCapitalize="none"
+                autoCorrect={false}
+                secureTextEntry
+                placeholder="Your provider API key"
+                placeholderTextColor={theme.textPlaceholder}
+              />
+
+              <CustomButton
+                title={savingAi ? "Saving..." : "Save AI Provider"}
+                onPress={savingAi ? null : saveAiProvider}
+                fontSize={fontSize}
+              />
+              <Text style={stylesWithFont.securityText}>
+                Your key is stored in the secure device keychain and is sent only to the API base URL above.
               </Text>
             </View>
+            ) : null}
           </View>
         );
 
@@ -939,9 +1151,14 @@ export default function SettingsScreen() {
         {renderMainMenu()}
 
         {currentSubMenu && (
-          <View style={{ width }}>
+          <ScrollView
+            style={stylesWithFont.menuPanel}
+            contentContainerStyle={stylesWithFont.subMenuScroll}
+            showsVerticalScrollIndicator={false}
+            keyboardShouldPersistTaps="handled"
+          >
             {renderSubMenu(currentSubMenu)}
-          </View>
+          </ScrollView>
         )}
       </Animated.View>
     </View>
@@ -953,18 +1170,69 @@ const dynamicStyles = (theme, fontSize) =>
     sectionHeader: {
       flexDirection: "row",
       alignItems: "center",
-      paddingVertical: 15,
-      paddingHorizontal: 15,
+      paddingVertical: 13,
+      paddingHorizontal: 14,
       backgroundColor: theme.card,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-      borderBottomColor: theme.border,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: theme.border,
+      borderRadius: 16,
+      marginBottom: 10,
+      shadowColor: "#000",
+      shadowOffset: { width: 0, height: 2 },
+      shadowOpacity: 0.06,
+      shadowRadius: 8,
+      elevation: 2,
+    },
+
+    mainMenu: {
+      paddingHorizontal: 16,
+      paddingTop: 18,
+      paddingBottom: 36,
+    },
+    menuPanel: {
+      width,
+      flexGrow: 0,
+      flexShrink: 0,
+    },
+    menuIntro: {
+      paddingHorizontal: 4,
+      paddingBottom: 20,
+    },
+    menuEyebrow: {
+      fontSize: Math.max(10, fontSize - 5),
+      fontWeight: "800",
+      letterSpacing: 1.5,
+      color: theme.accent,
+      marginBottom: 7,
+    },
+    menuTitle: {
+      fontSize: fontSize + 8,
+      lineHeight: fontSize + 13,
+      fontWeight: "800",
+      color: theme.textPrimary,
+      marginBottom: 6,
+    },
+    menuSubtitle: {
+      fontSize: Math.max(13, fontSize - 1),
+      lineHeight: fontSize + 5,
+      color: theme.textSecondary,
+      width: "100%",
+      flexShrink: 1,
+    },
+    sectionIcon: {
+      width: 40,
+      height: 40,
+      borderRadius: 12,
+      alignItems: "center",
+      justifyContent: "center",
+      backgroundColor: `${theme.accent}18`,
     },
 
     sectionTitle: {
       flex: 1,
       fontSize,
       fontWeight: "600",
-      marginLeft: 10,
+      marginLeft: 12,
       color: theme.textPrimary,
     },
 
@@ -972,17 +1240,23 @@ const dynamicStyles = (theme, fontSize) =>
       flexDirection: "row",
       justifyContent: "space-between",
       alignItems: "center",
-      paddingHorizontal: 15,
-      paddingVertical: 12,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-      borderBottomColor: theme.border,
+      paddingHorizontal: 16,
+      paddingVertical: 15,
+      backgroundColor: theme.card,
+      borderRadius: 16,
+      marginBottom: 12,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: theme.border,
     },
 
     settingColumn: {
-      paddingHorizontal: 15,
-      paddingVertical: 12,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-      borderBottomColor: theme.border,
+      paddingHorizontal: 16,
+      paddingVertical: 16,
+      backgroundColor: theme.card,
+      borderRadius: 16,
+      marginBottom: 12,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: theme.border,
     },
 
     label: {
@@ -997,7 +1271,11 @@ const dynamicStyles = (theme, fontSize) =>
 
     subMenu: {
       flex: 1,
-      paddingTop: 20,
+    },
+    subMenuScroll: {
+      paddingHorizontal: 16,
+      paddingTop: 18,
+      paddingBottom: 40,
     },
 
     modalBackground: {
@@ -1021,6 +1299,78 @@ const dynamicStyles = (theme, fontSize) =>
       borderBottomColor: theme.border,
       marginBottom: 10,
       fontSize,
+      color: theme.textPrimary,
+    },
+    inputLabel: {
+      marginTop: 14,
+      marginBottom: 5,
+      fontSize: Math.max(12, fontSize - 2),
+      fontWeight: "600",
+      color: theme.textPrimary,
+    },
+    aiInput: {
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: theme.border,
+      borderRadius: 12,
+      paddingHorizontal: 12,
+      paddingVertical: 12,
+      fontSize,
+      color: theme.textPrimary,
+      backgroundColor: theme.background,
+    },
+    dropdown: {
+      minHeight: 48,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: theme.border,
+      borderRadius: 12,
+      paddingHorizontal: 12,
+      backgroundColor: theme.background,
+    },
+    dropdownMenu: {
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: theme.border,
+      borderRadius: 12,
+      backgroundColor: theme.card,
+    },
+    dropdownText: {
+      fontSize,
+      color: theme.textPrimary,
+    },
+    dropdownPlaceholder: {
+      color: theme.textPlaceholder,
+    },
+    selectedUrl: {
+      marginTop: 7,
+      paddingHorizontal: 2,
+      fontSize: Math.max(11, fontSize - 3),
+      color: theme.textSecondary,
+    },
+    helpText: {
+      fontSize: Math.max(12, fontSize - 2),
+      lineHeight: Math.max(17, fontSize + 3),
+      color: theme.textSecondary,
+    },
+    securityText: {
+      marginTop: 8,
+      fontSize: Math.max(11, fontSize - 3),
+      lineHeight: Math.max(16, fontSize + 1),
+      color: theme.textSecondary,
+    },
+    aiProviderChoice: {
+      flexDirection: "row",
+      alignItems: "center",
+      paddingVertical: 13,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: theme.border,
+    },
+    aiProviderCopy: {
+      flex: 1,
+      marginLeft: 12,
+    },
+    aiProviderLabel: {
+      marginBottom: 3,
+      fontSize,
+      fontWeight: "700",
       color: theme.textPrimary,
     },
   });
