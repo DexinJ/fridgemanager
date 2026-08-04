@@ -493,13 +493,6 @@ export default function SettingsScreen() {
       contentContainerStyle={stylesWithFont.mainMenu}
       showsVerticalScrollIndicator={false}
     >
-      <View style={stylesWithFont.menuIntro}>
-        <Text style={stylesWithFont.menuEyebrow}>PREFERENCES</Text>
-        <Text style={stylesWithFont.menuTitle}>Make Pantrio yours</Text>
-        <Text style={stylesWithFont.menuSubtitle}>
-          Manage your account, reminders, appearance, privacy, and AI provider.
-        </Text>
-      </View>
       {categories.map((cat) => (
         <TouchableOpacity
           key={cat.key}
@@ -1227,31 +1220,6 @@ const dynamicStyles = (theme, fontSize) =>
       width,
       flexGrow: 0,
       flexShrink: 0,
-    },
-    menuIntro: {
-      paddingHorizontal: 4,
-      paddingBottom: 20,
-    },
-    menuEyebrow: {
-      fontSize: Math.max(10, fontSize - 5),
-      fontWeight: "800",
-      letterSpacing: 1.5,
-      color: theme.accent,
-      marginBottom: 7,
-    },
-    menuTitle: {
-      fontSize: fontSize + 8,
-      lineHeight: fontSize + 13,
-      fontWeight: "800",
-      color: theme.textPrimary,
-      marginBottom: 6,
-    },
-    menuSubtitle: {
-      fontSize: Math.max(13, fontSize - 1),
-      lineHeight: fontSize + 5,
-      color: theme.textSecondary,
-      width: "100%",
-      flexShrink: 1,
     },
     sectionIcon: {
       width: 40,

@@ -9,7 +9,7 @@ import { buildSystemMessage } from "./buildSystemMessage";
 import { useGPTTools } from "./gptTools";
 import { addMessage, checkAndSummarize } from "./memoryManager";
 import { getCustomAiApiKey } from "./aiProviderSettings";
-import { generateWithAppleIntelligence } from "../modules/apple-intelligence/src";
+import { generateAppleIntelligenceToolTurn } from "../modules/apple-intelligence/src";
 
 const BACKEND_WS_URL =
   process.env.EXPO_PUBLIC_WS_URL || "ws://192.168.0.163:3000/chat";
@@ -450,20 +450,58 @@ export const useGpt = () => {
   }
 
   async function runAppleAi(messages, systemText) {
-    const prompt = messages
+    const conversation = messages
       .filter((message) => message.role !== "system")
-      .map((message) => {
-        const content = typeof message.content === "string"
+      .map((message) => ({
+        role: message.role,
+        content: typeof message.content === "string"
           ? message.content
-          : assistantText(message.content);
-        return `${message.role}: ${content}`;
-      })
-      .join("\n\n");
+          : assistantText(message.content),
+      }));
+    const toolDescriptions = DIRECT_AI_TOOLS.map(({ function: tool }) =>
+      `${tool.name}: ${tool.description} Arguments JSON Schema: ${JSON.stringify(tool.parameters)}`
+    ).join("\n");
+    const instructions = `${systemText}
 
-    return generateWithAppleIntelligence(
-      `${systemText}\n\nReply conversationally. If the user asks to change app data, explain that on-device actions are not supported yet.`,
-      prompt
-    );
+You can use the app tools listed below. Choose type "tool" whenever you need to read or change app data. Choose type "final" only when you can answer the user without another tool. Never claim that an action succeeded until its tool result says it succeeded. Use only an exact tool name from this list.
+
+${toolDescriptions}`;
+
+    for (let step = 0; step < 6; step += 1) {
+      const prompt = conversation
+        .map((message) => `${message.role}: ${message.content}`)
+        .join("\n\n");
+      const turn = await generateAppleIntelligenceToolTurn(instructions, prompt);
+      const type = String(turn?.type || "").trim().toLowerCase();
+
+      if (type !== "tool") return String(turn?.text || "").trim();
+
+      const name = String(turn?.name || "").trim();
+      const handler = toolHandlers?.[name];
+      const parsed = safeJsonParse(turn?.arguments || "{}");
+      let result;
+
+      try {
+        result = handler
+          ? await handler(parsed.ok && parsed.value && typeof parsed.value === "object"
+              ? parsed.value
+              : {})
+          : { error: `No handler for tool: ${name}` };
+      } catch (error) {
+        result = { error: error?.message || "Tool failed" };
+      }
+
+      conversation.push({
+        role: "assistant",
+        content: `Tool call: ${name}(${turn?.arguments || "{}"})`,
+      });
+      conversation.push({
+        role: "tool",
+        content: `${name} result: ${JSON.stringify(result ?? {})}`,
+      });
+    }
+
+    throw new Error("Apple Intelligence exceeded the tool-call limit.");
   }
 
   const streamMessage = async ({

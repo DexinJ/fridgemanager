@@ -3,6 +3,33 @@ import UIKit
 
 #if canImport(FoundationModels)
 import FoundationModels
+
+@available(iOS 26.0, *)
+@Generable
+private struct AppleIntelligenceTurn {
+  @Guide(
+    description: "The next step. Use tool when app data must be read or changed; otherwise use final.",
+    .anyOf(["tool", "final"])
+  )
+  var type: String
+
+  @Guide(
+    description: "For a tool step, the exact available tool name. For a final step, an empty string.",
+    .anyOf([
+      "", "addFridgeItem", "addShoppingItem", "removeFridgeItem",
+      "removeShoppingItem", "findInFridge", "findInShoppingList",
+      "getFridgeContents", "getShoppingListContents", "streamlineLists",
+      "proposeAddAllToFridge",
+    ])
+  )
+  var name: String
+
+  @Guide(description: "For a tool step, a valid JSON object containing the tool arguments. For a final step, use {}.")
+  var arguments: String
+
+  @Guide(description: "For a final step, the conversational answer to the user. For a tool step, an empty string.")
+  var text: String
+}
 #endif
 
 public final class AppleIntelligenceModule: Module {
@@ -29,6 +56,28 @@ public final class AppleIntelligenceModule: Module {
         let session = LanguageModelSession(instructions: instructions)
         let response = try await session.respond(to: prompt)
         return response.content
+      }
+      #endif
+      throw AppleIntelligenceException("Apple Intelligence requires iOS 26 or later.")
+    }
+
+    AsyncFunction("generateToolTurn") { (instructions: String, prompt: String) async throws -> [String: String] in
+      #if canImport(FoundationModels)
+      if #available(iOS 26.0, *) {
+        guard SystemLanguageModel.default.isAvailable else {
+          throw AppleIntelligenceException("Apple Intelligence is not available right now.")
+        }
+        let session = LanguageModelSession(instructions: instructions)
+        let response = try await session.respond(
+          to: prompt,
+          generating: AppleIntelligenceTurn.self
+        )
+        return [
+          "type": response.content.type,
+          "name": response.content.name,
+          "arguments": response.content.arguments,
+          "text": response.content.text,
+        ]
       }
       #endif
       throw AppleIntelligenceException("Apple Intelligence requires iOS 26 or later.")

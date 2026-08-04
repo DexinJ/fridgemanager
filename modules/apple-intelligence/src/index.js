@@ -38,3 +38,9 @@ export async function generateWithAppleIntelligence(instructions, prompt) {
   if (!module) throw new Error("Apple Intelligence is only available on iOS.");
   return module.generate(instructions, prompt);
 }
+
+export async function generateAppleIntelligenceToolTurn(instructions, prompt) {
+  const module = getNativeModule();
+  if (!module) throw new Error("Apple Intelligence is only available on iOS.");
+  return module.generateToolTurn(instructions, prompt);
+}
