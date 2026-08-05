@@ -5,6 +5,7 @@ import { GestureHandlerRootView } from "react-native-gesture-handler";
 import "react-native-get-random-values";
 import { useAuth } from "../auth/useAuth";
 import { GlobalProvider } from "../context/GlobalContext";
+import { AppleSubscriptionProvider } from "../context/SubscriptionContext";
 
 Sentry.init({
   dsn: "https://9d707a565864181830d59147b126ac25@o4511787964432384.ingest.us.sentry.io/4511787964563456",
@@ -39,18 +40,23 @@ export default Sentry.wrap(function Layout() {
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <GlobalProvider authUser={user}>
-      {/* Mount GlobalProvider only when logged in */}
-      {user ? (     
-          <Stack screenOptions={{ headerShown: false }}>
-            <Stack.Screen name="(tabs)" />
-          </Stack>     
-      ) : (
-        <Stack screenOptions={{ headerShown: false }}>
-          <Stack.Screen name="(auth)" />
-        </Stack>
-      )}
-       </GlobalProvider>
+      <AppleSubscriptionProvider
+        key={user?.uid || "signed-out"}
+        accountId={user?.uid || null}
+        enabled={!!user}
+      >
+        <GlobalProvider authUser={user}>
+          {user ? (
+            <Stack screenOptions={{ headerShown: false }}>
+              <Stack.Screen name="(tabs)" />
+            </Stack>
+          ) : (
+            <Stack screenOptions={{ headerShown: false }}>
+              <Stack.Screen name="(auth)" />
+            </Stack>
+          )}
+        </GlobalProvider>
+      </AppleSubscriptionProvider>
     </GestureHandlerRootView>
   );
 });

@@ -16,6 +16,7 @@ The client application provides the mobile interface, local data storage, Fireba
 * Light and dark themes
 * Configurable notifications and expiration reminders
 * Account profile management
+* Live Apple in-app subscription status and plan detection on iOS
 * Permanent account deletion
 * Local offline data storage
 * Chat history and memory management
@@ -89,6 +90,28 @@ EXPO_PUBLIC_WS_URL=wss://api.example.com/chat
 ```
 
 Do not include a trailing slash in `EXPO_PUBLIC_API_BASE_URL`.
+
+### Apple Subscription Detection
+
+Add every auto-renewable subscription product ID from App Store Connect as a
+comma-separated value:
+
+```env
+EXPO_PUBLIC_APPLE_SUBSCRIPTION_PRODUCT_IDS=com.chilltech.pantrio.pro.monthly,com.chilltech.pantrio.pro.yearly
+```
+
+The iOS client checks verified StoreKit 2 subscription status at startup and
+whenever the app returns to the foreground. While the app is running, it also
+listens for subscription-status and transaction changes. The Account settings
+screen shows the current status, localized product name, product ID, renewal
+behavior, and expiration date.
+
+This feature detects only in-app subscriptions that belong to Pantrio; it
+cannot inspect Apple Music, iCloud+, or subscriptions from other apps. It uses
+a local native Expo module, so test it in an iOS development, TestFlight, or
+App Store build rather than Expo Go. For authoritative updates while the app is
+terminated, configure App Store Server Notifications V2 and verify signed
+transactions in the backend.
 
 ### Local Network Development
 
