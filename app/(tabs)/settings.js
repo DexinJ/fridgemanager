@@ -26,6 +26,7 @@ import {
   Alert,
   Animated,
   Dimensions,
+  Linking,
   Modal,
   Platform,
   ScrollView,
@@ -55,6 +56,9 @@ const { width } = Dimensions.get("window");
 // Put your API base URL somewhere central; adjust as needed.
 const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || "http://192.168.0.163:3000";
+
+const APPLE_SUBSCRIPTIONS_URL =
+  "https://apps.apple.com/account/subscriptions";
 
 const AI_PROVIDER_URLS = [
   { label: "OpenAI", value: "https://api.openai.com/v1" },
@@ -128,7 +132,6 @@ export default function SettingsScreen() {
     subscription,
     loading: subscriptionLoading,
     error: subscriptionError,
-    refreshSubscription,
   } = useAppleSubscription();
 
   const [currentSubMenu, setCurrentSubMenu] = useState(null);
@@ -363,6 +366,17 @@ export default function SettingsScreen() {
         },
       },
     ]);
+  };
+
+  const openAppleSubscriptions = async () => {
+    try {
+      await Linking.openURL(APPLE_SUBSCRIPTIONS_URL);
+    } catch (error) {
+      Alert.alert(
+        "Could not open subscriptions",
+        error?.message || "Open your Apple Account subscriptions in the App Store."
+      );
+    }
   };
 
   /**
@@ -811,15 +825,11 @@ export default function SettingsScreen() {
 
                   <CustomButton
                     title={
-                      subscriptionLoading
-                        ? "Checking Subscription..."
-                        : "Refresh Subscription"
+                      subscription?.productId
+                        ? "Edit Subscription"
+                        : "Subscribe"
                     }
-                    onPress={
-                      subscriptionLoading
-                        ? null
-                        : () => refreshSubscription().catch(() => {})
-                    }
+                    onPress={openAppleSubscriptions}
                     fontSize={fontSize}
                     color={theme.accent}
                   />
@@ -1291,6 +1301,7 @@ export default function SettingsScreen() {
             style={stylesWithFont.menuPanel}
             contentContainerStyle={stylesWithFont.subMenuScroll}
             showsVerticalScrollIndicator={false}
+            automaticallyAdjustKeyboardInsets
             keyboardShouldPersistTaps="handled"
           >
             {renderSubMenu(currentSubMenu)}
