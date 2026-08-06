@@ -26,7 +26,9 @@ import {
   Alert,
   Animated,
   Dimensions,
+  Linking,
   Modal,
+  Platform,
   ScrollView,
   StyleSheet,
   Switch,
@@ -43,6 +45,7 @@ import {
 import { useAuth } from "../../auth/useAuth";
 import { HeaderWithHiddenButton } from "../../components/Header";
 import { GlobalContext } from "../../context/GlobalContext";
+import { useAppleSubscription } from "../../context/SubscriptionContext";
 import {
   getAppleIntelligenceAvailability,
   openAppleIntelligenceSettings,
@@ -53,6 +56,9 @@ const { width } = Dimensions.get("window");
 // Put your API base URL somewhere central; adjust as needed.
 const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || "http://192.168.0.163:3000";
+
+const APPLE_SUBSCRIPTIONS_URL =
+  "https://apps.apple.com/account/subscriptions";
 
 const AI_PROVIDER_URLS = [
   { label: "OpenAI", value: "https://api.openai.com/v1" },
@@ -67,6 +73,45 @@ const APPLE_AI_UNSUPPORTED_STATUSES = new Set([
   "unsupported_platform",
   "development_build_required",
 ]);
+
+const APPLE_SUBSCRIPTION_STATUS_LABELS = {
+  subscribed: "Active",
+  active: "Active",
+  in_grace_period: "Active — billing grace period",
+  grace_period: "Active — billing grace period",
+  in_billing_retry_period: "Billing issue",
+  billing_retry: "Billing issue",
+  expired: "Expired",
+  revoked: "Revoked",
+  not_subscribed: "No active subscription",
+  loading: "Checking subscription...",
+  unknown: "Status unavailable",
+  development_build_required: "Requires an iOS app build",
+  unsupported_platform: "Available on iOS",
+};
+
+function getSubscriptionStatusLabel(status) {
+  return APPLE_SUBSCRIPTION_STATUS_LABELS[status] || "Status unavailable";
+}
+
+function getSubscriptionName(subscription) {
+  if (subscription?.displayName) return subscription.displayName;
+  if (!subscription?.productId) return null;
+
+  const productName = subscription.productId.split(".").pop() || "";
+  return productName
+    .split(/[-_]/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function formatSubscriptionDate(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleDateString();
+}
 
 export default function SettingsScreen() {
   const {
@@ -83,6 +128,11 @@ export default function SettingsScreen() {
   } = useContext(GlobalContext);
 
   const { user, signOut, loggedIn } = useAuth();
+  const {
+    subscription,
+    loading: subscriptionLoading,
+    error: subscriptionError,
+  } = useAppleSubscription();
 
   const [currentSubMenu, setCurrentSubMenu] = useState(null);
   const [anim] = useState(() => new Animated.Value(0));
@@ -316,6 +366,17 @@ export default function SettingsScreen() {
         },
       },
     ]);
+  };
+
+  const openAppleSubscriptions = async () => {
+    try {
+      await Linking.openURL(APPLE_SUBSCRIPTIONS_URL);
+    } catch (error) {
+      Alert.alert(
+        "Could not open subscriptions",
+        error?.message || "Open your Apple Account subscriptions in the App Store."
+      );
+    }
   };
 
   /**
@@ -716,6 +777,64 @@ export default function SettingsScreen() {
                 User Name:{" "}
                 {settings?.user?.name ?? "freeUser"}
               </Text>
+
+              {Platform.OS === "ios" ? (
+                <View style={stylesWithFont.subscriptionCard}>
+                  <View style={stylesWithFont.subscriptionHeader}>
+                    <Ionicons
+                      name="card-outline"
+                      size={fontSize * 1.2}
+                      color={theme.accent}
+                    />
+                    <Text style={stylesWithFont.subscriptionTitle}>
+                      Apple subscription
+                    </Text>
+                    {subscriptionLoading ? (
+                      <ActivityIndicator size="small" color={theme.accent} />
+                    ) : null}
+                  </View>
+
+                  <Text style={stylesWithFont.subscriptionStatus}>
+                    {getSubscriptionStatusLabel(subscription?.status)}
+                  </Text>
+
+                  {getSubscriptionName(subscription) ? (
+                    <Text style={stylesWithFont.subscriptionPlan}>
+                      {getSubscriptionName(subscription)}
+                    </Text>
+                  ) : null}
+
+                  {subscription?.productId ? (
+                    <Text style={stylesWithFont.subscriptionDetail}>
+                      {subscription.productId}
+                    </Text>
+                  ) : null}
+
+                  {formatSubscriptionDate(subscription?.expirationDate) ? (
+                    <Text style={stylesWithFont.subscriptionDetail}>
+                      {subscription?.willAutoRenew ? "Renews" : "Expires"}{" "}
+                      {formatSubscriptionDate(subscription.expirationDate)}
+                    </Text>
+                  ) : null}
+
+                  {subscriptionError ? (
+                    <Text style={stylesWithFont.subscriptionError}>
+                      {subscriptionError}
+                    </Text>
+                  ) : null}
+
+                  <CustomButton
+                    title={
+                      subscription?.productId
+                        ? "Edit Subscription"
+                        : "Subscribe"
+                    }
+                    onPress={openAppleSubscriptions}
+                    fontSize={fontSize}
+                    color={theme.accent}
+                  />
+                </View>
+              ) : null}
 
               {loggedIn ? (
                 <>
@@ -1182,6 +1301,7 @@ export default function SettingsScreen() {
             style={stylesWithFont.menuPanel}
             contentContainerStyle={stylesWithFont.subMenuScroll}
             showsVerticalScrollIndicator={false}
+            automaticallyAdjustKeyboardInsets
             keyboardShouldPersistTaps="handled"
           >
             {renderSubMenu(currentSubMenu)}
@@ -1259,6 +1379,47 @@ const dynamicStyles = (theme, fontSize) =>
       marginBottom: 12,
       borderWidth: StyleSheet.hairlineWidth,
       borderColor: theme.border,
+    },
+
+    subscriptionCard: {
+      marginTop: 14,
+      padding: 14,
+      borderRadius: 14,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: theme.border,
+      backgroundColor: theme.background,
+    },
+    subscriptionHeader: {
+      flexDirection: "row",
+      alignItems: "center",
+    },
+    subscriptionTitle: {
+      flex: 1,
+      marginLeft: 8,
+      fontSize,
+      fontWeight: "700",
+      color: theme.textPrimary,
+    },
+    subscriptionStatus: {
+      marginTop: 12,
+      fontSize,
+      fontWeight: "700",
+      color: theme.accent,
+    },
+    subscriptionPlan: {
+      marginTop: 5,
+      fontSize,
+      color: theme.textPrimary,
+    },
+    subscriptionDetail: {
+      marginTop: 4,
+      fontSize: Math.max(11, fontSize - 3),
+      color: theme.textSecondary,
+    },
+    subscriptionError: {
+      marginTop: 8,
+      fontSize: Math.max(11, fontSize - 3),
+      color: theme.danger,
     },
 
     label: {
