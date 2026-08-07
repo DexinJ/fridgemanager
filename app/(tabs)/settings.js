@@ -25,6 +25,7 @@ import {
   Alert,
   Animated,
   Dimensions,
+  Linking,
   Modal,
   ScrollView,
   StyleSheet,
@@ -431,6 +432,18 @@ export default function SettingsScreen() {
     ]);
   };
 
+  const openAppleSubscriptions = async () => {
+    try {
+      await Linking.openURL(APPLE_SUBSCRIPTIONS_URL);
+    } catch (error) {
+      Alert.alert(
+        "Could not open subscriptions",
+        error?.message ||
+          "Open your Apple Account subscriptions in the App Store."
+      );
+    }
+  };
+
   /**
    * Sends an authenticated request to the backend.
    *
@@ -829,6 +842,17 @@ export default function SettingsScreen() {
                 User Name:{" "}
                 {settings?.user?.name ?? "freeUser"}
               </Text>
+
+              <CustomButton
+                title={
+                  subscription?.productId
+                    ? "Edit Subscription"
+                    : "Subscribe"
+                }
+                onPress={openAppleSubscriptions}
+                fontSize={fontSize}
+                color={theme.accent}
+              />
 
               {loggedIn ? (
                 <>
