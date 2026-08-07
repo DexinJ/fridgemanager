@@ -12,7 +12,6 @@
 import { Ionicons } from "@expo/vector-icons";
 import Slider from "@react-native-community/slider";
 import { useNavigation, useRouter } from "expo-router";
-import DropDownPicker from "react-native-dropdown-picker";
 import React, {
   useCallback,
   useContext,
@@ -26,23 +25,22 @@ import {
   Alert,
   Animated,
   Dimensions,
-  Linking,
   Modal,
-  Platform,
   ScrollView,
   StyleSheet,
   Switch,
   Text,
   TextInput,
   TouchableOpacity,
-  View,
+  View
 } from "react-native";
-import { clearChatData } from "../../api/memoryManager";
+import DropDownPicker from "react-native-dropdown-picker";
 import {
   getCustomAiProviderSettings,
   normalizeAiBaseUrl,
   setCustomAiProviderSettings,
 } from "../../api/aiProviderSettings";
+import { clearChatData } from "../../api/memoryManager";
 import { useAuth } from "../../auth/useAuth";
 import { HeaderWithHiddenButton } from "../../components/Header";
 import { GlobalContext } from "../../context/GlobalContext";
@@ -431,18 +429,6 @@ export default function SettingsScreen() {
         },
       },
     ]);
-  };
-
-  const openAppleSubscriptions = async () => {
-    try {
-      await Linking.openURL(APPLE_SUBSCRIPTIONS_URL);
-    } catch (error) {
-      Alert.alert(
-        "Could not open subscriptions",
-        error?.message ||
-          "Open your Apple Account subscriptions in the App Store."
-      );
-    }
   };
 
   /**
@@ -843,64 +829,6 @@ export default function SettingsScreen() {
                 User Name:{" "}
                 {settings?.user?.name ?? "freeUser"}
               </Text>
-
-              <View style={stylesWithFont.subscriptionCard}>
-                <View style={stylesWithFont.subscriptionHeader}>
-                  <Ionicons
-                    name="card-outline"
-                    size={fontSize * 1.2}
-                    color={theme.accent}
-                  />
-                  <Text style={stylesWithFont.subscriptionTitle}>
-                    Apple subscription
-                  </Text>
-                  {subscriptionLoading ? (
-                    <ActivityIndicator size="small" color={theme.accent} />
-                  ) : null}
-                </View>
-
-                <Text style={stylesWithFont.subscriptionStatus}>
-                  {getSubscriptionStatusLabel(subscription?.status)}
-                </Text>
-
-                {getSubscriptionName(subscription) ? (
-                  <Text style={stylesWithFont.subscriptionPlan}>
-                    {getSubscriptionName(subscription)}
-                  </Text>
-                ) : null}
-
-                {subscription?.productId ? (
-                  <Text style={stylesWithFont.subscriptionDetail}>
-                    {subscription.productId}
-                  </Text>
-                ) : null}
-
-                {formatSubscriptionDate(subscription?.expirationDate) ? (
-                  <Text style={stylesWithFont.subscriptionDetail}>
-                    {subscription?.willAutoRenew ? "Renews" : "Expires"}{" "}
-                    {formatSubscriptionDate(subscription.expirationDate)}
-                  </Text>
-                ) : null}
-
-                {subscriptionError ? (
-                  <Text style={stylesWithFont.subscriptionError}>
-                    {subscriptionError}
-                  </Text>
-                ) : null}
-
-                <CustomButton
-                  title={
-                    Platform.OS !== "ios"
-                      ? "Manage Apple Subscription"
-                      : subscription?.productId
-                      ? "Edit Subscription"
-                      : "Subscribe"
-                  }
-                  onPress={openAppleSubscriptions}
-                  fontSize={fontSize}
-                  color={theme.accent}
-                />
-              </View>
 
               {loggedIn ? (
                 <>
@@ -1370,6 +1298,7 @@ export default function SettingsScreen() {
             style={stylesWithFont.menuPanel}
             contentContainerStyle={stylesWithFont.subMenuScroll}
             showsVerticalScrollIndicator={false}
+            automaticallyAdjustKeyboardInsets
             keyboardShouldPersistTaps="handled"
           >
             {renderSubMenu(currentSubMenu)}
