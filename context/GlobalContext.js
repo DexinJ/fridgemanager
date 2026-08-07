@@ -15,7 +15,7 @@ import React, {
 import { useColorScheme } from "react-native";
 import { v4 as uuidv4 } from "uuid";
 import { clearChatData, loadChatData } from "../api/memoryManager";
-import { clearCustomAiApiKey } from "../api/aiProviderSettings";
+import { clearCustomAiProviderSettings } from "../api/aiProviderSettings";
 
 // ❌ REMOVED: import { useAuth } from "../auth/useAuth";
 
@@ -1373,7 +1373,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         "@chatMessages",
         "@chatSummary",
       ]);
-      await clearCustomAiApiKey();
+      await clearCustomAiProviderSettings();
 
       await clearChatData(
         setMessages,
@@ -1397,6 +1397,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         fridgeItems,
         shoppingListItems,
         settings,
+        storageHydrated,
         tags,
 
         FOOD_TYPE_RULES,

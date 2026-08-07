@@ -8,7 +8,7 @@ import { GlobalContext } from "../context/GlobalContext";
 import { buildSystemMessage } from "./buildSystemMessage";
 import { useGPTTools } from "./gptTools";
 import { addMessage, checkAndSummarize } from "./memoryManager";
-import { getCustomAiApiKey } from "./aiProviderSettings";
+import { getCustomAiProviderSettings } from "./aiProviderSettings";
 import { generateAppleIntelligenceToolTurn } from "../modules/apple-intelligence/src";
 
 const BACKEND_WS_URL =
@@ -171,6 +171,7 @@ function safeJsonParse(str) {
 export const useGpt = () => {
   const {
     settings,
+    storageHydrated,
     fridgeItems,
     shoppingListItems,
     setMessages,
@@ -395,9 +396,12 @@ export const useGpt = () => {
   }
 
   async function runCustomAi(messages) {
-    const apiKey = await getCustomAiApiKey();
     const baseUrl = String(settings?.advanced?.aiBaseUrl || "").trim().replace(/\/+$/, "");
-    const model = String(settings?.advanced?.aiModel || "").trim();
+    const configuredModel = String(settings?.advanced?.aiModel || "").trim();
+    const { apiKey, model } = await getCustomAiProviderSettings(baseUrl, {
+      migrateLegacy: storageHydrated,
+      fallbackModel: configuredModel,
+    });
 
     if (!apiKey) throw new Error("Add an API key in Settings > Advanced.");
     if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) throw new Error("The custom AI base URL is invalid.");

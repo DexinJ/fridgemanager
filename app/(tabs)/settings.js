@@ -26,7 +26,9 @@ import {
   Alert,
   Animated,
   Dimensions,
+  Linking,
   Modal,
+  Platform,
   ScrollView,
   StyleSheet,
   Switch,
@@ -37,12 +39,14 @@ import {
 } from "react-native";
 import { clearChatData } from "../../api/memoryManager";
 import {
-  getCustomAiApiKey,
-  setCustomAiApiKey,
+  getCustomAiProviderSettings,
+  normalizeAiBaseUrl,
+  setCustomAiProviderSettings,
 } from "../../api/aiProviderSettings";
 import { useAuth } from "../../auth/useAuth";
 import { HeaderWithHiddenButton } from "../../components/Header";
 import { GlobalContext } from "../../context/GlobalContext";
+import { useAppleSubscription } from "../../context/SubscriptionContext";
 import {
   getAppleIntelligenceAvailability,
   openAppleIntelligenceSettings,
@@ -53,6 +57,9 @@ const { width } = Dimensions.get("window");
 // Put your API base URL somewhere central; adjust as needed.
 const API_BASE_URL =
   process.env.EXPO_PUBLIC_API_BASE_URL || "http://192.168.0.163:3000";
+
+const APPLE_SUBSCRIPTIONS_URL =
+  "https://apps.apple.com/account/subscriptions";
 
 const AI_PROVIDER_URLS = [
   { label: "OpenAI", value: "https://api.openai.com/v1" },
@@ -68,9 +75,49 @@ const APPLE_AI_UNSUPPORTED_STATUSES = new Set([
   "development_build_required",
 ]);
 
+const APPLE_SUBSCRIPTION_STATUS_LABELS = {
+  subscribed: "Active",
+  active: "Active",
+  in_grace_period: "Active — billing grace period",
+  grace_period: "Active — billing grace period",
+  in_billing_retry_period: "Billing issue",
+  billing_retry: "Billing issue",
+  expired: "Expired",
+  revoked: "Revoked",
+  not_subscribed: "No active subscription",
+  loading: "Checking subscription...",
+  unknown: "Status unavailable",
+  development_build_required: "Requires an iOS app build",
+  unsupported_platform: "Available on iOS",
+};
+
+function getSubscriptionStatusLabel(status) {
+  return APPLE_SUBSCRIPTION_STATUS_LABELS[status] || "Status unavailable";
+}
+
+function getSubscriptionName(subscription) {
+  if (subscription?.displayName) return subscription.displayName;
+  if (!subscription?.productId) return null;
+
+  const productName = subscription.productId.split(".").pop() || "";
+  return productName
+    .split(/[-_]/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function formatSubscriptionDate(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleDateString();
+}
+
 export default function SettingsScreen() {
   const {
     settings,
+    storageHydrated,
     updateSetting,
     theme,
     clearAllData,
@@ -83,6 +130,11 @@ export default function SettingsScreen() {
   } = useContext(GlobalContext);
 
   const { user, signOut, loggedIn } = useAuth();
+  const {
+    subscription,
+    loading: subscriptionLoading,
+    error: subscriptionError,
+  } = useAppleSubscription();
 
   const [currentSubMenu, setCurrentSubMenu] = useState(null);
   const [anim] = useState(() => new Animated.Value(0));
@@ -100,12 +152,15 @@ export default function SettingsScreen() {
   const [savingName, setSavingName] = useState(false);
   const [deletingAccount, setDeletingAccount] = useState(false);
   const [aiApiKey, setAiApiKey] = useState("");
-  const [aiBaseUrl, setAiBaseUrl] = useState(
-    settings?.advanced?.aiBaseUrl || "https://api.openai.com/v1"
-  );
-  const [aiModel, setAiModel] = useState(
-    settings?.advanced?.aiModel || "gpt-4o-mini"
-  );
+  const [aiProviderSettingsBaseUrl, setAiProviderSettingsBaseUrl] = useState(null);
+  const configuredAiBaseUrl =
+    settings?.advanced?.aiBaseUrl || "https://api.openai.com/v1";
+  const configuredAiModel = settings?.advanced?.aiModel || "gpt-4o-mini";
+  const [aiBaseUrlDraft, setAiBaseUrlDraft] = useState(null);
+  const [aiModelDraft, setAiModelDraft] = useState(null);
+  const [aiProviderSettingsRevision, setAiProviderSettingsRevision] = useState(0);
+  const aiBaseUrl = aiBaseUrlDraft ?? configuredAiBaseUrl;
+  const aiModel = aiModelDraft ?? configuredAiModel;
   const [aiProviderOpen, setAiProviderOpen] = useState(false);
   const aiProvider = settings?.advanced?.aiProvider ||
     (settings?.advanced?.useCustomAi ? "custom" : "pantrio");
@@ -121,8 +176,22 @@ export default function SettingsScreen() {
     [theme, fontSize]
   );
 
+  const setAiBaseUrl = useCallback((nextValue) => {
+    setAiBaseUrlDraft((currentDraft) => {
+      const currentValue = currentDraft ?? configuredAiBaseUrl;
+      return typeof nextValue === "function"
+        ? nextValue(currentValue)
+        : nextValue;
+    });
+  }, [configuredAiBaseUrl]);
+
+  const normalizedAiBaseUrl = normalizeAiBaseUrl(aiBaseUrl);
+  const normalizedConfiguredAiBaseUrl = normalizeAiBaseUrl(configuredAiBaseUrl);
+  const loadingAiProviderSettings =
+    !storageHydrated || aiProviderSettingsBaseUrl !== normalizedAiBaseUrl;
+
   const aiProviderItems = useMemo(() => {
-    const normalizedUrl = aiBaseUrl.trim().replace(/\/+$/, "");
+    const normalizedUrl = normalizeAiBaseUrl(aiBaseUrl);
     if (!normalizedUrl || AI_PROVIDER_URLS.some((item) => item.value === normalizedUrl)) {
       return AI_PROVIDER_URLS;
     }
@@ -133,8 +202,40 @@ export default function SettingsScreen() {
   }, [aiBaseUrl]);
 
   useEffect(() => {
-    getCustomAiApiKey().then(setAiApiKey).catch(() => {});
-  }, []);
+    if (!storageHydrated) return undefined;
+
+    let active = true;
+
+    getCustomAiProviderSettings(normalizedAiBaseUrl, {
+      migrateLegacy: normalizedAiBaseUrl === normalizedConfiguredAiBaseUrl,
+      fallbackModel:
+        normalizedAiBaseUrl === normalizedConfiguredAiBaseUrl
+          ? configuredAiModel
+          : "",
+    })
+      .then((savedSettings) => {
+        if (!active) return;
+        setAiApiKey(savedSettings.apiKey);
+        setAiModelDraft(savedSettings.model);
+        setAiProviderSettingsBaseUrl(normalizedAiBaseUrl);
+      })
+      .catch(() => {
+        if (!active) return;
+        setAiApiKey("");
+        setAiModelDraft("");
+        setAiProviderSettingsBaseUrl(normalizedAiBaseUrl);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [
+    normalizedAiBaseUrl,
+    normalizedConfiguredAiBaseUrl,
+    configuredAiModel,
+    aiProviderSettingsRevision,
+    storageHydrated,
+  ]);
 
   const checkAppleAi = useCallback(async () => {
     setCheckingAppleAi(true);
@@ -190,7 +291,7 @@ export default function SettingsScreen() {
   };
 
   const saveAiProvider = async () => {
-    const baseUrl = aiBaseUrl.trim().replace(/\/+$/, "");
+    const baseUrl = normalizeAiBaseUrl(aiBaseUrl);
     const model = aiModel.trim();
     if (!/^https?:\/\//i.test(baseUrl)) {
       Alert.alert("Invalid URL", "Enter a full HTTP or HTTPS API base URL.");
@@ -203,16 +304,30 @@ export default function SettingsScreen() {
 
     setSavingAi(true);
     try {
-      await setCustomAiApiKey(aiApiKey);
+      await setCustomAiProviderSettings(baseUrl, {
+        apiKey: aiApiKey,
+        model,
+      });
       updateSetting("advanced", "aiBaseUrl", baseUrl);
       updateSetting("advanced", "aiModel", model);
-      setAiBaseUrl(baseUrl);
-      Alert.alert("Saved", "Custom AI provider settings were saved securely.");
+      Alert.alert(
+        "Saved",
+        "This provider's API key and model name were saved securely."
+      );
     } catch (error) {
       Alert.alert("Save failed", error?.message || "Could not save AI settings.");
     } finally {
       setSavingAi(false);
     }
+  };
+
+  const handleClearAllData = async () => {
+    await Promise.resolve(clearAllData?.());
+    setAiApiKey("");
+    setAiBaseUrlDraft(null);
+    setAiModelDraft(null);
+    setAiProviderSettingsBaseUrl(null);
+    setAiProviderSettingsRevision((revision) => revision + 1);
   };
 
   const categories = [
@@ -316,6 +431,18 @@ export default function SettingsScreen() {
         },
       },
     ]);
+  };
+
+  const openAppleSubscriptions = async () => {
+    try {
+      await Linking.openURL(APPLE_SUBSCRIPTIONS_URL);
+    } catch (error) {
+      Alert.alert(
+        "Could not open subscriptions",
+        error?.message ||
+          "Open your Apple Account subscriptions in the App Store."
+      );
+    }
   };
 
   /**
@@ -717,6 +844,64 @@ export default function SettingsScreen() {
                 {settings?.user?.name ?? "freeUser"}
               </Text>
 
+              <View style={stylesWithFont.subscriptionCard}>
+                <View style={stylesWithFont.subscriptionHeader}>
+                  <Ionicons
+                    name="card-outline"
+                    size={fontSize * 1.2}
+                    color={theme.accent}
+                  />
+                  <Text style={stylesWithFont.subscriptionTitle}>
+                    Apple subscription
+                  </Text>
+                  {subscriptionLoading ? (
+                    <ActivityIndicator size="small" color={theme.accent} />
+                  ) : null}
+                </View>
+
+                <Text style={stylesWithFont.subscriptionStatus}>
+                  {getSubscriptionStatusLabel(subscription?.status)}
+                </Text>
+
+                {getSubscriptionName(subscription) ? (
+                  <Text style={stylesWithFont.subscriptionPlan}>
+                    {getSubscriptionName(subscription)}
+                  </Text>
+                ) : null}
+
+                {subscription?.productId ? (
+                  <Text style={stylesWithFont.subscriptionDetail}>
+                    {subscription.productId}
+                  </Text>
+                ) : null}
+
+                {formatSubscriptionDate(subscription?.expirationDate) ? (
+                  <Text style={stylesWithFont.subscriptionDetail}>
+                    {subscription?.willAutoRenew ? "Renews" : "Expires"}{" "}
+                    {formatSubscriptionDate(subscription.expirationDate)}
+                  </Text>
+                ) : null}
+
+                {subscriptionError ? (
+                  <Text style={stylesWithFont.subscriptionError}>
+                    {subscriptionError}
+                  </Text>
+                ) : null}
+
+                <CustomButton
+                  title={
+                    Platform.OS !== "ios"
+                      ? "Manage Apple Subscription"
+                      : subscription?.productId
+                      ? "Edit Subscription"
+                      : "Subscribe"
+                  }
+                  onPress={openAppleSubscriptions}
+                  fontSize={fontSize}
+                  color={theme.accent}
+                />
+              </View>
+
               {loggedIn ? (
                 <>
                   <CustomButton
@@ -1001,7 +1186,7 @@ export default function SettingsScreen() {
                       {
                         text: "Clear",
                         style: "destructive",
-                        onPress: () => clearAllData(),
+                        onPress: handleClearAllData,
                       },
                     ]
                   );
@@ -1107,6 +1292,7 @@ export default function SettingsScreen() {
                 items={aiProviderItems}
                 setOpen={setAiProviderOpen}
                 setValue={setAiBaseUrl}
+                disabled={savingAi}
                 placeholder="Choose an API provider"
                 listMode="SCROLLVIEW"
                 style={stylesWithFont.dropdown}
@@ -1122,8 +1308,9 @@ export default function SettingsScreen() {
               <Text style={stylesWithFont.inputLabel}>Model</Text>
               <TextInput
                 style={stylesWithFont.aiInput}
-                value={aiModel}
-                onChangeText={setAiModel}
+                value={loadingAiProviderSettings ? "" : aiModel}
+                onChangeText={setAiModelDraft}
+                editable={!savingAi && !loadingAiProviderSettings}
                 autoCapitalize="none"
                 autoCorrect={false}
                 placeholder="gpt-4o-mini"
@@ -1133,8 +1320,9 @@ export default function SettingsScreen() {
               <Text style={stylesWithFont.inputLabel}>API key</Text>
               <TextInput
                 style={stylesWithFont.aiInput}
-                value={aiApiKey}
+                value={loadingAiProviderSettings ? "" : aiApiKey}
                 onChangeText={setAiApiKey}
+                editable={!savingAi && !loadingAiProviderSettings}
                 autoCapitalize="none"
                 autoCorrect={false}
                 secureTextEntry
@@ -1144,11 +1332,11 @@ export default function SettingsScreen() {
 
               <CustomButton
                 title={savingAi ? "Saving..." : "Save AI Provider"}
-                onPress={savingAi ? null : saveAiProvider}
+                onPress={savingAi || loadingAiProviderSettings ? null : saveAiProvider}
                 fontSize={fontSize}
               />
               <Text style={stylesWithFont.securityText}>
-                Your key is stored in the secure device keychain and is sent only to the API base URL above.
+                Each provider keeps its own model name and key in the secure device keychain. A key is sent only to the API base URL it was saved for.
               </Text>
             </View>
             ) : null}
@@ -1259,6 +1447,47 @@ const dynamicStyles = (theme, fontSize) =>
       marginBottom: 12,
       borderWidth: StyleSheet.hairlineWidth,
       borderColor: theme.border,
+    },
+
+    subscriptionCard: {
+      marginTop: 14,
+      padding: 14,
+      borderRadius: 14,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: theme.border,
+      backgroundColor: theme.background,
+    },
+    subscriptionHeader: {
+      flexDirection: "row",
+      alignItems: "center",
+    },
+    subscriptionTitle: {
+      flex: 1,
+      marginLeft: 8,
+      fontSize,
+      fontWeight: "700",
+      color: theme.textPrimary,
+    },
+    subscriptionStatus: {
+      marginTop: 12,
+      fontSize,
+      fontWeight: "700",
+      color: theme.accent,
+    },
+    subscriptionPlan: {
+      marginTop: 5,
+      fontSize,
+      color: theme.textPrimary,
+    },
+    subscriptionDetail: {
+      marginTop: 4,
+      fontSize: Math.max(11, fontSize - 3),
+      color: theme.textSecondary,
+    },
+    subscriptionError: {
+      marginTop: 8,
+      fontSize: Math.max(11, fontSize - 3),
+      color: theme.danger,
     },
 
     label: {
