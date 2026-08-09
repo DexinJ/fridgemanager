@@ -1,9 +1,14 @@
 // app/_layout.js
 import * as Sentry from '@sentry/react-native';
 import { Stack } from "expo-router";
+import { ActivityIndicator, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import "react-native-get-random-values";
 import { useAuth } from "../auth/useAuth";
+import {
+  AccountSessionProvider,
+  useAccountSession,
+} from "../context/AccountSessionContext";
 import { GlobalProvider } from "../context/GlobalContext";
 import { AppleSubscriptionProvider } from "../context/SubscriptionContext";
 
@@ -32,6 +37,32 @@ Sentry.init({
   ],
 });
 
+function AppNavigator({ user }) {
+  const { initializing: sessionInitializing } = useAccountSession();
+
+  // A failed load is exposed in Settings; only the initial attempt gates tabs.
+  if (user && sessionInitializing) {
+    return (
+      <View
+        style={{ flex: 1, alignItems: "center", justifyContent: "center" }}
+        accessibilityLabel="Checking account access"
+      >
+        <ActivityIndicator size="large" />
+      </View>
+    );
+  }
+
+  return user ? (
+    <Stack screenOptions={{ headerShown: false }}>
+      <Stack.Screen name="(tabs)" />
+    </Stack>
+  ) : (
+    <Stack screenOptions={{ headerShown: false }}>
+      <Stack.Screen name="(auth)" />
+    </Stack>
+  );
+}
+
 export default Sentry.wrap(function Layout() {
   const { user, loading } = useAuth();
 
@@ -45,17 +76,14 @@ export default Sentry.wrap(function Layout() {
         accountId={user?.uid || null}
         enabled={!!user}
       >
-        <GlobalProvider authUser={user}>
-          {user ? (
-            <Stack screenOptions={{ headerShown: false }}>
-              <Stack.Screen name="(tabs)" />
-            </Stack>
-          ) : (
-            <Stack screenOptions={{ headerShown: false }}>
-              <Stack.Screen name="(auth)" />
-            </Stack>
-          )}
-        </GlobalProvider>
+        <AccountSessionProvider
+          key={user?.uid || "signed-out-session"}
+          authUser={user}
+        >
+          <GlobalProvider authUser={user}>
+            <AppNavigator user={user} />
+          </GlobalProvider>
+        </AccountSessionProvider>
       </AppleSubscriptionProvider>
     </GestureHandlerRootView>
   );

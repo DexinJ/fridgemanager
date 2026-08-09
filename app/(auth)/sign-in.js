@@ -12,16 +12,15 @@ import {
   TextInput,
   View,
 } from "react-native";
+import { API_BASE_URL } from "../../api/backendConfig";
 import { auth } from "../../auth/firebaseClient";
 import { GlobalContext } from "../../context/GlobalContext";
 
 import { signInWithApple } from "../../auth/appleAuth"; // ✅ CHANGED: Apple login helper
 import { signInWithGoogleNative } from "../../auth/googleAuth";
 
-const BACKEND_HTTP_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "https://oversanguinely-metabolous-maxine.ngrok-free.dev";
-
 async function getUserProfileFromBackend({ idToken, uid }) {
-  const resp = await fetch(`${BACKEND_HTTP_URL}/api/users/${uid}`, {
+  const resp = await fetch(`${API_BASE_URL}/api/users/${uid}`, {
     method: "GET",
     headers: {
       Authorization: `Bearer ${idToken}`,

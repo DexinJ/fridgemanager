@@ -27,6 +27,7 @@ import {
   Dimensions,
   Linking,
   Modal,
+  Platform,
   ScrollView,
   StyleSheet,
   Switch,
@@ -41,9 +42,11 @@ import {
   normalizeAiBaseUrl,
   setCustomAiProviderSettings,
 } from "../../api/aiProviderSettings";
+import { API_BASE_URL } from "../../api/backendConfig";
 import { clearChatData } from "../../api/memoryManager";
 import { useAuth } from "../../auth/useAuth";
 import { HeaderWithHiddenButton } from "../../components/Header";
+import { useAccountSession } from "../../context/AccountSessionContext";
 import { GlobalContext } from "../../context/GlobalContext";
 import { useAppleSubscription } from "../../context/SubscriptionContext";
 import {
@@ -53,12 +56,14 @@ import {
 
 const { width } = Dimensions.get("window");
 
-// Put your API base URL somewhere central; adjust as needed.
-const API_BASE_URL =
-  process.env.EXPO_PUBLIC_API_BASE_URL || "http://192.168.0.163:3000";
-
 const APPLE_SUBSCRIPTIONS_URL =
   "https://apps.apple.com/account/subscriptions";
+const TERMS_OF_USE_URL =
+  String(process.env.EXPO_PUBLIC_TERMS_OF_USE_URL || "").trim() ||
+  "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/";
+const PRIVACY_POLICY_URL = String(
+  process.env.EXPO_PUBLIC_PRIVACY_POLICY_URL || ""
+).trim();
 
 const AI_PROVIDER_URLS = [
   { label: "OpenAI", value: "https://api.openai.com/v1" },
@@ -90,6 +95,13 @@ const APPLE_SUBSCRIPTION_STATUS_LABELS = {
   unsupported_platform: "Available on iOS",
 };
 
+const APPLE_SUBSCRIPTION_ATTENTION_STATUSES = new Set([
+  "in_billing_retry_period",
+  "billing_retry",
+  "expired",
+  "revoked",
+]);
+
 function getSubscriptionStatusLabel(status) {
   return APPLE_SUBSCRIPTION_STATUS_LABELS[status] || "Status unavailable";
 }
@@ -113,10 +125,49 @@ function formatSubscriptionDate(value) {
   return date.toLocaleDateString();
 }
 
+function formatQuotaCount(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  return Math.max(0, Math.trunc(number)).toLocaleString();
+}
+
+function formatQuotaReset(value, timezone) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  const options = {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    ...(timezone ? { timeZone: timezone } : {}),
+  };
+
+  try {
+    return date.toLocaleString(undefined, options);
+  } catch {
+    return date.toLocaleString();
+  }
+}
+
+function planName(value) {
+  const normalized = String(value || "free").trim();
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+}
+
+function formatSubscriptionPeriod(period) {
+  const value = Number(period?.value);
+  const unit = String(period?.unit || "").toLowerCase();
+  if (!Number.isFinite(value) || value <= 0 || !unit) return null;
+  const normalizedUnit = value === 1 ? unit.replace(/s$/, "") : unit;
+  return `${Math.trunc(value)} ${normalizedUnit}${value === 1 ? "" : "s"}`;
+}
+
 export default function SettingsScreen() {
   const {
     settings,
     storageHydrated,
+    storageOwnerUid,
     updateSetting,
     theme,
     clearAllData,
@@ -134,6 +185,24 @@ export default function SettingsScreen() {
     loading: subscriptionLoading,
     error: subscriptionError,
   } = useAppleSubscription();
+  const {
+    session: accountSession,
+    entitlement,
+    quota,
+    model: accountModel,
+    loading: accountSessionLoading,
+    error: accountSessionError,
+    apple,
+    applePlans,
+    appleProductsLoading,
+    appleProductsError,
+    appleOperation,
+    appleError,
+    refreshSession,
+    purchaseApplePlan,
+    restoreApplePurchases,
+    refreshAppleSubscription,
+  } = useAccountSession();
 
   const [currentSubMenu, setCurrentSubMenu] = useState(null);
   const [anim] = useState(() => new Animated.Value(0));
@@ -169,6 +238,56 @@ export default function SettingsScreen() {
 
   const router = useRouter();
   const fontSize = settings?.ux?.fontSize ?? 16;
+  const username = settings?.user?.name ?? "freeUser";
+  const subscriptionStatus = subscriptionLoading && !subscription?.checkedAt
+    ? "loading"
+    : subscription?.status;
+  const subscriptionStatusLabel = getSubscriptionStatusLabel(
+    subscriptionStatus
+  );
+  const subscriptionStatusColor = subscriptionStatus === "loading"
+    ? theme.textSecondary
+    : subscription?.isEntitled
+      ? theme.accent
+      : APPLE_SUBSCRIPTION_ATTENTION_STATUSES.has(subscriptionStatus)
+        ? theme.danger
+        : theme.textSecondary;
+  const subscriptionName = getSubscriptionName(subscription);
+  const subscriptionDate = formatSubscriptionDate(
+    subscription?.expirationDate
+  );
+  const subscriptionPlanLabel = subscriptionName ||
+    (subscriptionStatus === "loading"
+      ? "Looking up your plan..."
+      : "No plan selected");
+  const accountAccessStatusLabel = accountSessionLoading
+    ? "Checking account..."
+    : accountSessionError && !accountSession
+      ? "Access unavailable"
+    : entitlement?.active
+      ? entitlement?.verified
+        ? "Verified subscription access"
+        : "Reported subscription access"
+      : "Free access";
+  const accountAccessStatusColor = accountSessionLoading
+    ? theme.textSecondary
+    : accountSessionError && !accountSession
+      ? theme.danger
+    : entitlement?.active
+      ? theme.accent
+      : theme.textSecondary;
+  const accountPlanLabel = accountSessionLoading
+    ? "Loading Pantrio access..."
+    : accountSessionError && !accountSession
+      ? "Could not load Pantrio access"
+      : `${planName(entitlement?.plan)} plan`;
+  const quotaReset = formatQuotaReset(quota?.resetsAt, quota?.timezone);
+  const effectiveModel = accountModel?.effective || null;
+  const applePurchasesAvailable =
+    Platform.OS === "ios" &&
+    apple?.enabled === true &&
+    Boolean(apple?.appAccountToken);
+  const appleBusy = Boolean(appleOperation);
 
   const stylesWithFont = useMemo(
     () => dynamicStyles(theme, fontSize),
@@ -205,7 +324,7 @@ export default function SettingsScreen() {
 
     let active = true;
 
-    getCustomAiProviderSettings(normalizedAiBaseUrl, {
+    getCustomAiProviderSettings(storageOwnerUid, normalizedAiBaseUrl, {
       migrateLegacy: normalizedAiBaseUrl === normalizedConfiguredAiBaseUrl,
       fallbackModel:
         normalizedAiBaseUrl === normalizedConfiguredAiBaseUrl
@@ -234,6 +353,7 @@ export default function SettingsScreen() {
     configuredAiModel,
     aiProviderSettingsRevision,
     storageHydrated,
+    storageOwnerUid,
   ]);
 
   const checkAppleAi = useCallback(async () => {
@@ -303,7 +423,7 @@ export default function SettingsScreen() {
 
     setSavingAi(true);
     try {
-      await setCustomAiProviderSettings(baseUrl, {
+      await setCustomAiProviderSettings(storageOwnerUid, baseUrl, {
         apiKey: aiApiKey,
         model,
       });
@@ -378,6 +498,11 @@ export default function SettingsScreen() {
     return resp.json().catch(() => ({}));
   }
 
+  const openUsernameEditor = () => {
+    setTempName(username);
+    setModalVisible(true);
+  };
+
   const saveName = async () => {
     const next = String(tempName || "").trim();
 
@@ -444,6 +569,81 @@ export default function SettingsScreen() {
     }
   };
 
+  const openLegalDocument = async (url, title) => {
+    try {
+      await Linking.openURL(url);
+    } catch (nextError) {
+      Alert.alert(
+        `Could not open ${title}`,
+        nextError?.message || `Open the ${title} in your web browser.`
+      );
+    }
+  };
+
+  const handlePurchaseApplePlan = async (plan) => {
+    if (!plan?.productId || appleBusy) return;
+
+    try {
+      const result = await purchaseApplePlan(plan.productId);
+      if (result?.outcome === "cancelled") return;
+      if (result?.outcome === "pending") {
+        Alert.alert(
+          "Purchase pending",
+          "Apple is waiting for approval or payment confirmation. Pantrio will update automatically when the transaction completes."
+        );
+        return;
+      }
+      if (result?.outcome === "purchased") {
+        Alert.alert(
+          "Subscription active",
+          "Apple verified the purchase and Pantrio refreshed your account access."
+        );
+      }
+    } catch (nextError) {
+      Alert.alert(
+        "Purchase not completed",
+        nextError?.message || "Could not complete the Apple purchase."
+      );
+    }
+  };
+
+  const handleRestoreApplePurchases = async () => {
+    if (appleBusy) return;
+
+    try {
+      const result = await restoreApplePurchases();
+      if (result?.verification || result?.evidence?.length) {
+        Alert.alert(
+          "Purchases restored",
+          "Pantrio verified the Apple purchase for this account."
+        );
+      } else {
+        Alert.alert(
+          "No purchases found",
+          "Apple did not return an active Pantrio subscription for this account."
+        );
+      }
+    } catch (nextError) {
+      Alert.alert(
+        "Restore failed",
+        nextError?.message || "Could not restore Apple purchases."
+      );
+    }
+  };
+
+  const handleRefreshAppleSubscription = async () => {
+    if (appleBusy) return;
+
+    try {
+      await refreshAppleSubscription();
+    } catch (nextError) {
+      Alert.alert(
+        "Refresh failed",
+        nextError?.message || "Could not refresh the Apple subscription."
+      );
+    }
+  };
+
   /**
    * Sends an authenticated request to the backend.
    *
@@ -491,7 +691,7 @@ export default function SettingsScreen() {
 
     Alert.alert(
       "Delete account?",
-      "This permanently deletes your account and clears your fridge items, shopping list, chat history, and settings from this device. This cannot be undone.",
+      "This permanently deletes your Pantrio account and clears your fridge items, shopping list, chat history, and settings from this device. This cannot be undone.\n\nDeleting your Pantrio account does not cancel an Apple subscription. Manage or cancel it separately in Apple Subscriptions.",
       [
         {
           text: "Cancel",
@@ -512,7 +712,7 @@ export default function SettingsScreen() {
 
               // Clear chat-specific storage and context state.
               await Promise.resolve(
-                clearChatData(setMessages, setSummary)
+                clearChatData(storageOwnerUid, setMessages, setSummary)
               );
 
               /*
@@ -837,34 +1037,509 @@ export default function SettingsScreen() {
       case "user":
         return (
           <View style={stylesWithFont.subMenu}>
+            <TouchableOpacity
+              style={stylesWithFont.settingRow}
+              activeOpacity={0.75}
+              onPress={openUsernameEditor}
+              accessibilityRole="button"
+              accessibilityLabel={`Edit username, currently ${username}`}
+            >
+              <View style={stylesWithFont.sectionIcon}>
+                <Ionicons
+                  name="person-outline"
+                  size={fontSize * 1.25}
+                  color={theme.accent}
+                />
+              </View>
+              <View style={stylesWithFont.accountCardCopy}>
+                <Text style={stylesWithFont.accountFieldLabel}>Username</Text>
+                <Text
+                  style={stylesWithFont.accountValue}
+                  numberOfLines={1}
+                >
+                  {username}
+                </Text>
+              </View>
+              <View style={stylesWithFont.accountEditAction}>
+                <Ionicons
+                  name="create-outline"
+                  size={Math.max(16, fontSize)}
+                  color={theme.accent}
+                />
+                <Text style={stylesWithFont.accountEditText}>Edit</Text>
+              </View>
+            </TouchableOpacity>
+
             <View style={stylesWithFont.settingColumn}>
-              <Text style={stylesWithFont.label}>
-                User Name:{" "}
-                {settings?.user?.name ?? "freeUser"}
+              <View style={stylesWithFont.accountCardHeader}>
+                <View style={stylesWithFont.sectionIcon}>
+                  <Ionicons
+                    name="shield-checkmark-outline"
+                    size={fontSize * 1.25}
+                    color={theme.accent}
+                  />
+                </View>
+                <View style={stylesWithFont.accountCardCopy}>
+                  <Text style={stylesWithFont.accountCardTitle}>
+                    Pantrio account access
+                  </Text>
+                  <Text style={stylesWithFont.accountCardSubtitle}>
+                    Backend access, quota, and model
+                  </Text>
+                </View>
+                {accountSessionLoading ? (
+                  <ActivityIndicator size="small" color={theme.accent} />
+                ) : null}
+              </View>
+
+              <View style={stylesWithFont.subscriptionCard}>
+                <View
+                  style={[
+                    stylesWithFont.subscriptionStatusBadge,
+                    { borderColor: accountAccessStatusColor },
+                  ]}
+                >
+                  <View
+                    style={[
+                      stylesWithFont.subscriptionStatusDot,
+                      { backgroundColor: accountAccessStatusColor },
+                    ]}
+                  />
+                  <Text
+                    style={[
+                      stylesWithFont.subscriptionStatusText,
+                      { color: accountAccessStatusColor },
+                    ]}
+                  >
+                    {accountAccessStatusLabel}
+                  </Text>
+                </View>
+
+                <Text style={stylesWithFont.subscriptionPlan}>
+                  {accountPlanLabel}
+                </Text>
+
+                {!accountSessionLoading && quota ? (
+                  <View style={stylesWithFont.subscriptionDetails}>
+                    <View style={stylesWithFont.subscriptionDetailRow}>
+                      <Text style={stylesWithFont.subscriptionDetailLabel}>
+                        Daily AI allowance
+                      </Text>
+                      <Text style={stylesWithFont.subscriptionDetailValue}>
+                        {quota.applies
+                          ? `${formatQuotaCount(quota.remaining)} of ${formatQuotaCount(quota.limit)} tokens left`
+                          : "No daily quota"}
+                      </Text>
+                    </View>
+                    {quota.applies && quotaReset ? (
+                      <View style={stylesWithFont.subscriptionDetailRow}>
+                        <Text style={stylesWithFont.subscriptionDetailLabel}>
+                          Resets
+                        </Text>
+                        <Text style={stylesWithFont.subscriptionDetailValue}>
+                          {quotaReset}
+                          {quota.timezone ? ` (${quota.timezone})` : ""}
+                        </Text>
+                      </View>
+                    ) : null}
+                    {effectiveModel ? (
+                      <View style={stylesWithFont.subscriptionDetailRow}>
+                        <Text style={stylesWithFont.subscriptionDetailLabel}>
+                          AI model
+                        </Text>
+                        <Text style={stylesWithFont.subscriptionDetailValue}>
+                          {effectiveModel}
+                        </Text>
+                      </View>
+                    ) : null}
+                    {entitlement?.active ? (
+                      <View style={stylesWithFont.subscriptionDetailRow}>
+                        <Text style={stylesWithFont.subscriptionDetailLabel}>
+                          Verification
+                        </Text>
+                        <Text style={stylesWithFont.subscriptionDetailValue}>
+                          {entitlement?.verified
+                            ? "Server verified"
+                            : "StoreKit report (unverified)"}
+                        </Text>
+                      </View>
+                    ) : null}
+                  </View>
+                ) : null}
+
+                {accountSessionError ? (
+                  <>
+                    <View style={stylesWithFont.subscriptionErrorRow}>
+                      <Ionicons
+                        name="alert-circle-outline"
+                        size={Math.max(16, fontSize)}
+                        color={theme.danger}
+                      />
+                      <Text style={stylesWithFont.subscriptionError}>
+                        {accountSessionError}
+                      </Text>
+                    </View>
+                    <CustomButton
+                      title={accountSessionLoading ? "Retrying..." : "Retry Account Check"}
+                      onPress={
+                        accountSessionLoading
+                          ? null
+                          : () => refreshSession().catch(() => {})
+                      }
+                      fontSize={fontSize}
+                      color={theme.accent}
+                    />
+                  </>
+                ) : null}
+              </View>
+              <Text style={stylesWithFont.subscriptionFootnote}>
+                Pantrio grants paid access only after its backend verifies the
+                signed Apple transaction for this account.
               </Text>
+            </View>
+
+            <View style={stylesWithFont.settingColumn}>
+              <View style={stylesWithFont.accountCardHeader}>
+                <View style={stylesWithFont.sectionIcon}>
+                  <Ionicons
+                    name="card-outline"
+                    size={fontSize * 1.25}
+                    color={theme.accent}
+                  />
+                </View>
+                <View style={stylesWithFont.accountCardCopy}>
+                  <Text style={stylesWithFont.accountCardTitle}>
+                    Apple on this device
+                  </Text>
+                  <Text style={stylesWithFont.accountCardSubtitle}>
+                    Local StoreKit status and renewal
+                  </Text>
+                </View>
+                {subscriptionLoading || appleBusy || appleProductsLoading ? (
+                  <ActivityIndicator size="small" color={theme.accent} />
+                ) : null}
+              </View>
+
+              <View style={stylesWithFont.subscriptionCard}>
+                <View
+                  style={[
+                    stylesWithFont.subscriptionStatusBadge,
+                    { borderColor: subscriptionStatusColor },
+                  ]}
+                >
+                  <View
+                    style={[
+                      stylesWithFont.subscriptionStatusDot,
+                      { backgroundColor: subscriptionStatusColor },
+                    ]}
+                  />
+                  <Text
+                    style={[
+                      stylesWithFont.subscriptionStatusText,
+                      { color: subscriptionStatusColor },
+                    ]}
+                  >
+                    {subscriptionStatusLabel}
+                  </Text>
+                </View>
+
+                <Text style={stylesWithFont.subscriptionPlan}>
+                  {subscriptionPlanLabel}
+                </Text>
+
+                {subscription?.productId ? (
+                  <View style={stylesWithFont.subscriptionDetails}>
+                    <View style={stylesWithFont.subscriptionDetailRow}>
+                      <Text style={stylesWithFont.subscriptionDetailLabel}>
+                        Product
+                      </Text>
+                      <Text
+                        style={stylesWithFont.subscriptionDetailValue}
+                        numberOfLines={2}
+                      >
+                        {subscription.productId}
+                      </Text>
+                    </View>
+                    <View style={stylesWithFont.subscriptionDetailRow}>
+                      <Text style={stylesWithFont.subscriptionDetailLabel}>
+                        Renewal
+                      </Text>
+                      <Text style={stylesWithFont.subscriptionDetailValue}>
+                        {subscription?.willAutoRenew
+                          ? "Renews automatically"
+                          : "Will not renew"}
+                      </Text>
+                    </View>
+                    {subscriptionDate ? (
+                      <View style={stylesWithFont.subscriptionDetailRow}>
+                        <Text style={stylesWithFont.subscriptionDetailLabel}>
+                          {subscription?.willAutoRenew
+                            ? "Next renewal"
+                            : "Access until"}
+                        </Text>
+                        <Text style={stylesWithFont.subscriptionDetailValue}>
+                          {subscriptionDate}
+                        </Text>
+                      </View>
+                    ) : null}
+                  </View>
+                ) : null}
+
+                {subscriptionError ? (
+                  <View style={stylesWithFont.subscriptionErrorRow}>
+                    <Ionicons
+                      name="alert-circle-outline"
+                      size={Math.max(16, fontSize)}
+                      color={theme.danger}
+                    />
+                    <Text style={stylesWithFont.subscriptionError}>
+                      {subscriptionError}
+                    </Text>
+                  </View>
+                ) : null}
+
+                {appleError ? (
+                  <View style={stylesWithFont.subscriptionErrorRow}>
+                    <Ionicons
+                      name="cloud-offline-outline"
+                      size={Math.max(16, fontSize)}
+                      color={theme.danger}
+                    />
+                    <Text style={stylesWithFont.subscriptionError}>
+                      {appleError}
+                    </Text>
+                  </View>
+                ) : null}
+              </View>
+
+              <Text style={stylesWithFont.accountInputLabel}>
+                Available plans
+              </Text>
+              {appleProductsLoading && !applePlans.length ? (
+                <View style={stylesWithFont.accountActivity}>
+                  <ActivityIndicator color={theme.accent} />
+                </View>
+              ) : null}
+              {!appleProductsLoading && !applePlans.length ? (
+                <Text style={stylesWithFont.helpText}>
+                  {apple?.enabled === false
+                    ? "Apple subscriptions are not configured for this app yet."
+                    : "No Apple subscription plans are currently available."}
+                </Text>
+              ) : null}
+              {applePlans.map((plan) => {
+                const currentPlan =
+                  entitlement?.active &&
+                  entitlement?.verified &&
+                  entitlement?.productId === plan.productId;
+                const periodLabel = formatSubscriptionPeriod(plan.period);
+                const priceLabel = plan.displayPrice
+                  ? periodLabel
+                    ? `${plan.displayPrice} every ${periodLabel}`
+                    : plan.displayPrice
+                  : periodLabel;
+                const canPurchase =
+                  applePurchasesAvailable &&
+                  plan.storeKitAvailable &&
+                  !appleBusy &&
+                  !currentPlan;
+
+                return (
+                  <View
+                    key={plan.productId}
+                    style={stylesWithFont.applePlanCard}
+                  >
+                    <View style={stylesWithFont.applePlanHeader}>
+                      <View style={stylesWithFont.applePlanCopy}>
+                        <Text style={stylesWithFont.applePlanName}>
+                          {plan.displayName}
+                        </Text>
+                        {priceLabel ? (
+                          <Text style={stylesWithFont.applePlanPrice}>
+                            {priceLabel}
+                          </Text>
+                        ) : null}
+                      </View>
+                      {currentPlan ? (
+                        <View style={stylesWithFont.currentPlanBadge}>
+                          <Text style={stylesWithFont.currentPlanText}>
+                            Current
+                          </Text>
+                        </View>
+                      ) : null}
+                    </View>
+                    {plan.description ? (
+                      <Text style={stylesWithFont.applePlanDescription}>
+                        {plan.description}
+                      </Text>
+                    ) : null}
+                    {plan.displayPrice && periodLabel ? (
+                      <Text style={stylesWithFont.appleRenewalDisclosure}>
+                        Automatically renews at {plan.displayPrice} every {periodLabel}
+                        {" "}unless canceled at least 24 hours before the current
+                        period ends. Payment is charged to your Apple Account at
+                        confirmation.
+                      </Text>
+                    ) : null}
+                    <CustomButton
+                      title={
+                        currentPlan
+                          ? "Current Plan"
+                          : appleOperation === "purchase"
+                            ? "Processing Purchase..."
+                            : entitlement?.active
+                              ? `Change to ${plan.displayName}`
+                              : `Subscribe to ${plan.displayName}`
+                      }
+                      onPress={
+                        canPurchase
+                          ? () => handlePurchaseApplePlan(plan)
+                          : null
+                      }
+                      fontSize={fontSize}
+                      color={theme.accent}
+                    />
+                    {!plan.storeKitAvailable && Platform.OS === "ios" ? (
+                      <Text style={stylesWithFont.applePlanUnavailable}>
+                        This product is not currently available from Apple.
+                      </Text>
+                    ) : null}
+                  </View>
+                );
+              })}
+
+              {appleProductsError ? (
+                <View style={stylesWithFont.subscriptionErrorRow}>
+                  <Ionicons
+                    name="alert-circle-outline"
+                    size={Math.max(16, fontSize)}
+                    color={theme.danger}
+                  />
+                  <Text style={stylesWithFont.subscriptionError}>
+                    {appleProductsError}
+                  </Text>
+                </View>
+              ) : null}
+
+              <View style={stylesWithFont.appleLegalLinks}>
+                <TouchableOpacity
+                  onPress={() =>
+                    openLegalDocument(TERMS_OF_USE_URL, "Terms of Use")
+                  }
+                  accessibilityRole="link"
+                >
+                  <Text style={stylesWithFont.appleLegalLinkText}>
+                    Terms of Use
+                  </Text>
+                </TouchableOpacity>
+                {PRIVACY_POLICY_URL ? (
+                  <TouchableOpacity
+                    onPress={() =>
+                      openLegalDocument(
+                        PRIVACY_POLICY_URL,
+                        "Privacy Policy"
+                      )
+                    }
+                    accessibilityRole="link"
+                  >
+                    <Text style={stylesWithFont.appleLegalLinkText}>
+                      Privacy Policy
+                    </Text>
+                  </TouchableOpacity>
+                ) : null}
+              </View>
 
               <CustomButton
                 title={
-                  subscription?.productId
-                    ? "Edit Subscription"
-                    : "Subscribe"
+                  appleOperation === "restore"
+                    ? "Restoring Purchases..."
+                    : "Restore Purchases"
                 }
+                onPress={
+                  applePurchasesAvailable && !appleBusy
+                    ? handleRestoreApplePurchases
+                    : null
+                }
+                fontSize={fontSize}
+                color={theme.accent}
+              />
+              <CustomButton
+                title={
+                  appleOperation === "refresh"
+                    ? "Refreshing Subscription..."
+                    : "Refresh Subscription Status"
+                }
+                onPress={
+                  applePurchasesAvailable && !appleBusy
+                    ? handleRefreshAppleSubscription
+                    : null
+                }
+                fontSize={fontSize}
+                color={theme.accent}
+              />
+              <CustomButton
+                title="Manage Apple Subscription"
                 onPress={openAppleSubscriptions}
                 fontSize={fontSize}
                 color={theme.accent}
               />
+              <Text style={stylesWithFont.subscriptionFootnote}>
+                Purchases are linked with an anonymous account token. Pantrio
+                never receives your Apple Account email or password.
+              </Text>
+            </View>
 
-              {loggedIn ? (
-                <>
+            {loggedIn ? (
+              <>
+                <View style={stylesWithFont.settingColumn}>
+                  <View style={stylesWithFont.accountCardHeader}>
+                    <View style={stylesWithFont.sectionIcon}>
+                      <Ionicons
+                        name="log-out-outline"
+                        size={fontSize * 1.25}
+                        color={theme.accent}
+                      />
+                    </View>
+                    <View style={stylesWithFont.accountCardCopy}>
+                      <Text style={stylesWithFont.accountCardTitle}>
+                        Session
+                      </Text>
+                      <Text style={stylesWithFont.accountCardSubtitle}>
+                        Sign out of Pantrio on this device
+                      </Text>
+                    </View>
+                  </View>
                   <CustomButton
                     title="Log out"
-                    onPress={
-                      deletingAccount ? null : handleLogout
-                    }
+                    onPress={deletingAccount ? null : handleLogout}
                     fontSize={fontSize}
-                    color={theme.danger}
+                    color={theme.accent}
                   />
+                </View>
 
+                <View style={stylesWithFont.settingColumn}>
+                  <View style={stylesWithFont.accountCardHeader}>
+                    <View
+                      style={[
+                        stylesWithFont.sectionIcon,
+                        { backgroundColor: `${theme.danger}18` },
+                      ]}
+                    >
+                      <Ionicons
+                        name="trash-outline"
+                        size={fontSize * 1.25}
+                        color={theme.danger}
+                      />
+                    </View>
+                    <View style={stylesWithFont.accountCardCopy}>
+                      <Text style={stylesWithFont.accountDangerTitle}>
+                        Delete account
+                      </Text>
+                      <Text style={stylesWithFont.accountCardSubtitle}>
+                      Permanently delete account and app data
+                      </Text>
+                    </View>
+                  </View>
                   <CustomButton
                     title={
                       deletingAccount
@@ -872,85 +1547,111 @@ export default function SettingsScreen() {
                         : "Delete Account"
                     }
                     onPress={
-                      deletingAccount
-                        ? null
-                        : handleDeleteAccount
+                      deletingAccount ? null : handleDeleteAccount
                     }
                     fontSize={fontSize}
                     color={theme.danger}
                   />
-
                   {deletingAccount ? (
-                    <View style={{ paddingVertical: 8 }}>
-                      <ActivityIndicator />
+                    <View style={stylesWithFont.accountActivity}>
+                      <ActivityIndicator color={theme.danger} />
                     </View>
                   ) : null}
-                </>
-              ) : (
-                <CustomButton
-                  title="Log In/Sign Up"
-                  onPress={() =>
-                    router.push("/(auth)/sign-in")
-                  }
-                  fontSize={fontSize}
-                  color={theme.danger}
-                />
-              )}
-
-              <Modal
-                visible={modalVisible}
-                animationType="fade"
-                transparent={true}
-                onRequestClose={() => {
-                  if (!savingName) {
-                    setModalVisible(false);
-                  }
-                }}
-              >
-                <View style={stylesWithFont.modalBackground}>
-                  <View style={stylesWithFont.modalContainer}>
-                    <Text style={stylesWithFont.label}>
-                      Enter new name:
-                    </Text>
-
-                    <TextInput
-                      style={stylesWithFont.input}
-                      value={tempName}
-                      onChangeText={setTempName}
-                      placeholder="Your name"
-                      placeholderTextColor={theme.textPlaceholder}
-                      returnKeyType="done"
-                      onSubmitEditing={saveName}
-                      editable={!savingName}
-                    />
-
-                    {savingName ? (
-                      <View style={{ paddingVertical: 8 }}>
-                        <ActivityIndicator />
-                      </View>
-                    ) : null}
-
-                    <CustomButton
-                      title={
-                        savingName ? "Saving..." : "Save"
-                      }
-                      onPress={savingName ? null : saveName}
-                      fontSize={fontSize}
-                    />
-
-                    <CustomButton
-                      title="Cancel"
-                      onPress={
-                        savingName
-                          ? null
-                          : () => setModalVisible(false)
-                      }
-                      fontSize={fontSize}
+                </View>
+              </>
+            ) : (
+              <View style={stylesWithFont.settingColumn}>
+                <View style={stylesWithFont.accountCardHeader}>
+                  <View style={stylesWithFont.sectionIcon}>
+                    <Ionicons
+                      name="log-in-outline"
+                      size={fontSize * 1.25}
+                      color={theme.accent}
                     />
                   </View>
+                  <View style={stylesWithFont.accountCardCopy}>
+                    <Text style={stylesWithFont.accountCardTitle}>
+                      Pantrio account
+                    </Text>
+                    <Text style={stylesWithFont.accountCardSubtitle}>
+                      Sign in to sync and manage your account
+                    </Text>
+                  </View>
                 </View>
-              </Modal>
-            </View>
+                <CustomButton
+                  title="Log In/Sign Up"
+                  onPress={() => router.push("/(auth)/sign-in")}
+                  fontSize={fontSize}
+                  color={theme.accent}
+                />
+              </View>
+            )}
+
+            <Modal
+              visible={modalVisible}
+              animationType="fade"
+              transparent={true}
+              onRequestClose={() => {
+                if (!savingName) {
+                  setModalVisible(false);
+                }
+              }}
+            >
+              <View style={stylesWithFont.modalBackground}>
+                <View style={stylesWithFont.modalContainer}>
+                  <View style={stylesWithFont.accountCardHeader}>
+                    <View style={stylesWithFont.sectionIcon}>
+                      <Ionicons
+                        name="person-outline"
+                        size={fontSize * 1.25}
+                        color={theme.accent}
+                      />
+                    </View>
+                    <View style={stylesWithFont.accountCardCopy}>
+                      <Text style={stylesWithFont.accountCardTitle}>
+                        Edit username
+                      </Text>
+                      <Text style={stylesWithFont.accountCardSubtitle}>
+                        Choose how your name appears in Pantrio
+                      </Text>
+                    </View>
+                  </View>
+
+                  <Text style={stylesWithFont.accountInputLabel}>Username</Text>
+                  <TextInput
+                    style={stylesWithFont.accountInput}
+                    value={tempName}
+                    onChangeText={setTempName}
+                    placeholder="Your name"
+                    placeholderTextColor={theme.textPlaceholder}
+                    returnKeyType="done"
+                    onSubmitEditing={saveName}
+                    editable={!savingName}
+                    autoFocus
+                  />
+
+                  {savingName ? (
+                    <View style={stylesWithFont.accountActivity}>
+                      <ActivityIndicator color={theme.accent} />
+                    </View>
+                  ) : null}
+
+                  <CustomButton
+                    title={savingName ? "Saving..." : "Save Username"}
+                    onPress={savingName ? null : saveName}
+                    fontSize={fontSize}
+                  />
+                  <CustomButton
+                    title="Cancel"
+                    onPress={
+                      savingName ? null : () => setModalVisible(false)
+                    }
+                    fontSize={fontSize}
+                    color={theme.textSecondary}
+                  />
+                </View>
+              </View>
+            </Modal>
           </View>
         );
 
@@ -1163,6 +1864,7 @@ export default function SettingsScreen() {
                         style: "destructive",
                         onPress: () =>
                           clearChatData(
+                            storageOwnerUid,
                             setMessages,
                             setSummary
                           ),
@@ -1402,6 +2104,82 @@ const dynamicStyles = (theme, fontSize) =>
       borderColor: theme.border,
     },
 
+    accountCardHeader: {
+      flexDirection: "row",
+      alignItems: "center",
+    },
+    accountCardCopy: {
+      flex: 1,
+      minWidth: 0,
+      marginLeft: 12,
+    },
+    accountFieldLabel: {
+      fontSize: Math.max(11, fontSize - 3),
+      fontWeight: "700",
+      letterSpacing: 0.7,
+      textTransform: "uppercase",
+      color: theme.textSecondary,
+    },
+    accountValue: {
+      marginTop: 3,
+      fontSize: fontSize + 2,
+      fontWeight: "700",
+      color: theme.textPrimary,
+    },
+    accountEditAction: {
+      flexDirection: "row",
+      alignItems: "center",
+      marginLeft: 12,
+      paddingHorizontal: 10,
+      paddingVertical: 7,
+      borderRadius: 10,
+      backgroundColor: `${theme.accent}18`,
+    },
+    accountEditText: {
+      marginLeft: 5,
+      fontSize: Math.max(12, fontSize - 2),
+      fontWeight: "700",
+      color: theme.accent,
+    },
+    accountCardTitle: {
+      fontSize,
+      fontWeight: "700",
+      color: theme.textPrimary,
+    },
+    accountCardSubtitle: {
+      marginTop: 3,
+      fontSize: Math.max(11, fontSize - 3),
+      lineHeight: Math.max(16, fontSize + 1),
+      color: theme.textSecondary,
+    },
+    accountDangerTitle: {
+      fontSize,
+      fontWeight: "700",
+      color: theme.danger,
+    },
+    accountActivity: {
+      alignItems: "center",
+      paddingTop: 12,
+    },
+    accountInputLabel: {
+      marginTop: 18,
+      marginBottom: 7,
+      fontSize: Math.max(12, fontSize - 2),
+      fontWeight: "700",
+      color: theme.textPrimary,
+    },
+    accountInput: {
+      minHeight: 48,
+      paddingHorizontal: 12,
+      paddingVertical: 11,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: theme.border,
+      borderRadius: 12,
+      fontSize,
+      color: theme.textPrimary,
+      backgroundColor: theme.background,
+    },
+
     subscriptionCard: {
       marginTop: 14,
       padding: 14,
@@ -1410,37 +2188,150 @@ const dynamicStyles = (theme, fontSize) =>
       borderColor: theme.border,
       backgroundColor: theme.background,
     },
-    subscriptionHeader: {
+    subscriptionStatusBadge: {
+      alignSelf: "flex-start",
       flexDirection: "row",
       alignItems: "center",
+      paddingHorizontal: 9,
+      paddingVertical: 6,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderRadius: 999,
     },
-    subscriptionTitle: {
-      flex: 1,
-      marginLeft: 8,
-      fontSize,
+    subscriptionStatusDot: {
+      width: 7,
+      height: 7,
+      marginRight: 7,
+      borderRadius: 4,
+    },
+    subscriptionStatusText: {
+      fontSize: Math.max(12, fontSize - 2),
+      fontWeight: "700",
+    },
+    subscriptionPlan: {
+      marginTop: 12,
+      fontSize: fontSize + 1,
       fontWeight: "700",
       color: theme.textPrimary,
     },
-    subscriptionStatus: {
+    subscriptionDetails: {
       marginTop: 12,
-      fontSize,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderTopColor: theme.border,
+    },
+    subscriptionDetailRow: {
+      flexDirection: "row",
+      justifyContent: "space-between",
+      alignItems: "flex-start",
+      paddingVertical: 10,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: theme.border,
+    },
+    subscriptionDetailLabel: {
+      flex: 1,
+      marginRight: 12,
+      fontSize: Math.max(11, fontSize - 3),
+      fontWeight: "600",
+      color: theme.textSecondary,
+    },
+    subscriptionDetailValue: {
+      flex: 1.7,
+      fontSize: Math.max(11, fontSize - 3),
+      fontWeight: "600",
+      textAlign: "right",
+      color: theme.textPrimary,
+    },
+    subscriptionErrorRow: {
+      flexDirection: "row",
+      alignItems: "flex-start",
+      marginTop: 12,
+      padding: 10,
+      borderRadius: 10,
+      backgroundColor: `${theme.danger}12`,
+    },
+    subscriptionError: {
+      flex: 1,
+      marginLeft: 8,
+      fontSize: Math.max(11, fontSize - 3),
+      lineHeight: Math.max(16, fontSize + 1),
+      color: theme.danger,
+    },
+    subscriptionFootnote: {
+      marginTop: 8,
+      paddingHorizontal: 2,
+      fontSize: Math.max(11, fontSize - 3),
+      lineHeight: Math.max(16, fontSize + 1),
+      textAlign: "center",
+      color: theme.textSecondary,
+    },
+    applePlanCard: {
+      marginTop: 10,
+      padding: 14,
+      borderRadius: 14,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: theme.border,
+      backgroundColor: theme.background,
+    },
+    applePlanHeader: {
+      flexDirection: "row",
+      alignItems: "flex-start",
+    },
+    applePlanCopy: {
+      flex: 1,
+      minWidth: 0,
+      marginRight: 10,
+    },
+    applePlanName: {
+      fontSize: fontSize + 1,
+      fontWeight: "700",
+      color: theme.textPrimary,
+    },
+    applePlanPrice: {
+      marginTop: 4,
+      fontSize: Math.max(12, fontSize - 2),
+      fontWeight: "600",
+      color: theme.accent,
+    },
+    applePlanDescription: {
+      marginTop: 10,
+      fontSize: Math.max(11, fontSize - 3),
+      lineHeight: Math.max(16, fontSize + 1),
+      color: theme.textSecondary,
+    },
+    appleRenewalDisclosure: {
+      marginTop: 10,
+      fontSize: Math.max(10, fontSize - 4),
+      lineHeight: Math.max(15, fontSize),
+      color: theme.textSecondary,
+    },
+    currentPlanBadge: {
+      paddingHorizontal: 9,
+      paddingVertical: 5,
+      borderRadius: 999,
+      backgroundColor: `${theme.accent}18`,
+    },
+    currentPlanText: {
+      fontSize: Math.max(11, fontSize - 3),
       fontWeight: "700",
       color: theme.accent,
     },
-    subscriptionPlan: {
-      marginTop: 5,
-      fontSize,
-      color: theme.textPrimary,
-    },
-    subscriptionDetail: {
-      marginTop: 4,
-      fontSize: Math.max(11, fontSize - 3),
-      color: theme.textSecondary,
-    },
-    subscriptionError: {
+    applePlanUnavailable: {
       marginTop: 8,
       fontSize: Math.max(11, fontSize - 3),
-      color: theme.danger,
+      textAlign: "center",
+      color: theme.textSecondary,
+    },
+    appleLegalLinks: {
+      flexDirection: "row",
+      justifyContent: "center",
+      gap: 22,
+      marginTop: 14,
+      marginBottom: 2,
+    },
+    appleLegalLinkText: {
+      fontSize: Math.max(11, fontSize - 3),
+      fontWeight: "700",
+      textDecorationLine: "underline",
+      color: theme.accent,
     },
 
     label: {
@@ -1470,10 +2361,13 @@ const dynamicStyles = (theme, fontSize) =>
     },
 
     modalContainer: {
-      width: 300,
+      width: "88%",
+      maxWidth: 420,
       padding: 20,
       backgroundColor: theme.card,
-      borderRadius: 10,
+      borderRadius: 16,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: theme.border,
       flexDirection: "column",
       justifyContent: "space-around",
     },

@@ -2,28 +2,43 @@ import { Ionicons } from "@expo/vector-icons";
 import * as ImageManipulator from "expo-image-manipulator";
 import * as ImagePicker from "expo-image-picker";
 import React, { useContext, useState } from "react";
-import { StyleSheet, Text, TouchableOpacity, View } from "react-native";
+import { Alert, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { GlobalContext } from "../context/GlobalContext";
 
+const MAX_IMAGE_DIMENSION = 1_600;
+const MAX_IMAGE_DATA_URL_LENGTH = 6 * 1024 * 1024;
 
 export default function PlusMenu({ onSend }) {
   const { settings, theme } = useContext(GlobalContext);
   const fontSize = settings?.ux?.fontSize || 16;
   const [menuOpen, setMenuOpen] = useState(false);
 
-  async function toJpegBase64(uri) {
-    const ctx = ImageManipulator.ImageManipulator.manipulate(uri); // or ImageManipulator.manipulate(uri)
-    console.log("ctx");
+  async function toJpegBase64(asset) {
+    const ctx = ImageManipulator.ImageManipulator.manipulate(asset.uri);
+    const width = Number(asset.width) || 0;
+    const height = Number(asset.height) || 0;
+    const longestEdge = Math.max(width, height);
+
+    if (longestEdge > MAX_IMAGE_DIMENSION) {
+      const scale = MAX_IMAGE_DIMENSION / longestEdge;
+      ctx.resize({
+        width: Math.max(1, Math.round(width * scale)),
+        height: Math.max(1, Math.round(height * scale)),
+      });
+    }
+
     const imageRef = await ctx.renderAsync();
-    console.log("imageRef");
     const result = await imageRef.saveAsync({
       format: ImageManipulator.SaveFormat.JPEG,
-      compress: 0.7,
+      compress: 0.65,
       base64: true,
     });
-    console.log("result: ");
     if (!result.base64) throw new Error("Failed to create base64 image");
-    return `data:image/jpeg;base64,${result.base64}`;
+    const dataUrl = `data:image/jpeg;base64,${result.base64}`;
+    if (dataUrl.length > MAX_IMAGE_DATA_URL_LENGTH) {
+      throw new Error("The selected image is too large to send.");
+    }
+    return dataUrl;
   }
 
   const takePhoto = async () => {
@@ -35,12 +50,17 @@ export default function PlusMenu({ onSend }) {
       quality: 0.7,
     });
 
-    if (!result.canceled) {
-      const asset = result.assets[0];
-      const dataUrl = await toJpegBase64(asset.uri);
-      onSend({ text: null, imageUri: dataUrl, isUser: true });
+    try {
+      if (!result.canceled) {
+        const asset = result.assets[0];
+        const dataUrl = await toJpegBase64(asset);
+        onSend({ text: null, imageUri: dataUrl, isUser: true });
+      }
+    } catch (error) {
+      Alert.alert("Image", error?.message || "The photo could not be prepared.");
+    } finally {
+      setMenuOpen(false);
     }
-    setMenuOpen(false);
   };
 
   const pickPhoto = async () => {
@@ -52,12 +72,17 @@ export default function PlusMenu({ onSend }) {
       quality: 0.7,
     });
 
-    if (!result.canceled) {
-      const asset = result.assets[0];
-      const dataUrl = await toJpegBase64(asset.uri);
-      onSend({ text: null, imageUri: dataUrl, isUser: true });
+    try {
+      if (!result.canceled) {
+        const asset = result.assets[0];
+        const dataUrl = await toJpegBase64(asset);
+        onSend({ text: null, imageUri: dataUrl, isUser: true });
+      }
+    } catch (error) {
+      Alert.alert("Image", error?.message || "The image could not be prepared.");
+    } finally {
+      setMenuOpen(false);
     }
-    setMenuOpen(false);
   };
 
   return (

@@ -12,6 +12,27 @@ import MessageInput from "../../components/MessageInput";
 import MessageList from "../../components/MessageList";
 import { GlobalContext } from "../../context/GlobalContext";
 
+function getChatErrorMessage(error) {
+  const messagesByCode = {
+    QUOTA_EXHAUSTED: "You have used today’s Pantrio AI allowance.",
+    REQUEST_TOO_LARGE: "This conversation is too large to send. Try starting a new chat.",
+    RATE_LIMITED: "You’re sending requests too quickly. Please try again shortly.",
+    AUTH_REQUIRED: "Your session expired. Please sign in again.",
+    AUTH_INVALID: "Your session expired. Please sign in again.",
+    ENTITLEMENT_STALE: "Your subscription status needs to be refreshed in Settings.",
+    REQUEST_TIMEOUT: "The chat request timed out. Please try again.",
+    UPSTREAM_ERROR: "Pantrio AI is temporarily unavailable. Please try again.",
+    UPSTREAM_UNAVAILABLE: "Pantrio AI is temporarily unavailable. Please try again.",
+  };
+
+  if (messagesByCode[error?.code]) return messagesByCode[error.code];
+
+  const message = String(error?.message || "").trim();
+  if (message && message !== "Unknown error") return message;
+
+  return "Pantrio AI could not complete that request.";
+}
+
 export default function ChatScreen() {
   const [input, setInput] = useState("");
   const insets = useSafeAreaInsets();
@@ -50,12 +71,13 @@ export default function ChatScreen() {
         });
       } catch (error) {
         console.error("Error sending message to GPT:", error);
+        const errorMessage = getChatErrorMessage(error);
 
         setMessages((prev) => [
           ...prev,
           {
             role: "assistant",
-            content: [{ type: "output_text", text: "Oops, something went wrong." }],
+            content: [{ type: "output_text", text: errorMessage }],
           },
         ]);
       } finally {

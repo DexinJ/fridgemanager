@@ -1,24 +1,28 @@
 import ExpoModulesCore
 import Foundation
 import StoreKit
+import UIKit
 
 private let subscriptionChangedEvent = "onSubscriptionStatusChanged"
+private let transactionChangedEvent = "onAppleTransaction"
 
 public final class AppleSubscriptionsModule: Module {
   private let stateQueue = DispatchQueue(
     label: "com.chilltech.pantrio.apple-subscriptions"
   )
   private var configuredProductIDs: [String] = []
-  private var isObserving = false
+  private var isObservingStatus = false
+  private var isObservingTransactions = false
   private var refreshGeneration = 0
   private var transactionUpdatesTask: Task<Void, Never>?
   private var statusUpdatesTask: Task<Void, Never>?
   private var refreshTask: Task<Void, Never>?
+  private var unfinishedRefreshTask: Task<Void, Never>?
 
   public func definition() -> ModuleDefinition {
     Name("AppleSubscriptions")
 
-    Events(subscriptionChangedEvent)
+    Events(subscriptionChangedEvent, transactionChangedEvent)
 
     Function("configure") { (productIDs: [String]) in
       let normalizedIDs = Self.normalizedProductIDs(productIDs)
@@ -31,20 +35,161 @@ public final class AppleSubscriptionsModule: Module {
       return await Self.makeSnapshot(productIDs: normalizedIDs)
     }
 
+    AsyncFunction("getProducts") { (productIDs: [String]) async throws -> [[String: Any]] in
+      let normalizedIDs = Self.normalizedProductIDs(productIDs)
+      self.updateConfiguration(normalizedIDs)
+      return try await Self.loadProducts(productIDs: normalizedIDs)
+    }
+
+    AsyncFunction("purchase") {
+      (productID: String, appAccountToken: String) async throws -> [String: Any] in
+      let normalizedProductID = productID.trimmingCharacters(
+        in: .whitespacesAndNewlines
+      )
+      guard !normalizedProductID.isEmpty else {
+        throw AppleSubscriptionBridgeError.invalidProductID
+      }
+
+      let configuredIDs = self.configuredProductIDsSnapshot()
+      guard configuredIDs.contains(normalizedProductID) else {
+        throw AppleSubscriptionBridgeError.productNotConfigured(normalizedProductID)
+      }
+      guard let accountToken = UUID(uuidString: appAccountToken) else {
+        throw AppleSubscriptionBridgeError.invalidAppAccountToken
+      }
+
+      let products = try await Product.products(for: [normalizedProductID])
+      guard let product = products.first(where: { $0.id == normalizedProductID }) else {
+        throw AppleSubscriptionBridgeError.productUnavailable(normalizedProductID)
+      }
+      guard product.type == .autoRenewable else {
+        throw AppleSubscriptionBridgeError.unsupportedProductType(normalizedProductID)
+      }
+
+      let purchaseResult = try await Self.purchase(
+        product: product,
+        appAccountToken: accountToken
+      )
+
+      switch purchaseResult {
+      case .success(let verificationResult):
+        let evidence = await Self.makeEvidence(
+          verificationResult,
+          source: "purchase"
+        )
+        let unfinishedIDs = await Self.unfinishedTransactionIDs(
+          productIDs: configuredIDs
+        )
+        let snapshot = await Self.makeSnapshot(productIDs: configuredIDs)
+        return Self.outcome(
+          "purchased",
+          evidence: [evidence],
+          unfinishedTransactionIDs: unfinishedIDs,
+          snapshot: snapshot
+        )
+
+      case .pending:
+        return Self.outcome(
+          "pending",
+          snapshot: await Self.makeSnapshot(productIDs: configuredIDs)
+        )
+
+      case .userCancelled:
+        return Self.outcome(
+          "cancelled",
+          snapshot: await Self.makeSnapshot(productIDs: configuredIDs)
+        )
+
+      @unknown default:
+        throw AppleSubscriptionBridgeError.unknownPurchaseResult
+      }
+    }
+
+    AsyncFunction("restorePurchases") { (productIDs: [String]) async throws -> [String: Any] in
+      let normalizedIDs = Self.normalizedProductIDs(productIDs)
+      self.updateConfiguration(normalizedIDs)
+
+      try await AppStore.sync()
+
+      let evidence = await Self.currentAndUnfinishedEvidence(
+        productIDs: normalizedIDs,
+        source: "restore"
+      )
+      let unfinishedIDs = await Self.unfinishedTransactionIDs(
+        productIDs: normalizedIDs
+      )
+      let snapshot = await Self.makeSnapshot(productIDs: normalizedIDs)
+      return Self.outcome(
+        "restored",
+        evidence: evidence,
+        unfinishedTransactionIDs: unfinishedIDs,
+        snapshot: snapshot
+      )
+    }
+
+    AsyncFunction("getUnfinishedTransactions") { () async -> [String: Any] in
+      let productIDs = self.configuredProductIDsSnapshot()
+      let evidence = await Self.unfinishedEvidence(
+        productIDs: productIDs,
+        source: "unfinished_request"
+      )
+      return Self.outcome(
+        "unfinished",
+        evidence: evidence,
+        unfinishedTransactionIDs: Self.transactionIDs(from: evidence)
+      )
+    }
+
+    AsyncFunction("finishTransactions") { (transactionIDs: [String]) async -> [String: Any] in
+      let requestedIDs = Set(
+        transactionIDs
+          .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+          .filter { !$0.isEmpty }
+      )
+      let productIDs = self.configuredProductIDsSnapshot()
+      let finishedIDs = await Self.finishTransactions(
+        transactionIDs: requestedIDs,
+        productIDs: productIDs
+      )
+      let remainingIDs = await Self.unfinishedTransactionIDs(
+        productIDs: productIDs
+      )
+      let missingIDs = requestedIDs.subtracting(finishedIDs).sorted()
+      let snapshot = await Self.makeSnapshot(productIDs: productIDs)
+
+      var result = Self.outcome(
+        "finished",
+        unfinishedTransactionIDs: remainingIDs,
+        snapshot: snapshot
+      )
+      result["finishedTransactionIds"] = finishedIDs.sorted()
+      result["notFoundTransactionIds"] = missingIDs
+      return result
+    }
+
     OnStartObserving(subscriptionChangedEvent) {
-      self.beginObserving()
+      self.beginStatusObserving()
     }
 
     OnStopObserving(subscriptionChangedEvent) {
-      self.endObserving()
+      self.endStatusObserving()
+    }
+
+    OnStartObserving(transactionChangedEvent) {
+      self.beginTransactionObserving()
+    }
+
+    OnStopObserving(transactionChangedEvent) {
+      self.endTransactionObserving()
     }
 
     OnAppBecomesActive {
       self.scheduleStatusEvent(reason: "app_became_active")
+      self.scheduleUnfinishedEvent(reason: "app_became_active")
     }
 
     OnDestroy {
-      self.endObserving()
+      self.endAllObserving()
     }
   }
 
@@ -55,32 +200,78 @@ public final class AppleSubscriptionsModule: Module {
       }
 
       configuredProductIDs = productIDs
-      if isObserving {
+      if isObservingStatus {
         scheduleStatusEventLocked(reason: "configuration_changed")
+      }
+      if isObservingTransactions {
+        scheduleUnfinishedEventLocked(reason: "configuration_changed")
       }
     }
   }
 
-  private func beginObserving() {
+  private func configuredProductIDsSnapshot() -> [String] {
+    stateQueue.sync { configuredProductIDs }
+  }
+
+  private func beginStatusObserving() {
     stateQueue.async {
-      self.isObserving = true
-      self.startUpdateListenersLocked()
+      self.isObservingStatus = true
+      self.reconcileUpdateListenersLocked()
+      self.scheduleStatusEventLocked(reason: "listener_started")
     }
   }
 
-  private func startUpdateListenersLocked() {
-    if transactionUpdatesTask == nil {
+  private func endStatusObserving() {
+    stateQueue.async {
+      self.isObservingStatus = false
+      self.refreshGeneration += 1
+      self.refreshTask?.cancel()
+      self.refreshTask = nil
+      self.reconcileUpdateListenersLocked()
+    }
+  }
+
+  private func beginTransactionObserving() {
+    stateQueue.async {
+      self.isObservingTransactions = true
+      self.reconcileUpdateListenersLocked()
+      self.scheduleUnfinishedEventLocked(reason: "listener_started")
+    }
+  }
+
+  private func endTransactionObserving() {
+    stateQueue.async {
+      self.isObservingTransactions = false
+      self.unfinishedRefreshTask?.cancel()
+      self.unfinishedRefreshTask = nil
+      self.reconcileUpdateListenersLocked()
+    }
+  }
+
+  private func endAllObserving() {
+    stateQueue.async {
+      self.isObservingStatus = false
+      self.isObservingTransactions = false
+      self.stopAllUpdateListenersLocked()
+    }
+  }
+
+  private func reconcileUpdateListenersLocked() {
+    if (isObservingStatus || isObservingTransactions) && transactionUpdatesTask == nil {
       transactionUpdatesTask = Task { [weak self] in
-        for await _ in StoreKit.Transaction.updates {
+        for await verificationResult in StoreKit.Transaction.updates {
           guard !Task.isCancelled else {
             return
           }
-          self?.scheduleStatusEvent(reason: "transaction_updated")
+          await self?.handleTransactionUpdate(verificationResult)
         }
       }
+    } else if !isObservingStatus && !isObservingTransactions {
+      transactionUpdatesTask?.cancel()
+      transactionUpdatesTask = nil
     }
 
-    if statusUpdatesTask == nil {
+    if isObservingStatus && statusUpdatesTask == nil {
       statusUpdatesTask = Task { [weak self] in
         for await _ in Product.SubscriptionInfo.Status.updates {
           guard !Task.isCancelled else {
@@ -89,17 +280,36 @@ public final class AppleSubscriptionsModule: Module {
           self?.scheduleStatusEvent(reason: "subscription_status_updated")
         }
       }
+    } else if !isObservingStatus {
+      statusUpdatesTask?.cancel()
+      statusUpdatesTask = nil
     }
   }
 
-  private func endObserving() {
-    stateQueue.async {
-      self.isObserving = false
-      self.stopUpdateListenersLocked()
+  private func handleTransactionUpdate(
+    _ verificationResult: VerificationResult<StoreKit.Transaction>
+  ) async {
+    let productIDs = configuredProductIDsSnapshot()
+    let transaction = Self.transaction(from: verificationResult)
+    guard Self.matchesCatalog(transaction, productIDs: productIDs) else {
+      return
     }
+
+    let evidence = await Self.makeEvidence(
+      verificationResult,
+      source: "transaction_update"
+    )
+    publishTransactionOutcome(
+      Self.outcome(
+        "transaction_updated",
+        evidence: [evidence],
+        unfinishedTransactionIDs: Self.transactionIDs(from: [evidence])
+      )
+    )
+    scheduleStatusEvent(reason: "transaction_updated")
   }
 
-  private func stopUpdateListenersLocked() {
+  private func stopAllUpdateListenersLocked() {
     refreshGeneration += 1
     transactionUpdatesTask?.cancel()
     transactionUpdatesTask = nil
@@ -107,6 +317,8 @@ public final class AppleSubscriptionsModule: Module {
     statusUpdatesTask = nil
     refreshTask?.cancel()
     refreshTask = nil
+    unfinishedRefreshTask?.cancel()
+    unfinishedRefreshTask = nil
   }
 
   private func scheduleStatusEvent(reason: String) {
@@ -116,7 +328,7 @@ public final class AppleSubscriptionsModule: Module {
   }
 
   private func scheduleStatusEventLocked(reason: String) {
-    guard isObserving else {
+    guard isObservingStatus else {
       return
     }
 
@@ -136,18 +348,323 @@ public final class AppleSubscriptionsModule: Module {
     }
   }
 
+  private func scheduleUnfinishedEvent(reason: String) {
+    stateQueue.async { [weak self] in
+      self?.scheduleUnfinishedEventLocked(reason: reason)
+    }
+  }
+
+  private func scheduleUnfinishedEventLocked(reason: String) {
+    guard isObservingTransactions else {
+      return
+    }
+
+    unfinishedRefreshTask?.cancel()
+    let productIDs = configuredProductIDs
+    unfinishedRefreshTask = Task { [weak self] in
+      let evidence = await Self.unfinishedEvidence(
+        productIDs: productIDs,
+        source: reason
+      )
+      guard !Task.isCancelled, !evidence.isEmpty else {
+        return
+      }
+
+      self?.publishTransactionOutcome(
+        Self.outcome(
+          "unfinished",
+          evidence: evidence,
+          unfinishedTransactionIDs: Self.transactionIDs(from: evidence)
+        )
+      )
+    }
+  }
+
+  private func publishTransactionOutcome(_ result: [String: Any]) {
+    stateQueue.async { [weak self] in
+      guard let self, self.isObservingTransactions else {
+        return
+      }
+      self.sendEvent(transactionChangedEvent, result)
+    }
+  }
+
   private func publishStatusEvent(
     _ snapshot: [String: Any],
     generation: Int
   ) {
     stateQueue.async { [weak self] in
       guard let self,
-            self.isObserving,
+            self.isObservingStatus,
             self.refreshGeneration == generation else {
         return
       }
 
       self.sendEvent(subscriptionChangedEvent, snapshot)
+    }
+  }
+
+  private static func loadProducts(
+    productIDs: [String]
+  ) async throws -> [[String: Any]] {
+    guard !productIDs.isEmpty else {
+      return []
+    }
+
+    let products = try await Product.products(for: productIDs)
+    let productsByID = Dictionary(uniqueKeysWithValues: products.map { ($0.id, $0) })
+
+    return productIDs.compactMap { productID in
+      guard let product = productsByID[productID],
+            product.type == .autoRenewable,
+            let subscription = product.subscription else {
+        return nil
+      }
+
+      let period = subscription.subscriptionPeriod
+      return [
+        "productId": product.id,
+        "displayName": product.displayName,
+        "description": product.description,
+        "displayPrice": product.displayPrice,
+        "price": NSDecimalNumber(decimal: product.price).stringValue,
+        "type": "auto_renewable",
+        "subscriptionGroupId": subscription.subscriptionGroupID,
+        "subscriptionGroupDisplayName": subscription.groupDisplayName,
+        "groupLevel": subscription.groupLevel,
+        "period": [
+          "value": period.value,
+          "unit": normalizedPeriodUnit(period.unit),
+        ],
+        "isFamilyShareable": product.isFamilyShareable,
+      ]
+    }
+  }
+
+  @MainActor
+  private static func purchase(
+    product: Product,
+    appAccountToken: UUID
+  ) async throws -> Product.PurchaseResult {
+    let windowScenes = UIApplication.shared.connectedScenes
+      .compactMap { $0 as? UIWindowScene }
+    guard let windowScene = windowScenes.first(where: {
+      $0.activationState == .foregroundActive
+    }) ?? windowScenes.first else {
+      throw AppleSubscriptionBridgeError.noActiveWindowScene
+    }
+
+    return try await product.purchase(
+      confirmIn: windowScene,
+      options: [.appAccountToken(appAccountToken)]
+    )
+  }
+
+  private static func makeEvidence(
+    _ verificationResult: VerificationResult<StoreKit.Transaction>,
+    source: String
+  ) async -> [String: Any] {
+    let transaction: StoreKit.Transaction
+    let localVerification: String
+    let localVerificationError: String?
+
+    switch verificationResult {
+    case .verified(let verifiedTransaction):
+      transaction = verifiedTransaction
+      localVerification = "verified"
+      localVerificationError = nil
+    case .unverified(let unverifiedTransaction, let error):
+      transaction = unverifiedTransaction
+      localVerification = "unverified"
+      localVerificationError = error.localizedDescription
+    }
+
+    let renewalEvidence = await signedRenewalEvidence(for: transaction)
+    return [
+      "signedTransactionInfo": verificationResult.jwsRepresentation,
+      "signedRenewalInfo": bridgeValue(renewalEvidence.jws),
+      "transactionId": String(transaction.id),
+      "originalTransactionId": String(transaction.originalID),
+      "productId": transaction.productID,
+      "subscriptionGroupId": bridgeValue(transaction.subscriptionGroupID),
+      "appAccountToken": bridgeValue(
+        transaction.appAccountToken?.uuidString.lowercased()
+      ),
+      "purchaseDate": iso8601String(transaction.purchaseDate),
+      "expirationDate": bridgeValue(transaction.expirationDate.map(iso8601String)),
+      "revocationDate": bridgeValue(transaction.revocationDate.map(iso8601String)),
+      "localVerification": localVerification,
+      "localVerificationError": bridgeValue(localVerificationError),
+      "renewalLocalVerification": bridgeValue(renewalEvidence.localVerification),
+      "source": source,
+    ]
+  }
+
+  private static func signedRenewalEvidence(
+    for transaction: StoreKit.Transaction
+  ) async -> (jws: String?, localVerification: String?) {
+    guard transaction.productType == .autoRenewable,
+          let subscriptionStatus = await transaction.subscriptionStatus else {
+      return (nil, nil)
+    }
+
+    let verification: String
+    switch subscriptionStatus.renewalInfo {
+    case .verified:
+      verification = "verified"
+    case .unverified:
+      verification = "unverified"
+    }
+    return (subscriptionStatus.renewalInfo.jwsRepresentation, verification)
+  }
+
+  private static func currentAndUnfinishedEvidence(
+    productIDs: [String],
+    source: String
+  ) async -> [[String: Any]] {
+    var evidenceByTransactionID: [String: [String: Any]] = [:]
+
+    for await verificationResult in StoreKit.Transaction.currentEntitlements {
+      let transaction = transaction(from: verificationResult)
+      guard matchesCatalog(transaction, productIDs: productIDs) else {
+        continue
+      }
+      evidenceByTransactionID[String(transaction.id)] = await makeEvidence(
+        verificationResult,
+        source: source
+      )
+    }
+
+    for await verificationResult in StoreKit.Transaction.unfinished {
+      let transaction = transaction(from: verificationResult)
+      guard matchesCatalog(transaction, productIDs: productIDs) else {
+        continue
+      }
+      evidenceByTransactionID[String(transaction.id)] = await makeEvidence(
+        verificationResult,
+        source: source
+      )
+    }
+
+    return evidenceByTransactionID.values.sorted {
+      ($0["transactionId"] as? String ?? "") <
+        ($1["transactionId"] as? String ?? "")
+    }
+  }
+
+  private static func unfinishedEvidence(
+    productIDs: [String],
+    source: String
+  ) async -> [[String: Any]] {
+    var evidence: [[String: Any]] = []
+    for await verificationResult in StoreKit.Transaction.unfinished {
+      let transaction = transaction(from: verificationResult)
+      guard matchesCatalog(transaction, productIDs: productIDs) else {
+        continue
+      }
+      evidence.append(
+        await makeEvidence(verificationResult, source: source)
+      )
+    }
+    return evidence.sorted {
+      ($0["transactionId"] as? String ?? "") <
+        ($1["transactionId"] as? String ?? "")
+    }
+  }
+
+  private static func unfinishedTransactionIDs(
+    productIDs: [String]
+  ) async -> [String] {
+    var transactionIDs = Set<String>()
+    for await verificationResult in StoreKit.Transaction.unfinished {
+      let transaction = transaction(from: verificationResult)
+      guard matchesCatalog(transaction, productIDs: productIDs) else {
+        continue
+      }
+      transactionIDs.insert(String(transaction.id))
+    }
+    return transactionIDs.sorted()
+  }
+
+  private static func finishTransactions(
+    transactionIDs: Set<String>,
+    productIDs: [String]
+  ) async -> Set<String> {
+    guard !transactionIDs.isEmpty else {
+      return []
+    }
+
+    var finishedIDs = Set<String>()
+    for await verificationResult in StoreKit.Transaction.unfinished {
+      let transaction = transaction(from: verificationResult)
+      let transactionID = String(transaction.id)
+      guard transactionIDs.contains(transactionID),
+            matchesCatalog(transaction, productIDs: productIDs) else {
+        continue
+      }
+
+      await transaction.finish()
+      finishedIDs.insert(transactionID)
+    }
+    return finishedIDs
+  }
+
+  private static func transaction(
+    from verificationResult: VerificationResult<StoreKit.Transaction>
+  ) -> StoreKit.Transaction {
+    switch verificationResult {
+    case .verified(let transaction), .unverified(let transaction, _):
+      return transaction
+    }
+  }
+
+  private static func matchesCatalog(
+    _ transaction: StoreKit.Transaction,
+    productIDs: [String]
+  ) -> Bool {
+    transaction.productType == .autoRenewable &&
+      productIDs.contains(transaction.productID)
+  }
+
+  private static func transactionIDs(
+    from evidence: [[String: Any]]
+  ) -> [String] {
+    Array(
+      Set(evidence.compactMap { $0["transactionId"] as? String })
+    ).sorted()
+  }
+
+  private static func outcome(
+    _ outcome: String,
+    evidence: [[String: Any]] = [],
+    unfinishedTransactionIDs: [String] = [],
+    snapshot: [String: Any]? = nil
+  ) -> [String: Any] {
+    var result: [String: Any] = [
+      "outcome": outcome,
+      "evidence": evidence,
+      "unfinishedTransactionIds": unfinishedTransactionIDs,
+    ]
+    if let snapshot {
+      result["snapshot"] = snapshot
+    }
+    return result
+  }
+
+  private static func normalizedPeriodUnit(
+    _ unit: Product.SubscriptionPeriod.Unit
+  ) -> String {
+    switch unit {
+    case .day:
+      return "day"
+    case .week:
+      return "week"
+    case .month:
+      return "month"
+    case .year:
+      return "year"
+    @unknown default:
+      return "unknown"
     }
   }
 
@@ -349,6 +866,35 @@ public final class AppleSubscriptionsModule: Module {
           .filter { !$0.isEmpty }
       )
     ).sorted()
+  }
+}
+
+private enum AppleSubscriptionBridgeError: LocalizedError {
+  case invalidProductID
+  case productNotConfigured(String)
+  case invalidAppAccountToken
+  case productUnavailable(String)
+  case unsupportedProductType(String)
+  case noActiveWindowScene
+  case unknownPurchaseResult
+
+  var errorDescription: String? {
+    switch self {
+    case .invalidProductID:
+      return "A subscription product ID is required."
+    case .productNotConfigured(let productID):
+      return "The subscription product \(productID) is not in the current server catalog."
+    case .invalidAppAccountToken:
+      return "The backend app account token must be a valid UUID."
+    case .productUnavailable(let productID):
+      return "Apple did not return the subscription product \(productID)."
+    case .unsupportedProductType(let productID):
+      return "The product \(productID) is not an auto-renewable subscription."
+    case .noActiveWindowScene:
+      return "A foreground app window is required to present the Apple purchase sheet."
+    case .unknownPurchaseResult:
+      return "Apple returned an unsupported purchase result."
+    }
   }
 }
 

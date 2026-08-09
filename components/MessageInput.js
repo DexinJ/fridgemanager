@@ -6,7 +6,8 @@ import {
   useAudioRecorder,
   useAudioRecorderState,
 } from "expo-audio";
-import { useContext, useState } from "react";
+import { onAuthStateChanged } from "firebase/auth";
+import { useContext, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -18,21 +19,72 @@ import {
   View,
 } from "react-native";
 import { auth } from "../auth/firebaseClient";
+import { API_BASE_URL } from "../api/backendConfig";
+import {
+  createBackendResponseError,
+  parseBackendResponseText,
+} from "../api/backendErrors";
 import { GlobalContext } from "../context/GlobalContext";
+import { useAccountSession } from "../context/AccountSessionContext";
 import PlusMenu from "./PlusMenu";
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL;
+const MAX_RECORDING_SECONDS = 60;
+const TRANSCRIPTION_TIMEOUT_MS = 90_000;
+const VOICE_RECORDING_PRESET = {
+  ...RecordingPresets.LOW_QUALITY,
+  extension: ".m4a",
+  sampleRate: 16_000,
+  numberOfChannels: 1,
+  bitRate: 32_000,
+  android: RecordingPresets.HIGH_QUALITY.android,
+  web: {
+    ...RecordingPresets.LOW_QUALITY.web,
+    bitsPerSecond: 32_000,
+  },
+};
 
 export default function MessageInput({ value, onChangeText, onSend }) {
   const { settings, theme, receiving } = useContext(GlobalContext);
+  const { updateQuota } = useAccountSession();
 
   const fontSize = settings?.ux?.fontSize || 16;
 
   const [voiceMode, setVoiceMode] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
+  const recordingSessionRef = useRef(false);
+  const recordingPressIntentRef = useRef(false);
+  const transcriptionControllerRef = useRef(null);
+  const mountedRef = useRef(true);
 
-  const audioRecorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+  const audioRecorder = useAudioRecorder(VOICE_RECORDING_PRESET);
   const recorderState = useAudioRecorderState(audioRecorder);
+
+  useEffect(() => {
+    const unsubscribeAuth = onAuthStateChanged(auth, () => {
+      transcriptionControllerRef.current?.abort();
+    });
+
+    return () => {
+      mountedRef.current = false;
+      transcriptionControllerRef.current?.abort();
+      unsubscribeAuth();
+    };
+  }, []);
+
+  useEffect(
+    () => () => {
+      recordingPressIntentRef.current = false;
+      recordingSessionRef.current = false;
+      if (audioRecorder.isRecording) {
+        void audioRecorder.stop().catch(() => {});
+      }
+      void setAudioModeAsync({
+        allowsRecording: false,
+        playsInSilentMode: true,
+      }).catch(() => {});
+    },
+    [audioRecorder]
+  );
 
   const isBusy =
     receiving ||
@@ -70,6 +122,7 @@ export default function MessageInput({ value, onChangeText, onSend }) {
         await AudioModule.requestRecordingPermissionsAsync();
 
       if (!permission.granted) {
+        recordingPressIntentRef.current = false;
         Alert.alert(
           "Microphone permission required",
           "Please allow microphone access to use voice messages."
@@ -77,14 +130,30 @@ export default function MessageInput({ value, onChangeText, onSend }) {
         return;
       }
 
+      if (!recordingPressIntentRef.current) return;
+
       await setAudioModeAsync({
         allowsRecording: true,
         playsInSilentMode: true,
       });
 
       await audioRecorder.prepareToRecordAsync();
-      audioRecorder.record();
+      if (!recordingPressIntentRef.current) {
+        await setAudioModeAsync({
+          allowsRecording: false,
+          playsInSilentMode: true,
+        });
+        return;
+      }
+      recordingSessionRef.current = true;
+      audioRecorder.record({ forDuration: MAX_RECORDING_SECONDS });
     } catch (error) {
+      recordingPressIntentRef.current = false;
+      recordingSessionRef.current = false;
+      await setAudioModeAsync({
+        allowsRecording: false,
+        playsInSilentMode: true,
+      }).catch(() => {});
       console.error("Failed to start recording:", error);
 
       Alert.alert(
@@ -95,12 +164,17 @@ export default function MessageInput({ value, onChangeText, onSend }) {
   };
 
   const stopRecordingAndTranscribe = async () => {
-    if (!recorderState.isRecording) {
+    recordingPressIntentRef.current = false;
+    if (!recordingSessionRef.current && !audioRecorder.isRecording) {
       return;
     }
 
+    recordingSessionRef.current = false;
+
     try {
-      await audioRecorder.stop();
+      if (audioRecorder.isRecording) {
+        await audioRecorder.stop();
+      }
 
       const uri = audioRecorder.uri;
 
@@ -115,6 +189,10 @@ export default function MessageInput({ value, onChangeText, onSend }) {
 
       await transcribeAudio(uri);
     } catch (error) {
+      await setAudioModeAsync({
+        allowsRecording: false,
+        playsInSilentMode: true,
+      }).catch(() => {});
       console.error("Failed to stop or transcribe recording:", error);
 
       Alert.alert(
@@ -127,12 +205,15 @@ export default function MessageInput({ value, onChangeText, onSend }) {
   };
 
   const transcribeAudio = async (uri) => {
-    if (!API_URL) {
-      throw new Error("EXPO_PUBLIC_API_URL is not configured.");
-    }
-  
     setTranscribing(true);
-  
+    transcriptionControllerRef.current?.abort();
+    const controller = new AbortController();
+    transcriptionControllerRef.current = controller;
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      TRANSCRIPTION_TIMEOUT_MS
+    );
+
     try {
       const formData = new FormData();
   
@@ -158,34 +239,29 @@ export default function MessageInput({ value, onChangeText, onSend }) {
       const token = await user.getIdToken();
   
       const response = await fetch(
-        `${API_URL}/api/transcriptions`,
+        `${API_BASE_URL}/api/transcriptions`,
         {
           method: "POST",
           headers: {
             Authorization: `Bearer ${token}`,
           },
           body: formData,
+          signal: controller.signal,
         }
       );
   
       const responseText = await response.text();
-  
-      let data;
-  
-      try {
-        data = JSON.parse(responseText);
-      } catch {
-        data = {
-          error: responseText || "Invalid server response.",
-        };
+      const data = parseBackendResponseText(responseText);
+
+      if (data?.quota) {
+        updateQuota(data.quota);
       }
   
       if (!response.ok) {
-        throw new Error(
-          data?.error ||
-            data?.message ||
-            `Transcription failed with status ${response.status}.`
-        );
+        throw createBackendResponseError(data, {
+          status: response.status,
+          fallbackMessage: `Transcription failed with status ${response.status}.`,
+        });
       }
   
       const transcript = data?.text?.trim();
@@ -203,17 +279,30 @@ export default function MessageInput({ value, onChangeText, onSend }) {
       });
     } catch (error) {
       console.error("Transcription failed:", error);
-  
-      Alert.alert(
-        "Voice Transcription",
-        error.message || "Failed to transcribe recording."
-      );
+
+      if (error?.quota) {
+        updateQuota(error.quota);
+      }
+
+      if (mountedRef.current) {
+        Alert.alert(
+          "Voice Transcription",
+          error?.name === "AbortError"
+            ? "The transcription request timed out. Please try again."
+            : error.message || "Failed to transcribe recording."
+        );
+      }
     } finally {
-      setTranscribing(false);
+      clearTimeout(timeoutId);
+      if (transcriptionControllerRef.current === controller) {
+        transcriptionControllerRef.current = null;
+      }
+      if (mountedRef.current) setTranscribing(false);
     }
   };
 
   const handlePressIn = async () => {
+    recordingPressIntentRef.current = true;
     await startRecording();
   };
 
@@ -222,12 +311,20 @@ export default function MessageInput({ value, onChangeText, onSend }) {
   };
 
   const leaveVoiceMode = async () => {
-    if (recorderState.isRecording) {
-      try {
+    recordingPressIntentRef.current = false;
+    recordingSessionRef.current = false;
+
+    try {
+      if (audioRecorder.isRecording) {
         await audioRecorder.stop();
-      } catch (error) {
-        console.error("Failed to cancel recording:", error);
       }
+    } catch (error) {
+      console.error("Failed to cancel recording:", error);
+    } finally {
+      await setAudioModeAsync({
+        allowsRecording: false,
+        playsInSilentMode: true,
+      }).catch(() => {});
     }
 
     setVoiceMode(false);

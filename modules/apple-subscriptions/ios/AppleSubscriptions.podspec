@@ -1,8 +1,8 @@
 Pod::Spec.new do |s|
   s.name           = 'AppleSubscriptions'
   s.version        = '1.0.0'
-  s.summary        = 'Pantrio StoreKit subscription status bridge'
-  s.description    = 'Observes verified StoreKit 2 subscription and entitlement status.'
+  s.summary        = 'Pantrio StoreKit subscription bridge'
+  s.description    = 'Loads plans, purchases with account tokens, and forwards signed StoreKit 2 evidence.'
   s.license        = { :type => 'MIT' }
   s.author         = 'Pantrio'
   s.homepage       = 'https://example.invalid'

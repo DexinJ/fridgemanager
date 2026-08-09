@@ -15,6 +15,7 @@ import {
 import { createUserWithEmailAndPassword } from "firebase/auth";
 
 import { signInWithApple } from "../../auth/appleAuth"; // ✅ CHANGED: Apple login helper
+import { API_BASE_URL } from "../../api/backendConfig";
 import { auth } from "../../auth/firebaseClient";
 import {
   configureGoogleSignIn,
@@ -22,10 +23,8 @@ import {
 } from "../../auth/googleAuth";
 import { GlobalContext } from "../../context/GlobalContext";
 
-const BACKEND_HTTP_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "https://oversanguinely-metabolous-maxine.ngrok-free.dev";
-
 async function saveUserProfileToBackend({ idToken, username }) {
-  const resp = await fetch(`${BACKEND_HTTP_URL}/api/users`, {
+  const resp = await fetch(`${API_BASE_URL}/api/users`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

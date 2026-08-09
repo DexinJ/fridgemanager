@@ -14,8 +14,16 @@ import React, {
 } from "react";
 import { useColorScheme } from "react-native";
 import { v4 as uuidv4 } from "uuid";
+import { API_BASE_URL } from "../api/backendConfig";
 import { clearChatData, loadChatData } from "../api/memoryManager";
-import { clearCustomAiProviderSettings } from "../api/aiProviderSettings";
+import {
+  clearCustomAiProviderSettings,
+  migrateLegacyCustomAiProviderSettings,
+} from "../api/aiProviderSettings";
+import {
+  getUserStorageKeys,
+  migrateLegacyAsyncStorageForUser,
+} from "../api/storageKeys";
 
 // ❌ REMOVED: import { useAuth } from "../auth/useAuth";
 
@@ -49,11 +57,6 @@ import {
 } from "../utils/tags";
 
 const AI_PROVIDER_VALUES = new Set(["pantrio", "apple", "custom"]);
-
-// ✅ Make sure you have this env set in Expo:
-// EXPO_PUBLIC_API_BASE_URL=http://192.168.0.163:3000
-const API_BASE_URL =
-  process.env.EXPO_PUBLIC_API_BASE_URL || "http://localhost:3000";
 
 export const GlobalContext = createContext();
 
@@ -333,6 +336,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   // ✅ CHANGED:
   // Use authUser passed from _layout.
   const user = authUser;
+  const storageOwnerUid = user?.uid || null;
 
   // ---------------------------
   // Smart chat persistence refs
@@ -413,13 +417,38 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     let cancelled = false;
 
     const loadData = async () => {
+      if (!storageOwnerUid) {
+        chatHydratedRef.current = true;
+        chatLastSavedAtRef.current = Date.now();
+        setStorageHydrated(true);
+        return;
+      }
+
       try {
+        await migrateLegacyAsyncStorageForUser(storageOwnerUid);
+        const storageKeys = getUserStorageKeys(storageOwnerUid);
         const [fridgeData, shoppingData, settingsData] =
           await Promise.all([
-            AsyncStorage.getItem("@fridgeItems"),
-            AsyncStorage.getItem("@shoppingListItems"),
-            AsyncStorage.getItem("@appSettings"),
+            AsyncStorage.getItem(storageKeys.fridgeItems),
+            AsyncStorage.getItem(storageKeys.shoppingListItems),
+            AsyncStorage.getItem(storageKeys.appSettings),
           ]);
+
+        let providerMigrationBaseUrl = defaultSettings.advanced.aiBaseUrl;
+        let providerMigrationModel = defaultSettings.advanced.aiModel;
+        if (settingsData) {
+          const migrationSettings = JSON.parse(settingsData);
+          const migrationAdvanced = migrationSettings?.advanced || {};
+          providerMigrationBaseUrl =
+            migrationAdvanced.aiBaseUrl || providerMigrationBaseUrl;
+          providerMigrationModel =
+            migrationAdvanced.aiModel || providerMigrationModel;
+        }
+
+        await migrateLegacyCustomAiProviderSettings(storageOwnerUid, {
+          baseUrl: providerMigrationBaseUrl,
+          fallbackModel: providerMigrationModel,
+        });
 
         if (cancelled) return;
 
@@ -449,7 +478,6 @@ export const GlobalProvider = ({ children, authUser = null }) => {
             : storedAdvanced.useCustomAi
               ? "custom"
               : "pantrio";
-
           setSettings((prev) => ({
             ...prev,
             ...parsedSettings,
@@ -482,7 +510,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
           }));
         }
 
-        await loadChatData(setMessages, setSummary);
+        await loadChatData(storageOwnerUid, setMessages, setSummary);
       } catch (error) {
         console.error("Error loading local data:", error);
       } finally {
@@ -503,27 +531,27 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     return () => {
       cancelled = true;
     };
-  }, [defaultSettings]);
+  }, [defaultSettings, storageOwnerUid]);
 
   // ---------------------------------------
   // Smart chat saving
   // ---------------------------------------
   useEffect(() => {
-    if (!chatHydratedRef.current) return;
+    if (!chatHydratedRef.current || !storageOwnerUid) return;
 
-    const KEY = "@chatMessages";
+    const { chatMessages } = getUserStorageKeys(storageOwnerUid);
 
     const doSave = async () => {
       try {
         chatLastSavedAtRef.current = Date.now();
 
         await AsyncStorage.setItem(
-          KEY,
+          chatMessages,
           JSON.stringify(messages)
         );
       } catch (error) {
         console.warn(
-          "save @chatMessages failed:",
+          "save scoped chat messages failed:",
           error
         );
       }
@@ -564,7 +592,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         chatSaveTimerRef.current = null;
       }
     };
-  }, [messages, receiving]);
+  }, [messages, receiving, storageOwnerUid]);
 
   // ---------------------------------------
   // Fetch username after login
@@ -573,6 +601,10 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     let cancelled = false;
 
     async function loadUserIntoSettings() {
+      // Let the UID-scoped local settings finish hydrating first so a late
+      // local read cannot overwrite the authoritative backend username.
+      if (!storageHydrated) return;
+
       if (!user) {
         setSettings((prev) => ({
           ...prev,
@@ -656,7 +688,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     return () => {
       cancelled = true;
     };
-  }, [user]);
+  }, [storageHydrated, user]);
 
   // ---------------------------------------
   // Save fridge, shopping list, and settings
@@ -666,21 +698,23 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   // Do not overwrite stored data with initial empty/default
   // values during app startup.
   useEffect(() => {
-    if (!storageHydrated) return;
+    if (!storageHydrated || !storageOwnerUid) return;
+
+    const storageKeys = getUserStorageKeys(storageOwnerUid);
 
     const saveData = async () => {
       try {
         await Promise.all([
           AsyncStorage.setItem(
-            "@fridgeItems",
+            storageKeys.fridgeItems,
             JSON.stringify(fridgeItemsRaw)
           ),
           AsyncStorage.setItem(
-            "@shoppingListItems",
+            storageKeys.shoppingListItems,
             JSON.stringify(shoppingListItems)
           ),
           AsyncStorage.setItem(
-            "@appSettings",
+            storageKeys.appSettings,
             JSON.stringify(settings)
           ),
         ]);
@@ -698,6 +732,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     fridgeItemsRaw,
     shoppingListItems,
     settings,
+    storageOwnerUid,
   ]);
 
   // --- Settings updater ---
@@ -1366,19 +1401,20 @@ export const GlobalProvider = ({ children, authUser = null }) => {
       setShoppingListItems([]);
       setSettings(defaultSettings);
 
-      await AsyncStorage.multiRemove([
-        "@fridgeItems",
-        "@shoppingListItems",
-        "@appSettings",
-        "@chatMessages",
-        "@chatSummary",
-      ]);
-      await clearCustomAiProviderSettings();
+      if (storageOwnerUid) {
+        const storageKeys = getUserStorageKeys(storageOwnerUid);
 
-      await clearChatData(
-        setMessages,
-        setSummary
-      );
+        await AsyncStorage.multiRemove([
+          storageKeys.fridgeItems,
+          storageKeys.shoppingListItems,
+          storageKeys.appSettings,
+        ]);
+        await clearCustomAiProviderSettings(storageOwnerUid);
+        await clearChatData(storageOwnerUid, setMessages, setSummary);
+      } else {
+        setMessages([]);
+        setSummary("");
+      }
 
       console.log(
         "All data cleared!"
@@ -1398,6 +1434,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         shoppingListItems,
         settings,
         storageHydrated,
+        storageOwnerUid,
         tags,
 
         FOOD_TYPE_RULES,

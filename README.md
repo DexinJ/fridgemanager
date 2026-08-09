@@ -16,7 +16,7 @@ The client application provides the mobile interface, local data storage, Fireba
 * Light and dark themes
 * Configurable notifications and expiration reminders
 * Account profile management
-* Live Apple in-app subscription status and plan detection on iOS
+* Account-linked Apple subscriptions with server-verified StoreKit transactions
 * Permanent account deletion
 * Local offline data storage
 * Chat history and memory management
@@ -91,20 +91,41 @@ EXPO_PUBLIC_WS_URL=wss://api.example.com/chat
 
 Do not include a trailing slash in `EXPO_PUBLIC_API_BASE_URL`.
 
-### Apple Subscription Detection
+### Apple Subscriptions
 
-Add every auto-renewable subscription product ID from App Store Connect as a
-comma-separated value:
+The backend session catalog is the source of truth for purchasable plans. It
+returns each App Store product ID with its internal `planId`; the iOS client
+then asks StoreKit for localized name, description, price, currency, and
+renewal period. Adding a plan therefore requires a backend catalog entry and
+the matching App Store Connect product, rather than a new hard-coded screen.
+
+An optional comma-separated product list can be used as a development fallback
+before an authenticated backend session is available:
 
 ```env
-EXPO_PUBLIC_APPLE_SUBSCRIPTION_PRODUCT_IDS=com.chilltech.pantrio.pro.monthly,com.chilltech.pantrio.pro.yearly
+EXPO_PUBLIC_APPLE_SUBSCRIPTION_PRODUCT_IDS=com.chilltech.pantrio.subscription.monthly,com.chilltech.pantrio.subscription.yearly
+EXPO_PUBLIC_TERMS_OF_USE_URL=https://www.apple.com/legal/internet-services/itunes/dev/stdeula/
+EXPO_PUBLIC_PRIVACY_POLICY_URL=https://example.com/privacy
 ```
 
-The iOS client checks verified StoreKit 2 subscription status at startup and
-whenever the app returns to the foreground. While the app is running, it also
-listens for subscription-status and transaction changes. The Account settings
-screen shows the current status, localized product name, product ID, renewal
-behavior, and expiration date.
+`EXPO_PUBLIC_PRIVACY_POLICY_URL` must be set to Pantrio's real, public privacy
+policy before a production build. The app does not invent or default that URL.
+If `EXPO_PUBLIC_TERMS_OF_USE_URL` is omitted, the UI links to Apple's standard
+EULA.
+
+The backend creates one stable anonymous `appAccountToken` UUID for every
+Firebase user and returns it from `GET /api/session`. Every purchase includes
+that UUID. The app sends Apple's signed transaction evidence to
+`POST /api/subscriptions/apple/verify`, finishes only the transaction IDs the
+backend accepts, and refreshes the authoritative session. Unfinished
+transactions are retried at startup and on foreground; live StoreKit updates
+use the same idempotent verification path. Restore Purchases is explicit and
+cannot move a transaction between Pantrio accounts.
+
+The Account settings screen renders backend catalog plans with StoreKit's
+localized price and renewal period, plus Subscribe, Restore, Manage, Terms,
+and Privacy actions. Paid access is based only on the backend-verified
+entitlement, quota, and effective model returned in the session.
 
 This feature detects only in-app subscriptions that belong to Pantrio; it
 cannot inspect Apple Music, iCloud+, or subscriptions from other apps. It uses
@@ -398,29 +419,14 @@ The backend is responsible for deleting:
 
 ## Local Data Storage
 
-The app uses AsyncStorage for local persistence.
+The app uses UID-scoped AsyncStorage keys for fridge items, shopping items,
+settings, chat messages, and chat summaries. Custom-provider credentials are
+also UID-scoped in SecureStore. Use `getUserStorageKeys(uid)` rather than
+hard-coded global keys when reading, writing, or clearing account data.
 
-Common keys include:
-
-```text
-@fridgeItems
-@shoppingListItems
-@appSettings
-@tags
-@chatMessages
-```
-
-Example:
-
-```js
-await AsyncStorage.multiRemove([
-  "@fridgeItems",
-  "@shoppingListItems",
-  "@appSettings",
-  "@tags",
-  "@chatMessages",
-]);
-```
+On upgrade, the first authenticated user claims any legacy unscoped local
+data. Existing scoped values win, the old keys are removed after migration,
+and another account cannot claim interrupted migration data.
 
 The application’s `GlobalContext` centralizes most shared state and persistence behavior.
 
