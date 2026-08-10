@@ -36,6 +36,20 @@ const APPLE_EVIDENCE_SOURCES = new Set([
   "refresh",
   "transaction_update",
 ]);
+const APPLE_ACCOUNT_OPERATIONS = new Set(["purchase", "restore", "refresh"]);
+const ACCOUNT_TEARDOWN_OPERATIONS = new Set(["logout", "delete-account"]);
+
+function accountOperationInProgressError(activeOperation) {
+  const isTeardown = ACCOUNT_TEARDOWN_OPERATIONS.has(activeOperation);
+  const error = new Error(
+    isTeardown
+      ? "Account sign-out is already in progress."
+      : "Finish the current Apple subscription action before signing out or deleting the account."
+  );
+  error.code = "ACCOUNT_OPERATION_IN_PROGRESS";
+  error.activeOperation = activeOperation || null;
+  return error;
+}
 
 function finiteNumber(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -240,12 +254,14 @@ const AccountSessionContext = createContext({
   applePlans: [],
   appleProductsLoading: false,
   appleProductsError: null,
+  accountOperation: null,
   appleOperation: null,
   appleError: null,
   refreshSession: async () => null,
   purchaseApplePlan: async () => null,
   restoreApplePurchases: async () => null,
   refreshAppleSubscription: async () => null,
+  beginAccountTeardown: () => () => {},
   updateQuota: () => {},
   applyRealtimeState: () => {},
 });
@@ -270,6 +286,7 @@ export function AccountSessionProvider({ authUser = null, children }) {
   const [initialized, setInitialized] = useState(!authUser);
   const [loading, setLoading] = useState(Boolean(authUser));
   const [error, setError] = useState(null);
+  const [accountOperation, setAccountOperation] = useState(null);
   const [appleOperation, setAppleOperation] = useState(null);
   const [appleError, setAppleError] = useState(null);
   const authUserUid = authUser?.uid || null;
@@ -281,8 +298,63 @@ export function AccountSessionProvider({ authUser = null, children }) {
   const authUserUidRef = useRef(authUserUid);
   const authGenerationRef = useRef(0);
   const appleEvidenceRequestsRef = useRef(new Map());
-  const appleUserActionRef = useRef(false);
+  const accountOperationLeaseRef = useRef(null);
   const appleBootstrapKeyRef = useRef(null);
+
+  const acquireAccountOperation = useCallback((operation) => {
+    const activeOperation = accountOperationLeaseRef.current?.operation;
+    if (activeOperation) {
+      throw accountOperationInProgressError(activeOperation);
+    }
+
+    const lease = { operation };
+    accountOperationLeaseRef.current = lease;
+    if (mountedRef.current) {
+      setAccountOperation(operation);
+      if (APPLE_ACCOUNT_OPERATIONS.has(operation)) {
+        setAppleOperation(operation);
+      }
+    }
+
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (accountOperationLeaseRef.current !== lease) return;
+
+      accountOperationLeaseRef.current = null;
+      if (mountedRef.current) {
+        setAccountOperation(null);
+        if (APPLE_ACCOUNT_OPERATIONS.has(operation)) {
+          setAppleOperation(null);
+        }
+      }
+    };
+  }, []);
+
+  const beginAccountTeardown = useCallback(
+    (operation) => {
+      if (!ACCOUNT_TEARDOWN_OPERATIONS.has(operation)) {
+        throw new Error(`Unsupported account teardown operation: ${operation}`);
+      }
+
+      const release = acquireAccountOperation(operation);
+
+      // Once teardown owns the synchronous lease, cancel background account
+      // requests so they cannot publish state while auth is being removed.
+      sessionRequestGenerationRef.current += 1;
+      sessionRequestControllerRef.current?.abort();
+      sessionRequestControllerRef.current = null;
+      for (const controller of appleRequestControllersRef.current) {
+        controller.abort();
+      }
+      appleRequestControllersRef.current.clear();
+      appleEvidenceRequestsRef.current.clear();
+
+      return release;
+    },
+    [acquireAccountOperation]
+  );
 
   const applySessionPayload = useCallback((payload) => {
     if (!payload || typeof payload !== "object") return;
@@ -574,7 +646,10 @@ export function AccountSessionProvider({ authUser = null, children }) {
   }, [applySessionPayload, authenticatedAppleRequest, refreshSession]);
 
   const reconcileAppleSubscription = useCallback(
-    async (sessionPayload = sessionRef.current) => {
+    async (
+      sessionPayload = sessionRef.current,
+      operationAlreadyAcquired = false
+    ) => {
       const apple = sessionPayload?.apple;
       if (
         Platform.OS !== "ios" ||
@@ -584,28 +659,43 @@ export function AccountSessionProvider({ authUser = null, children }) {
         return null;
       }
 
-      await configureProductCatalog(apple.products || []);
-      const unfinishedEnvelope = await getUnfinishedTransactions();
-      const accountEnvelope = evidenceForAppAccount(
-        unfinishedEnvelope,
-        apple.appAccountToken
-      );
-      let refreshedSession;
-      if (accountEnvelope.evidence.length) {
-        const verification = await verifyAppleEvidence(
-          accountEnvelope,
-          "refresh",
-          sessionPayload
-        );
-        refreshedSession = verification?.session || sessionRef.current;
+      let releaseOperation = null;
+      if (operationAlreadyAcquired) {
+        const activeOperation = accountOperationLeaseRef.current?.operation;
+        if (activeOperation !== "refresh") {
+          throw accountOperationInProgressError(activeOperation);
+        }
       } else {
-        refreshedSession = await refreshServerAppleEntitlement();
-        await refreshLocalAppleSubscription().catch(() => null);
+        releaseOperation = acquireAccountOperation("refresh");
       }
-      if (mountedRef.current) setAppleError(null);
-      return refreshedSession;
+
+      try {
+        await configureProductCatalog(apple.products || []);
+        const unfinishedEnvelope = await getUnfinishedTransactions();
+        const accountEnvelope = evidenceForAppAccount(
+          unfinishedEnvelope,
+          apple.appAccountToken
+        );
+        let refreshedSession;
+        if (accountEnvelope.evidence.length) {
+          const verification = await verifyAppleEvidence(
+            accountEnvelope,
+            "refresh",
+            sessionPayload
+          );
+          refreshedSession = verification?.session || sessionRef.current;
+        } else {
+          refreshedSession = await refreshServerAppleEntitlement();
+          await refreshLocalAppleSubscription().catch(() => null);
+        }
+        if (mountedRef.current) setAppleError(null);
+        return refreshedSession;
+      } finally {
+        releaseOperation?.();
+      }
     },
     [
+      acquireAccountOperation,
       configureProductCatalog,
       getUnfinishedTransactions,
       refreshLocalAppleSubscription,
@@ -616,38 +706,29 @@ export function AccountSessionProvider({ authUser = null, children }) {
 
   const purchaseApplePlan = useCallback(
     async (productId) => {
-      if (appleUserActionRef.current) {
-        const busyError = new Error(
-          "Another Apple subscription action is already in progress."
-        );
-        busyError.code = "APPLE_OPERATION_IN_PROGRESS";
-        throw busyError;
-      }
-
+      const releaseOperation = acquireAccountOperation("purchase");
       const sessionPayload = sessionRef.current;
       const actionUid = authUserUid;
       const actionGeneration = authGenerationRef.current;
       const apple = sessionPayload?.apple;
       const catalog = Array.isArray(apple?.products) ? apple.products : [];
-      if (
-        Platform.OS !== "ios" ||
-        apple?.enabled !== true ||
-        !apple?.appAccountToken
-      ) {
-        throw new Error("Apple purchases are not available for this account.");
-      }
-      if (!catalog.some((product) => product?.productId === productId)) {
-        const productError = new Error(
-          "This subscription plan is not available for this Pantrio account."
-        );
-        productError.code = "APPLE_PRODUCT_NOT_ALLOWED";
-        throw productError;
-      }
-
-      appleUserActionRef.current = true;
-      setAppleOperation("purchase");
       setAppleError(null);
       try {
+        if (
+          Platform.OS !== "ios" ||
+          apple?.enabled !== true ||
+          !apple?.appAccountToken
+        ) {
+          throw new Error("Apple purchases are not available for this account.");
+        }
+        if (!catalog.some((product) => product?.productId === productId)) {
+          const productError = new Error(
+            "This subscription plan is not available for this Pantrio account."
+          );
+          productError.code = "APPLE_PRODUCT_NOT_ALLOWED";
+          throw productError;
+        }
+
         await configureProductCatalog(catalog);
         if (
           !mountedRef.current ||
@@ -683,40 +764,34 @@ export function AccountSessionProvider({ authUser = null, children }) {
         }
         throw nextError;
       } finally {
-        if (authGenerationRef.current === actionGeneration) {
-          appleUserActionRef.current = false;
-          if (mountedRef.current) setAppleOperation(null);
-        }
+        releaseOperation();
       }
     },
-    [authUserUid, configureProductCatalog, purchaseProduct, verifyAppleEvidence]
+    [
+      acquireAccountOperation,
+      authUserUid,
+      configureProductCatalog,
+      purchaseProduct,
+      verifyAppleEvidence,
+    ]
   );
 
   const restoreApplePurchases = useCallback(async () => {
-    if (appleUserActionRef.current) {
-      const busyError = new Error(
-        "Another Apple subscription action is already in progress."
-      );
-      busyError.code = "APPLE_OPERATION_IN_PROGRESS";
-      throw busyError;
-    }
-
+    const releaseOperation = acquireAccountOperation("restore");
     const sessionPayload = sessionRef.current;
     const actionUid = authUserUid;
     const actionGeneration = authGenerationRef.current;
     const apple = sessionPayload?.apple;
-    if (
-      Platform.OS !== "ios" ||
-      apple?.enabled !== true ||
-      !apple?.appAccountToken
-    ) {
-      throw new Error("Apple purchases are not available for this account.");
-    }
-
-    appleUserActionRef.current = true;
-    setAppleOperation("restore");
     setAppleError(null);
     try {
+      if (
+        Platform.OS !== "ios" ||
+        apple?.enabled !== true ||
+        !apple?.appAccountToken
+      ) {
+        throw new Error("Apple purchases are not available for this account.");
+      }
+
       await configureProductCatalog(apple.products || []);
       if (
         !mountedRef.current ||
@@ -749,12 +824,10 @@ export function AccountSessionProvider({ authUser = null, children }) {
       }
       throw nextError;
     } finally {
-      if (authGenerationRef.current === actionGeneration) {
-        appleUserActionRef.current = false;
-        if (mountedRef.current) setAppleOperation(null);
-      }
+      releaseOperation();
     }
   }, [
+    acquireAccountOperation,
     authUserUid,
     configureProductCatalog,
     refreshLocalAppleSubscription,
@@ -764,15 +837,13 @@ export function AccountSessionProvider({ authUser = null, children }) {
   ]);
 
   const refreshAppleSubscription = useCallback(async () => {
-    if (appleUserActionRef.current) return null;
-    appleUserActionRef.current = true;
-    const actionGeneration = authGenerationRef.current;
-    setAppleOperation("refresh");
+    const releaseOperation = acquireAccountOperation("refresh");
     setAppleError(null);
     try {
       const refreshedSession = await refreshSession();
       return await reconcileAppleSubscription(
-        refreshedSession || sessionRef.current
+        refreshedSession || sessionRef.current,
+        true
       );
     } catch (nextError) {
       if (mountedRef.current && !isSupersededAppleRequest(nextError)) {
@@ -782,12 +853,9 @@ export function AccountSessionProvider({ authUser = null, children }) {
       }
       throw nextError;
     } finally {
-      if (authGenerationRef.current === actionGeneration) {
-        appleUserActionRef.current = false;
-        if (mountedRef.current) setAppleOperation(null);
-      }
+      releaseOperation();
     }
-  }, [reconcileAppleSubscription, refreshSession]);
+  }, [acquireAccountOperation, reconcileAppleSubscription, refreshSession]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -795,6 +863,7 @@ export function AccountSessionProvider({ authUser = null, children }) {
     const appleEvidenceRequests = appleEvidenceRequestsRef.current;
     return () => {
       mountedRef.current = false;
+      accountOperationLeaseRef.current = null;
       sessionRequestGenerationRef.current += 1;
       sessionRequestControllerRef.current?.abort();
       sessionRequestControllerRef.current = null;
@@ -871,7 +940,7 @@ export function AccountSessionProvider({ authUser = null, children }) {
     }
     appleRequestControllersRef.current.clear();
     appleEvidenceRequestsRef.current.clear();
-    appleUserActionRef.current = false;
+    accountOperationLeaseRef.current = null;
     sessionRef.current = null;
     appleBootstrapKeyRef.current = null;
   }, [authUserUid]);
@@ -885,6 +954,7 @@ export function AccountSessionProvider({ authUser = null, children }) {
       setInitialized(!authUserUid);
       setLoading(Boolean(authUserUid));
       setError(null);
+      setAccountOperation(null);
       setAppleOperation(null);
       setAppleError(null);
     }, 0);
@@ -917,7 +987,11 @@ export function AccountSessionProvider({ authUser = null, children }) {
 
     const bootstrapTimer = setTimeout(() => {
       reconcileAppleSubscription(session).catch((nextError) => {
-        if (mountedRef.current && !isSupersededAppleRequest(nextError)) {
+        if (
+          mountedRef.current &&
+          !isSupersededAppleRequest(nextError) &&
+          nextError?.code !== "ACCOUNT_OPERATION_IN_PROGRESS"
+        ) {
           setAppleError(
             nextError?.message || "Could not verify the Apple subscription."
           );
@@ -1007,6 +1081,7 @@ export function AccountSessionProvider({ authUser = null, children }) {
       applePlans,
       appleProductsLoading,
       appleProductsError,
+      accountOperation,
       appleOperation,
       appleError,
       // Backward-compatible aliases for existing consumers.
@@ -1016,16 +1091,19 @@ export function AccountSessionProvider({ authUser = null, children }) {
       purchaseApplePlan,
       restoreApplePurchases,
       refreshAppleSubscription,
+      beginAccountTeardown,
       updateQuota,
       applyRealtimeState,
     }),
     [
       appleError,
       appleOperation,
+      accountOperation,
       applePlans,
       appleProductsError,
       appleProductsLoading,
       applyRealtimeState,
+      beginAccountTeardown,
       entitlement,
       error,
       initialized,

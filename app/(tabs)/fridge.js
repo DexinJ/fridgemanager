@@ -1,5 +1,5 @@
 import { router, useNavigation } from "expo-router";
-import React, { useCallback, useContext, useLayoutEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Alert, SectionList, StyleSheet, Text, View } from "react-native";
 import { useGpt } from "../../api/gpt";
 import ActionGridPopover from "../../components/ActionGridPopover";
@@ -65,6 +65,18 @@ export default function FridgeScreen() {
   const [contextMenuVisible, setContextMenuVisible] = useState(false);
   const [contextFromRect, setContextFromRect] = useState(null);
   const pendingEditRef = useRef(null);
+  const mountedRef = useRef(false);
+  const recipeBusyRef = useRef(false);
+  const recipeGenerationRef = useRef(0);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      recipeGenerationRef.current += 1;
+      recipeBusyRef.current = false;
+    };
+  }, []);
 
   // ---- Tag helpers (from utils) ----
   const { tagById, tagIdByKey } = useMemo(() => buildTagMaps(tags || []), [tags]);
@@ -283,7 +295,10 @@ export default function FridgeScreen() {
   // Recipes / ShopList / Delete / Edit
   const openRecipesForItems = useCallback(
     async (items) => {
-      if (!items || items.length === 0) return;
+      if (!items || items.length === 0 || recipeBusyRef.current) return;
+      recipeBusyRef.current = true;
+      const generation = recipeGenerationRef.current + 1;
+      recipeGenerationRef.current = generation;
 
       const ingredientLines = items
         .map((it) => {
@@ -308,7 +323,17 @@ For each recipe:
         router.push("/chat");
         await streamMessage({ text: prompt, language: "en" });
       } catch (e) {
-        Alert.alert("Recipes", e?.message || "Failed to generate recipes.");
+        if (
+          e?.code !== "REQUEST_CANCELLED" &&
+          mountedRef.current &&
+          recipeGenerationRef.current === generation
+        ) {
+          Alert.alert("Recipes", e?.message || "Failed to generate recipes.");
+        }
+      } finally {
+        if (recipeGenerationRef.current === generation) {
+          recipeBusyRef.current = false;
+        }
       }
     },
     [streamMessage]

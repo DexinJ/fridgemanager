@@ -12,7 +12,6 @@
       "supportsTablet": true,
       "usesAppleSignIn": true,
       "bundleIdentifier": "com.chilltech.pantrio",
-      "googleServicesFile": "./GoogleService-Info.plist",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
@@ -22,7 +21,11 @@
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#0A8E91"
-      }
+      },
+      "permissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
+      ]
     },
     "web": {
       "bundler": "metro",
@@ -32,13 +35,6 @@
     "plugins": [
       "expo-router",
       "expo-apple-authentication",
-      [
-        "@react-native-google-signin/google-signin",
-        {
-          "iosUrlScheme": "com.googleusercontent.apps.430585833748-qrjms4s5d60ul0q29hvv6l0et964p54l",
-          "iosClientId": "430585833748-qrjms4s5d60ul0q29hvv6l0et964p54l.apps.googleusercontent.com"
-        }
-      ],
       [
         "expo-splash-screen",
         {
@@ -62,6 +58,7 @@
         "expo-audio",
         {
           "microphonePermission": "Allow Pantrio to record audio.",
+          "enableBackgroundPlayback": false,
           "enableBackgroundRecording": false
         }
       ],
@@ -76,7 +73,6 @@
           "organization": "dexinjin"
         }
       ],
-      "@sentry/react-native",
       "expo-secure-store"
     ],
     "experiments": {
@@ -87,6 +83,12 @@
       "eas": {
         "projectId": "48e12973-9e82-4257-a473-2e0cd5665bd1"
       }
+    },
+    "runtimeVersion": {
+      "policy": "fingerprint"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/48e12973-9e82-4257-a473-2e0cd5665bd1"
     }
   }
 }

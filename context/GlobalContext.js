@@ -15,14 +15,20 @@ import React, {
 import { useColorScheme } from "react-native";
 import { v4 as uuidv4 } from "uuid";
 import { API_BASE_URL } from "../api/backendConfig";
+import { fetchWithTimeout } from "../api/fetchWithTimeout";
 import { clearChatData, loadChatData } from "../api/memoryManager";
 import {
   clearCustomAiProviderSettings,
   migrateLegacyCustomAiProviderSettings,
 } from "../api/aiProviderSettings";
 import {
+  clearUserDataPurgePending,
+  getUserDataPurgeIntent,
   getUserStorageKeys,
+  listUserDataPurgeIntents,
+  markUserDataPurgePending,
   migrateLegacyAsyncStorageForUser,
+  recordUserDataPurgeFailure,
 } from "../api/storageKeys";
 
 // ❌ REMOVED: import { useAuth } from "../auth/useAuth";
@@ -57,6 +63,194 @@ import {
 } from "../utils/tags";
 
 const AI_PROVIDER_VALUES = new Set(["pantrio", "apple", "custom"]);
+const STORAGE_SLICE_NAMES = ["fridge", "shopping", "settings", "chat"];
+
+function createStorageHydrationState({ resolved = false } = {}) {
+  return Object.fromEntries(
+    STORAGE_SLICE_NAMES.map((slice) => [
+      slice,
+      { resolved, writeEnabled: false, error: null },
+    ])
+  );
+}
+
+function isPlainRecord(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function parseStoredArray(value, label) {
+  if (value === null) return [];
+  const parsedValue = JSON.parse(value);
+  if (!Array.isArray(parsedValue)) {
+    throw new Error(`Stored ${label} data must be an array.`);
+  }
+  return parsedValue;
+}
+
+function parseStoredSettings(value) {
+  if (value === null) return null;
+  const parsedValue = JSON.parse(value);
+  if (!isPlainRecord(parsedValue)) {
+    throw new Error("Stored settings must be an object.");
+  }
+  return parsedValue;
+}
+
+function mergeStoredSettings(previousSettings, parsedSettings) {
+  if (!parsedSettings) return previousSettings;
+
+  const storedUx = isPlainRecord(parsedSettings.ux) ? parsedSettings.ux : {};
+  const storedNotifications = isPlainRecord(parsedSettings.notifications)
+    ? parsedSettings.notifications
+    : {};
+  const storedPrivacy = isPlainRecord(parsedSettings.privacy)
+    ? parsedSettings.privacy
+    : {};
+  const storedAdvanced = isPlainRecord(parsedSettings.advanced)
+    ? parsedSettings.advanced
+    : {};
+  const storedExpiration = isPlainRecord(parsedSettings.expiration)
+    ? parsedSettings.expiration
+    : {};
+  const storedUser = isPlainRecord(parsedSettings.user)
+    ? parsedSettings.user
+    : {};
+  const restoredAiProvider = AI_PROVIDER_VALUES.has(storedAdvanced.aiProvider)
+    ? storedAdvanced.aiProvider
+    : storedAdvanced.useCustomAi
+      ? "custom"
+      : "pantrio";
+
+  return {
+    ...previousSettings,
+    ...parsedSettings,
+    ux: { ...previousSettings.ux, ...storedUx },
+    notifications: {
+      ...previousSettings.notifications,
+      ...storedNotifications,
+    },
+    privacy: { ...previousSettings.privacy, ...storedPrivacy },
+    advanced: {
+      ...previousSettings.advanced,
+      ...storedAdvanced,
+      aiProvider: restoredAiProvider,
+      useCustomAi: restoredAiProvider === "custom",
+    },
+    expiration: { ...previousSettings.expiration, ...storedExpiration },
+    user: { ...previousSettings.user, ...storedUser },
+  };
+}
+
+function errorMessage(error) {
+  return String(error?.message || error || "Unknown storage error");
+}
+
+async function purgeStoredUserData(uid) {
+  const storageKeys = getUserStorageKeys(uid);
+  const operations = [
+    ["fridge", () => AsyncStorage.removeItem(storageKeys.fridgeItems)],
+    [
+      "shopping",
+      () => AsyncStorage.removeItem(storageKeys.shoppingListItems),
+    ],
+    ["settings", () => AsyncStorage.removeItem(storageKeys.appSettings)],
+    ["customAi", () => clearCustomAiProviderSettings(uid)],
+    [
+      "chat",
+      async () => {
+        const result = await clearChatData(uid);
+        if (!result.ok) throw result.error || new Error("Chat purge failed.");
+      },
+    ],
+  ];
+  const settledOperations = await Promise.allSettled(
+    operations.map(([, operation]) => operation())
+  );
+  const outcomes = {};
+  const cleared = [];
+  const errors = [];
+
+  settledOperations.forEach((result, index) => {
+    const scope = operations[index][0];
+    if (result.status === "fulfilled") {
+      outcomes[scope] = true;
+      cleared.push(scope);
+      return;
+    }
+
+    outcomes[scope] = false;
+    errors.push({
+      scope,
+      message: errorMessage(result.reason),
+      cause: result.reason,
+    });
+  });
+
+  return { ok: errors.length === 0, outcomes, cleared, errors };
+}
+
+function publicPurgeResult(result) {
+  return {
+    ok: result.ok,
+    pendingRetry: !result.ok,
+    cleared: result.cleared,
+    errors: result.errors.map(({ scope, message }) => ({ scope, message })),
+  };
+}
+
+async function completePendingUserDataPurge(uid) {
+  const intent = await getUserDataPurgeIntent(uid);
+  if (
+    intent &&
+    intent.phase !== "confirmed" &&
+    intent.phase !== "purging"
+  ) {
+    return {
+      ok: false,
+      outcomes: {},
+      cleared: [],
+      errors: [
+        {
+          scope: "purgeIntent",
+          message:
+            "The pending data cleanup has not been confirmed yet.",
+        },
+      ],
+      awaitingConfirmation: true,
+    };
+  }
+
+  const purgeResult = await purgeStoredUserData(uid);
+
+  if (purgeResult.ok) {
+    try {
+      await clearUserDataPurgePending(uid);
+      return purgeResult;
+    } catch (error) {
+      purgeResult.ok = false;
+      purgeResult.errors.push({
+        scope: "purgeIntent",
+        message: errorMessage(error),
+        cause: error,
+      });
+    }
+  }
+
+  try {
+    await recordUserDataPurgeFailure(
+      uid,
+      purgeResult.errors[0]?.cause || new Error("User data purge failed.")
+    );
+  } catch (error) {
+    purgeResult.errors.push({
+      scope: "purgeJournal",
+      message: errorMessage(error),
+      cause: error,
+    });
+  }
+
+  return purgeResult;
+}
 
 export const GlobalContext = createContext();
 
@@ -104,10 +298,27 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   const [shoppingListItems, setShoppingListItems] = useState([]);
   const [settings, setSettings] = useState(defaultSettings);
 
-  // ✅ FIX 1:
-  // Prevent empty/default state from being saved before
-  // AsyncStorage finishes loading.
-  const [storageHydrated, setStorageHydrated] = useState(false);
+  // A failed read may finish startup, but that slice stays read-only so its
+  // recoverable stored value is never overwritten with an in-memory default.
+  const [storageHydration, setStorageHydration] = useState(() =>
+    createStorageHydrationState()
+  );
+  const [storageHydrationAttempt, setStorageHydrationAttempt] = useState(0);
+  const [storagePurgeResult, setStoragePurgeResult] = useState(null);
+  const storageHydrated = STORAGE_SLICE_NAMES.every(
+    (slice) => storageHydration[slice].resolved
+  );
+  const storageHydrationErrors = useMemo(
+    () =>
+      Object.fromEntries(
+        STORAGE_SLICE_NAMES.flatMap((slice) =>
+          storageHydration[slice].error
+            ? [[slice, errorMessage(storageHydration[slice].error)]]
+            : []
+        )
+      ),
+    [storageHydration]
+  );
 
   const [urgencyDays, setUrgencyDays] = useState({
     expired: 0,
@@ -341,7 +552,17 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   // ---------------------------
   // Smart chat persistence refs
   // ---------------------------
-  const chatHydratedRef = useRef(false);
+  const storageWriteEnabledRef = useRef(
+    Object.fromEntries(STORAGE_SLICE_NAMES.map((slice) => [slice, false]))
+  );
+  const retryStorageHydration = useCallback(() => {
+    storageWriteEnabledRef.current = Object.fromEntries(
+      STORAGE_SLICE_NAMES.map((slice) => [slice, false])
+    );
+    setStorageHydration(createStorageHydrationState());
+    setStoragePurgeResult(null);
+    setStorageHydrationAttempt((attempt) => attempt + 1);
+  }, []);
   const chatSaveTimerRef = useRef(null);
   const chatLastSavedAtRef = useRef(0);
 
@@ -410,120 +631,210 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   // Load local data on startup
   // ---------------------------------------
 
-  // ✅ FIX 2:
-  // Finish loading fridge items, shopping items,
-  // and settings before enabling saves.
+  // Per-slice hydration prevents a corrupt/read-failed slice from being saved.
   useEffect(() => {
     let cancelled = false;
 
+    const resetHydration = () => {
+      storageWriteEnabledRef.current = Object.fromEntries(
+        STORAGE_SLICE_NAMES.map((slice) => [slice, false])
+      );
+      if (!cancelled) setStorageHydration(createStorageHydrationState());
+    };
+
+    const resolveSlice = (slice, { writeEnabled, error = null }) => {
+      if (cancelled) return;
+      storageWriteEnabledRef.current = {
+        ...storageWriteEnabledRef.current,
+        [slice]: writeEnabled,
+      };
+      setStorageHydration((previous) => ({
+        ...previous,
+        [slice]: { resolved: true, writeEnabled, error },
+      }));
+    };
+
+    const resolveAllReadOnly = (error = null) => {
+      if (cancelled) return;
+      storageWriteEnabledRef.current = Object.fromEntries(
+        STORAGE_SLICE_NAMES.map((slice) => [slice, false])
+      );
+      setStorageHydration(
+        Object.fromEntries(
+          STORAGE_SLICE_NAMES.map((slice) => [
+            slice,
+            { resolved: true, writeEnabled: false, error },
+          ])
+        )
+      );
+    };
+
     const loadData = async () => {
-      if (!storageOwnerUid) {
-        chatHydratedRef.current = true;
-        chatLastSavedAtRef.current = Date.now();
-        setStorageHydrated(true);
+      resetHydration();
+
+      let pendingPurgeIntents;
+      try {
+        pendingPurgeIntents = await listUserDataPurgeIntents();
+      } catch (error) {
+        if (!cancelled) {
+          setStoragePurgeResult({
+            ok: false,
+            pendingRetry: true,
+            cleared: [],
+            errors: [{ scope: "purgeJournal", message: errorMessage(error) }],
+          });
+          resolveAllReadOnly(error);
+        }
         return;
       }
 
-      try {
-        await migrateLegacyAsyncStorageForUser(storageOwnerUid);
-        const storageKeys = getUserStorageKeys(storageOwnerUid);
-        const [fridgeData, shoppingData, settingsData] =
-          await Promise.all([
-            AsyncStorage.getItem(storageKeys.fridgeItems),
-            AsyncStorage.getItem(storageKeys.shoppingListItems),
-            AsyncStorage.getItem(storageKeys.appSettings),
-          ]);
-
-        let providerMigrationBaseUrl = defaultSettings.advanced.aiBaseUrl;
-        let providerMigrationModel = defaultSettings.advanced.aiModel;
-        if (settingsData) {
-          const migrationSettings = JSON.parse(settingsData);
-          const migrationAdvanced = migrationSettings?.advanced || {};
-          providerMigrationBaseUrl =
-            migrationAdvanced.aiBaseUrl || providerMigrationBaseUrl;
-          providerMigrationModel =
-            migrationAdvanced.aiModel || providerMigrationModel;
+      const sweepCleared = [];
+      for (const intent of pendingPurgeIntents) {
+        if (intent.phase !== "confirmed" && intent.phase !== "purging") {
+          continue;
         }
-
-        await migrateLegacyCustomAiProviderSettings(storageOwnerUid, {
-          baseUrl: providerMigrationBaseUrl,
-          fallbackModel: providerMigrationModel,
-        });
-
+        const result = await completePendingUserDataPurge(intent.uid);
         if (cancelled) return;
-
-        if (fridgeData) {
-          const parsedFridgeData = JSON.parse(fridgeData);
-
-          setFridgeItemsRaw(
-            migrateFridgeItems(parsedFridgeData)
+        sweepCleared.push(...result.cleared);
+        if (!result.ok) {
+          const visibleResult = publicPurgeResult(result);
+          setStoragePurgeResult(visibleResult);
+          resolveAllReadOnly(
+            new Error(
+              visibleResult.errors[0]?.message || "Pending data purge failed."
+            )
           );
-        }
-
-        if (shoppingData) {
-          const parsedShoppingData = JSON.parse(shoppingData);
-
-          setShoppingListItems(
-            migrateShoppingItems(parsedShoppingData)
-          );
-        }
-
-        if (settingsData) {
-          const parsedSettings = JSON.parse(settingsData);
-          const storedAdvanced = parsedSettings.advanced || {};
-          const restoredAiProvider = AI_PROVIDER_VALUES.has(
-            storedAdvanced.aiProvider
-          )
-            ? storedAdvanced.aiProvider
-            : storedAdvanced.useCustomAi
-              ? "custom"
-              : "pantrio";
-          setSettings((prev) => ({
-            ...prev,
-            ...parsedSettings,
-            ux: {
-              ...prev.ux,
-              ...(parsedSettings.ux || {}),
-            },
-            notifications: {
-              ...prev.notifications,
-              ...(parsedSettings.notifications || {}),
-            },
-            privacy: {
-              ...prev.privacy,
-              ...(parsedSettings.privacy || {}),
-            },
-            advanced: {
-              ...prev.advanced,
-              ...storedAdvanced,
-              aiProvider: restoredAiProvider,
-              useCustomAi: restoredAiProvider === "custom",
-            },
-            expiration: {
-              ...prev.expiration,
-              ...(parsedSettings.expiration || {}),
-            },
-            user: {
-              ...prev.user,
-              ...(parsedSettings.user || {}),
-            },
-          }));
-        }
-
-        await loadChatData(storageOwnerUid, setMessages, setSummary);
-      } catch (error) {
-        console.error("Error loading local data:", error);
-      } finally {
-        if (!cancelled) {
-          chatHydratedRef.current = true;
-          chatLastSavedAtRef.current = Date.now();
-
-          // ✅ FIX 2:
-          // Saving is now allowed because startup loading
-          // has completed.
-          setStorageHydrated(true);
+          return;
         }
       }
+
+      if (cancelled) return;
+      if (pendingPurgeIntents.length > 0) {
+        setStoragePurgeResult({
+          ok: true,
+          pendingRetry: false,
+          cleared: sweepCleared,
+          errors: [],
+        });
+      }
+
+      if (!storageOwnerUid) {
+        chatLastSavedAtRef.current = Date.now();
+        resolveAllReadOnly();
+        return;
+      }
+
+      let legacyMigrationError = null;
+      try {
+        await migrateLegacyAsyncStorageForUser(storageOwnerUid);
+      } catch (error) {
+        legacyMigrationError = error;
+        console.error("Legacy local data migration failed:", error);
+      }
+
+      const storageKeys = getUserStorageKeys(storageOwnerUid);
+      const [fridgeResult, shoppingResult, settingsResult, chatResult] =
+        await Promise.allSettled([
+          AsyncStorage.getItem(storageKeys.fridgeItems),
+          AsyncStorage.getItem(storageKeys.shoppingListItems),
+          AsyncStorage.getItem(storageKeys.appSettings),
+          loadChatData(storageOwnerUid),
+        ]);
+      if (cancelled) return;
+
+      let fridgeData = [];
+      let fridgeError = null;
+      try {
+        if (fridgeResult.status === "rejected") throw fridgeResult.reason;
+        fridgeData = migrateFridgeItems(
+          parseStoredArray(fridgeResult.value, "fridge")
+        );
+        if (!Array.isArray(fridgeData)) {
+          throw new Error("Migrated fridge data must be an array.");
+        }
+      } catch (error) {
+        fridgeError = error;
+      }
+
+      let shoppingData = [];
+      let shoppingError = null;
+      try {
+        if (shoppingResult.status === "rejected") throw shoppingResult.reason;
+        shoppingData = migrateShoppingItems(
+          parseStoredArray(shoppingResult.value, "shopping list")
+        );
+        if (!Array.isArray(shoppingData)) {
+          throw new Error("Migrated shopping list data must be an array.");
+        }
+      } catch (error) {
+        shoppingError = error;
+      }
+
+      let parsedSettings = null;
+      let settingsLoadError = null;
+      try {
+        if (settingsResult.status === "rejected") throw settingsResult.reason;
+        parsedSettings = parseStoredSettings(settingsResult.value);
+      } catch (error) {
+        settingsLoadError = error;
+      }
+
+      const storedAdvanced = isPlainRecord(parsedSettings?.advanced)
+        ? parsedSettings.advanced
+        : {};
+      let settingsMigrationError = null;
+      try {
+        await migrateLegacyCustomAiProviderSettings(storageOwnerUid, {
+          baseUrl:
+            storedAdvanced.aiBaseUrl || defaultSettings.advanced.aiBaseUrl,
+          fallbackModel:
+            storedAdvanced.aiModel || defaultSettings.advanced.aiModel,
+        });
+      } catch (error) {
+        settingsMigrationError = error;
+        console.error("Legacy AI provider migration failed:", error);
+      }
+      const settingsError = settingsLoadError || settingsMigrationError;
+
+      let chatData = null;
+      let chatError = null;
+      if (chatResult.status === "fulfilled") {
+        chatData = chatResult.value;
+      } else {
+        chatError = chatResult.reason;
+      }
+
+      if (cancelled) return;
+
+      if (!fridgeError) setFridgeItemsRaw(fridgeData);
+      if (!shoppingError) setShoppingListItems(shoppingData);
+      if (!settingsLoadError) {
+        setSettings((previous) =>
+          mergeStoredSettings(previous, parsedSettings)
+        );
+      }
+      if (!chatError) {
+        setMessages(chatData.messages);
+        setSummary(chatData.summary);
+      }
+      chatLastSavedAtRef.current = Date.now();
+
+      resolveSlice("fridge", {
+        writeEnabled: !fridgeError && !legacyMigrationError,
+        error: fridgeError || legacyMigrationError,
+      });
+      resolveSlice("shopping", {
+        writeEnabled: !shoppingError && !legacyMigrationError,
+        error: shoppingError || legacyMigrationError,
+      });
+      resolveSlice("settings", {
+        writeEnabled: !settingsError && !legacyMigrationError,
+        error: settingsError || legacyMigrationError,
+      });
+      resolveSlice("chat", {
+        writeEnabled: !chatError && !legacyMigrationError,
+        error: chatError || legacyMigrationError,
+      });
     };
 
     loadData();
@@ -531,17 +842,24 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     return () => {
       cancelled = true;
     };
-  }, [defaultSettings, storageOwnerUid]);
+  }, [defaultSettings, storageHydrationAttempt, storageOwnerUid]);
 
   // ---------------------------------------
   // Smart chat saving
   // ---------------------------------------
   useEffect(() => {
-    if (!chatHydratedRef.current || !storageOwnerUid) return;
+    if (
+      !storageHydration.chat.writeEnabled ||
+      !storageWriteEnabledRef.current.chat ||
+      !storageOwnerUid
+    ) {
+      return;
+    }
 
     const { chatMessages } = getUserStorageKeys(storageOwnerUid);
 
     const doSave = async () => {
+      if (!storageWriteEnabledRef.current.chat) return;
       try {
         chatLastSavedAtRef.current = Date.now();
 
@@ -550,6 +868,14 @@ export const GlobalProvider = ({ children, authUser = null }) => {
           JSON.stringify(messages)
         );
       } catch (error) {
+        storageWriteEnabledRef.current = {
+          ...storageWriteEnabledRef.current,
+          chat: false,
+        };
+        setStorageHydration((previous) => ({
+          ...previous,
+          chat: { resolved: true, writeEnabled: false, error },
+        }));
         console.warn(
           "save scoped chat messages failed:",
           error
@@ -592,13 +918,19 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         chatSaveTimerRef.current = null;
       }
     };
-  }, [messages, receiving, storageOwnerUid]);
+  }, [
+    messages,
+    receiving,
+    storageHydration.chat.writeEnabled,
+    storageOwnerUid,
+  ]);
 
   // ---------------------------------------
   // Fetch username after login
   // ---------------------------------------
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
 
     async function loadUserIntoSettings() {
       // Let the UID-scoped local settings finish hydrating first so a late
@@ -621,12 +953,17 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         const token = await user.getIdToken();
         const uid = user.uid;
 
-        const response = await fetch(
+        const response = await fetchWithTimeout(
           `${API_BASE_URL}/api/users/${uid}`,
           {
             headers: {
               Authorization: `Bearer ${token}`,
             },
+            signal: controller.signal,
+          },
+          {
+            timeoutMessage:
+              "Loading the account profile timed out. Please try again.",
           }
         );
 
@@ -663,10 +1000,12 @@ export const GlobalProvider = ({ children, authUser = null }) => {
           }));
         }
       } catch (error) {
-        console.log(
-          "loadUserIntoSettings error:",
-          error
-        );
+        if (__DEV__ && !cancelled && error?.name !== "AbortError") {
+          console.log(
+            "loadUserIntoSettings error:",
+            error
+          );
+        }
 
         if (!cancelled) {
           setSettings((prev) => ({
@@ -687,6 +1026,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
 
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [storageHydrated, user]);
 
@@ -694,44 +1034,86 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   // Save fridge, shopping list, and settings
   // ---------------------------------------
 
-  // ✅ FIX 3:
-  // Do not overwrite stored data with initial empty/default
-  // values during app startup.
-  useEffect(() => {
-    if (!storageHydrated || !storageOwnerUid) return;
-
-    const storageKeys = getUserStorageKeys(storageOwnerUid);
-
-    const saveData = async () => {
-      try {
-        await Promise.all([
-          AsyncStorage.setItem(
-            storageKeys.fridgeItems,
-            JSON.stringify(fridgeItemsRaw)
-          ),
-          AsyncStorage.setItem(
-            storageKeys.shoppingListItems,
-            JSON.stringify(shoppingListItems)
-          ),
-          AsyncStorage.setItem(
-            storageKeys.appSettings,
-            JSON.stringify(settings)
-          ),
-        ]);
-      } catch (error) {
-        console.error(
-          "Error saving local data:",
-          error
-        );
-      }
+  const markStorageWriteFailure = useCallback((slice, error) => {
+    storageWriteEnabledRef.current = {
+      ...storageWriteEnabledRef.current,
+      [slice]: false,
     };
+    setStorageHydration((previous) => ({
+      ...previous,
+      [slice]: { resolved: true, writeEnabled: false, error },
+    }));
+  }, []);
 
-    saveData();
+  // Each persisted slice is gated by its own successful hydration.
+  useEffect(() => {
+    if (
+      !storageHydration.fridge.writeEnabled ||
+      !storageWriteEnabledRef.current.fridge ||
+      !storageOwnerUid
+    ) {
+      return;
+    }
+
+    const { fridgeItems } = getUserStorageKeys(storageOwnerUid);
+    AsyncStorage.setItem(fridgeItems, JSON.stringify(fridgeItemsRaw)).catch(
+      (error) => {
+        markStorageWriteFailure("fridge", error);
+        console.error("Error saving fridge data:", error);
+      }
+    );
   }, [
-    storageHydrated,
     fridgeItemsRaw,
+    markStorageWriteFailure,
+    storageHydration.fridge.writeEnabled,
+    storageOwnerUid,
+  ]);
+
+  useEffect(() => {
+    if (
+      !storageHydration.shopping.writeEnabled ||
+      !storageWriteEnabledRef.current.shopping ||
+      !storageOwnerUid
+    ) {
+      return;
+    }
+
+    const { shoppingListItems: shoppingKey } =
+      getUserStorageKeys(storageOwnerUid);
+    AsyncStorage.setItem(
+      shoppingKey,
+      JSON.stringify(shoppingListItems)
+    ).catch((error) => {
+      markStorageWriteFailure("shopping", error);
+      console.error("Error saving shopping list data:", error);
+    });
+  }, [
+    markStorageWriteFailure,
     shoppingListItems,
+    storageHydration.shopping.writeEnabled,
+    storageOwnerUid,
+  ]);
+
+  useEffect(() => {
+    if (
+      !storageHydration.settings.writeEnabled ||
+      !storageWriteEnabledRef.current.settings ||
+      !storageOwnerUid
+    ) {
+      return;
+    }
+
+    const { appSettings } = getUserStorageKeys(storageOwnerUid);
+    AsyncStorage.setItem(appSettings, JSON.stringify(settings)).catch(
+      (error) => {
+        markStorageWriteFailure("settings", error);
+        console.error("Error saving settings:", error);
+      }
+    );
+  }, [
+    markStorageWriteFailure,
     settings,
+    storageHydration.settings.writeEnabled,
     storageOwnerUid,
   ]);
 
@@ -1396,35 +1778,127 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   };
 
   const clearAllData = async () => {
-    try {
+    if (!storageOwnerUid) {
       setFridgeItemsRaw([]);
       setShoppingListItems([]);
       setSettings(defaultSettings);
-
-      if (storageOwnerUid) {
-        const storageKeys = getUserStorageKeys(storageOwnerUid);
-
-        await AsyncStorage.multiRemove([
-          storageKeys.fridgeItems,
-          storageKeys.shoppingListItems,
-          storageKeys.appSettings,
-        ]);
-        await clearCustomAiProviderSettings(storageOwnerUid);
-        await clearChatData(storageOwnerUid, setMessages, setSummary);
-      } else {
-        setMessages([]);
-        setSummary("");
-      }
-
-      console.log(
-        "All data cleared!"
-      );
-    } catch (error) {
-      console.error(
-        "Error clearing data:",
-        error
-      );
+      setMessages([]);
+      setSummary("");
+      const result = {
+        ok: true,
+        pendingRetry: false,
+        cleared: ["fridge", "shopping", "settings", "chat"],
+        errors: [],
+      };
+      setStoragePurgeResult(result);
+      return result;
     }
+
+    storageWriteEnabledRef.current = Object.fromEntries(
+      STORAGE_SLICE_NAMES.map((slice) => [slice, false])
+    );
+    setStorageHydration((previous) =>
+      Object.fromEntries(
+        STORAGE_SLICE_NAMES.map((slice) => [
+          slice,
+          {
+            resolved: true,
+            writeEnabled: false,
+            error: previous[slice]?.error || null,
+          },
+        ])
+      )
+    );
+    if (chatSaveTimerRef.current) {
+      clearTimeout(chatSaveTimerRef.current);
+      chatSaveTimerRef.current = null;
+    }
+
+    let journalError = null;
+    let keepWritesDisabled = false;
+    try {
+      const existingIntent = await getUserDataPurgeIntent(storageOwnerUid);
+      keepWritesDisabled = existingIntent?.reason === "account-delete";
+    } catch (error) {
+      journalError = error;
+      console.error("Could not read the data purge intent:", error);
+    }
+    try {
+      await markUserDataPurgePending(storageOwnerUid, {
+        reason: "clear-all",
+      });
+    } catch (error) {
+      journalError ||= error;
+      console.error("Could not persist the data purge intent:", error);
+    }
+
+    let purgeResult;
+    try {
+      purgeResult = await completePendingUserDataPurge(storageOwnerUid);
+    } catch (error) {
+      purgeResult = {
+        ok: false,
+        outcomes: {},
+        cleared: [],
+        errors: [
+          {
+            scope: "purge",
+            message: errorMessage(error),
+            cause: error,
+          },
+        ],
+      };
+    }
+
+    if (journalError && !purgeResult.ok) {
+      purgeResult.errors.push({
+        scope: "purgeJournal",
+        message: errorMessage(journalError),
+        cause: journalError,
+      });
+    }
+
+    if (purgeResult.outcomes.fridge) setFridgeItemsRaw([]);
+    if (purgeResult.outcomes.shopping) setShoppingListItems([]);
+    if (purgeResult.outcomes.settings) setSettings(defaultSettings);
+    if (purgeResult.outcomes.chat) {
+      setMessages([]);
+      setSummary("");
+    }
+
+    const sharedPurgeError = purgeResult.ok
+      ? null
+      : new Error(
+          purgeResult.errors[0]?.message || "Local data purge is incomplete."
+        );
+    const writesEnabled = purgeResult.ok && !keepWritesDisabled;
+    storageWriteEnabledRef.current = Object.fromEntries(
+      STORAGE_SLICE_NAMES.map((slice) => [slice, writesEnabled])
+    );
+    setStorageHydration(
+      Object.fromEntries(
+        STORAGE_SLICE_NAMES.map((slice) => [
+          slice,
+          {
+            resolved: true,
+            writeEnabled: writesEnabled,
+            error: sharedPurgeError,
+          },
+        ])
+      )
+    );
+
+    const visibleResult = publicPurgeResult(purgeResult);
+    setStoragePurgeResult(visibleResult);
+
+    if (__DEV__ && visibleResult.ok) {
+      console.log("All scoped local data cleared.");
+    }
+    if (!visibleResult.ok) {
+      console.error("Local data purge is incomplete:", visibleResult.errors);
+    }
+
+    return visibleResult;
   };
 
   return (
@@ -1433,8 +1907,13 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         fridgeItems,
         shoppingListItems,
         settings,
+        retryStorageHydration,
         storageHydrated,
+        storageHydration,
+        storageHydrationAttempt,
+        storageHydrationErrors,
         storageOwnerUid,
+        storagePurgeResult,
         tags,
 
         FOOD_TYPE_RULES,

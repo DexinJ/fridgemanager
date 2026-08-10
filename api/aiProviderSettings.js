@@ -1,13 +1,15 @@
 import * as SecureStore from "expo-secure-store";
 import {
+  getLegacyStorageOwner,
   getUserSecureStorageKey,
-  isLegacyStorageOwner,
 } from "./storageKeys";
 
 const LEGACY_AI_API_KEY_STORAGE_KEY = "pantrio.customAiApiKey";
 // This was the first per-provider key, but it was shared by every account on
 // the device. It is now used only as a one-time migration source.
 const LEGACY_AI_PROVIDER_SETTINGS_STORAGE_KEY = "pantrio.customAiApiKeys";
+const LEGACY_AI_SETTINGS_QUARANTINE_KEY =
+  "pantrio.legacyCustomAiQuarantine.v1";
 const USER_AI_PROVIDER_SETTINGS_KEY_NAME = "customAiProviderSettings";
 let secureStoreOperation = Promise.resolve();
 
@@ -77,13 +79,59 @@ async function migrateLegacyProviderSettingsUnlocked(
   uid,
   { baseUrl = "", fallbackModel = "" } = {}
 ) {
-  if (!(await isLegacyStorageOwner(uid))) return false;
-
-  const providerId = normalizeAiBaseUrl(baseUrl);
+  const legacyOwnerUid = await getLegacyStorageOwner();
+  const normalizedUid = String(uid || "").trim();
   const [legacyProviderValue, legacyApiKey] = await Promise.all([
     SecureStore.getItemAsync(LEGACY_AI_PROVIDER_SETTINGS_STORAGE_KEY),
     SecureStore.getItemAsync(LEGACY_AI_API_KEY_STORAGE_KEY),
   ]);
+
+  if (!legacyOwnerUid) {
+    // A global SecureStore value without an ownership marker is ambiguous.
+    // Quarantine it instead of assigning a previous user's API key to
+    // whichever account happens to sign in first.
+    if (legacyProviderValue === null && legacyApiKey === null) return false;
+
+    const storedQuarantine = await SecureStore.getItemAsync(
+      LEGACY_AI_SETTINGS_QUARANTINE_KEY
+    );
+    let quarantineEntries = [];
+    if (storedQuarantine) {
+      try {
+        const parsedQuarantine = JSON.parse(storedQuarantine);
+        quarantineEntries = Array.isArray(parsedQuarantine?.entries)
+          ? parsedQuarantine.entries
+          : [{ quarantinedAt: null, rawValue: storedQuarantine }];
+      } catch {
+        quarantineEntries = [{ quarantinedAt: null, rawValue: storedQuarantine }];
+      }
+    }
+    const alreadyQuarantined = quarantineEntries.some(
+      (entry) =>
+        entry?.providerSettings === legacyProviderValue &&
+        entry?.apiKey === legacyApiKey
+    );
+    if (!alreadyQuarantined) {
+      quarantineEntries.push({
+        quarantinedAt: new Date().toISOString(),
+        providerSettings: legacyProviderValue,
+        apiKey: legacyApiKey,
+      });
+    }
+    await SecureStore.setItemAsync(
+      LEGACY_AI_SETTINGS_QUARANTINE_KEY,
+      JSON.stringify({ version: 1, entries: quarantineEntries })
+    );
+    await Promise.all([
+      SecureStore.deleteItemAsync(LEGACY_AI_PROVIDER_SETTINGS_STORAGE_KEY),
+      SecureStore.deleteItemAsync(LEGACY_AI_API_KEY_STORAGE_KEY),
+    ]);
+    return false;
+  }
+
+  if (legacyOwnerUid !== normalizedUid) return false;
+
+  const providerId = normalizeAiBaseUrl(baseUrl);
 
   if (legacyProviderValue === null && legacyApiKey === null) return false;
 

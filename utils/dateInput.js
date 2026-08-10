@@ -1,12 +1,16 @@
 const MS_PER_DAY = 86400000;
 
 export function startOfDayLocal(d) {
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  if (!(d instanceof Date) || Number.isNaN(d.getTime())) return null;
+
+  const local = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  return Number.isNaN(local.getTime()) ? null : local;
 }
 
 // store as ISO at local midnight
 export function isoFromLocalDateOnly(d) {
-  return startOfDayLocal(d).toISOString();
+  const local = startOfDayLocal(d);
+  return local ? local.toISOString() : null;
 }
 
 // Accept: YYYY-MM-DD or MM/DD/YYYY
@@ -42,6 +46,8 @@ export function parseDateInputToIso(dateText) {
 }
 
 export function formatYYYYMMDDLocal(d) {
+  if (!(d instanceof Date) || Number.isNaN(d.getTime())) return "";
+
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const da = String(d.getDate()).padStart(2, "0");
@@ -51,8 +57,11 @@ export function formatYYYYMMDDLocal(d) {
 // optional helper if you ever need it
 export function addLocalDaysIso(days) {
   const d = startOfDayLocal(new Date());
-  d.setDate(d.getDate() + Math.round(days));
-  return d.toISOString();
+  const normalizedDays = Number(days);
+  if (!d || !Number.isFinite(normalizedDays)) return null;
+
+  d.setDate(d.getDate() + Math.round(normalizedDays));
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
 export { MS_PER_DAY };

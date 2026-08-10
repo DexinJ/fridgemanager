@@ -1,12 +1,14 @@
 // app/(auth)/_layout.js
-import { Redirect, Stack } from "expo-router";
-import { useAuth } from "../../auth/useAuth";
+import { Stack } from "expo-router";
+import { GlobalProvider } from "../../context/GlobalContext";
 
 export default function AuthLayout() {
-  const { loggedIn, loading } = useAuth();
-  if (loading) return null;
-  if (loggedIn) return <Redirect href="/(tabs)" />;
   return (
-    <Stack screenOptions={{ headerShown: false }} initialRouteName="onboarding" />
+    <GlobalProvider>
+      <Stack
+        screenOptions={{ headerShown: false }}
+        initialRouteName="onboarding"
+      />
+    </GlobalProvider>
   );
 }

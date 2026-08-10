@@ -1,5 +1,6 @@
-import { useContext, useEffect, useMemo, useState } from "react";
+import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Alert,
   Image,
   Linking,
   StyleSheet,
@@ -11,6 +12,16 @@ import ImageViewing from "react-native-image-viewing";
 import { getLinkPreview } from "link-preview-js";
 import { GlobalContext } from "../context/GlobalContext";
 
+const MAX_LINK_PREVIEWS = 3;
+
+function toDisplayText(value) {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return "";
+}
+
 function getDomain(url) {
   try {
     return new URL(url).hostname.replace(/^www\./, "");
@@ -19,22 +30,90 @@ function getDomain(url) {
   }
 }
 
+function canFetchPreview(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+      return false;
+    }
+
+    const hostname = parsed.hostname
+      .toLowerCase()
+      .replace(/^\[|\]$/g, "")
+      .replace(/\.$/, "");
+    if (
+      !hostname ||
+      hostname === "localhost" ||
+      hostname.endsWith(".localhost") ||
+      hostname.endsWith(".local") ||
+      (!hostname.includes(".") && !hostname.includes(":"))
+    ) {
+      return false;
+    }
+
+    const ipv4 = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (ipv4) {
+      const octets = ipv4.slice(1).map(Number);
+      if (octets.some((octet) => octet > 255)) return false;
+      const [a, b] = octets;
+      return !(
+        a === 0 ||
+        a === 10 ||
+        a === 127 ||
+        (a === 100 && b >= 64 && b <= 127) ||
+        (a === 169 && b === 254) ||
+        (a === 172 && b >= 16 && b <= 31) ||
+        (a === 192 && b === 168) ||
+        a >= 224
+      );
+    }
+
+    if (hostname.includes(":")) {
+      if (
+        hostname === "::" ||
+        hostname === "::1" ||
+        /^fe[89ab]/.test(hostname) ||
+        /^f[cd]/.test(hostname)
+      ) {
+        return false;
+      }
+
+      const mappedIpv4 = hostname.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+      if (mappedIpv4) return canFetchPreview(`https://${mappedIpv4[1]}`);
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export default function MessageBubble({ text, imageUri, isUser }) {
   const { settings, theme } = useContext(GlobalContext);
   const fontSize = settings?.ux?.fontSize || 16;
 
   const [previewVisible, setPreviewVisible] = useState(false);
+  const mountedRef = useRef(false);
+  const displayText = toDisplayText(text);
+  const safeImageUri = typeof imageUri === "string" ? imageUri : "";
   const [linkMetas, setLinkMetas] = useState([]); // ✅ array now
 
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   const openPreview = () => {
-    if (imageUri) setPreviewVisible(true);
+    if (safeImageUri) setPreviewVisible(true);
   };
   const closePreview = () => setPreviewVisible(false);
 
   // --- Extract URLs (dedupe, keep order) ---
   const urls = useMemo(() => {
     const urlRegex = /(https?:\/\/[^\s]+)/g;
-    const found = text?.match(urlRegex) || [];
+    const found = displayText.match(urlRegex) || [];
 
     const seen = new Set();
     const deduped = [];
@@ -45,17 +124,17 @@ export default function MessageBubble({ text, imageUri, isUser }) {
       if (!seen.has(clean)) {
         seen.add(clean);
         deduped.push(clean);
+        if (deduped.length >= MAX_LINK_PREVIEWS) break;
       }
     }
     return deduped;
-  }, [text]);
+  }, [displayText]);
 
   // --- Fetch previews for all URLs ---
   useEffect(() => {
     let cancelled = false;
 
     if (!urls.length) {
-      setLinkMetas([]);
       return;
     }
 
@@ -63,6 +142,10 @@ export default function MessageBubble({ text, imageUri, isUser }) {
       try {
         const results = await Promise.all(
           urls.map(async (url) => {
+            if (!canFetchPreview(url)) {
+              return { url, title: null, description: null, images: [] };
+            }
+
             try {
               const data = await getLinkPreview(url, {
                 headers: {
@@ -75,8 +158,8 @@ export default function MessageBubble({ text, imageUri, isUser }) {
 
               return {
                 url,
-                title: data?.title ?? null,
-                description: data?.description ?? null,
+                title: toDisplayText(data?.title) || null,
+                description: toDisplayText(data?.description) || null,
                 images: Array.isArray(data?.images) ? data.images : [],
               };
             } catch {
@@ -97,10 +180,25 @@ export default function MessageBubble({ text, imageUri, isUser }) {
     return () => {
       cancelled = true;
     };
-  }, [urls.join("|")]);
+  }, [urls]);
+
+  const visibleLinkMetas = linkMetas.filter((meta) => urls.includes(meta.url));
+
+  const openLink = async (url) => {
+    try {
+      const supported = await Linking.canOpenURL(url);
+      if (!supported) throw new Error("This link is not supported on this device.");
+      if (!mountedRef.current) return;
+      await Linking.openURL(url);
+    } catch (error) {
+      if (mountedRef.current) {
+        Alert.alert("Could not open link", error?.message || "Please try again.");
+      }
+    }
+  };
 
   // --- Case 1: image only (unchanged behavior) ---
-  if (imageUri) {
+  if (safeImageUri) {
     return (
       <View
         style={[
@@ -110,14 +208,14 @@ export default function MessageBubble({ text, imageUri, isUser }) {
       >
         <TouchableOpacity onPress={openPreview}>
           <Image
-            source={{ uri: imageUri }}
+            source={{ uri: safeImageUri }}
             style={styles.thumbnail}
             resizeMode="cover"
           />
         </TouchableOpacity>
 
         <ImageViewing
-          images={[{ uri: imageUri }]}
+          images={[{ uri: safeImageUri }]}
           imageIndex={0}
           visible={previewVisible}
           onRequestClose={closePreview}
@@ -138,17 +236,17 @@ export default function MessageBubble({ text, imageUri, isUser }) {
           isUser ? styles.userBubble : styles.aiBubble,
         ]}
       >
-        {text ? (
+        {displayText ? (
           <Text selectable style={[styles.text, { fontSize, color: theme.textPrimary }]}>
-            {text}
+            {displayText}
           </Text>
         ) : null}
       </View>
 
       {/* --- Link preview cards OUTSIDE the bubble --- */}
-      {!!linkMetas.length && (
+      {!!visibleLinkMetas.length && (
         <View style={[styles.linkList, isUser ? styles.userAlign : styles.aiAlign]}>
-          {linkMetas.map((m) => (
+          {visibleLinkMetas.map((m) => (
             <TouchableOpacity
               key={m.url}
               style={[
@@ -158,7 +256,7 @@ export default function MessageBubble({ text, imageUri, isUser }) {
                   borderColor: theme.border ?? "rgba(0,0,0,0.12)",
                 },
               ]}
-              onPress={() => Linking.openURL(m.url)}
+              onPress={() => openLink(m.url)}
               activeOpacity={0.9}
             >
                 <View

@@ -37,7 +37,8 @@ The client application provides the mobile interface, local data storage, Fireba
 
 Before running the app, install:
 
-* Node.js 18 or newer
+* Node.js 22.13.0 (the EAS profiles pin this version; other supported ranges
+  are declared in `package.json`)
 * npm
 * Expo CLI or Expo Go
 * Android Studio for Android emulation
@@ -134,6 +135,12 @@ App Store build rather than Expo Go. For authoritative updates while the app is
 terminated, configure App Store Server Notifications V2 and verify signed
 transactions in the backend.
 
+Apple purchases made by development and TestFlight builds are Sandbox
+transactions. The `preview` EAS environment must therefore point to a staging
+backend that accepts Sandbox verification. The production backend remains
+Production-only unless `APPLE_ALLOW_SANDBOX_IN_PRODUCTION=true` is enabled for
+controlled testing; disable that override before public launch.
+
 ### Local Network Development
 
 When testing on a physical phone, `localhost` refers to the phone itself, not your development computer.
@@ -156,39 +163,63 @@ Common providers include:
 * Google
 * Apple
 
-Add the Firebase client configuration to your authentication configuration file.
-
-Example:
-
-```js
-import { initializeApp } from "firebase/app";
-import { getAuth } from "firebase/auth";
-
-const firebaseConfig = {
-  apiKey: process.env.EXPO_PUBLIC_FIREBASE_API_KEY,
-  authDomain: process.env.EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN,
-  projectId: process.env.EXPO_PUBLIC_FIREBASE_PROJECT_ID,
-  storageBucket: process.env.EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId:
-    process.env.EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.EXPO_PUBLIC_FIREBASE_APP_ID,
-};
-
-const app = initializeApp(firebaseConfig);
-
-export const auth = getAuth(app);
-```
-
-Firebase client configuration values may be placed in `.env`:
+The app uses the Firebase JavaScript SDK. Copy `.env.example` to `.env` and
+provide the Firebase Web app configuration used by `auth/firebaseClient.js`:
 
 ```env
 EXPO_PUBLIC_FIREBASE_API_KEY=your_api_key
 EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN=your_project.firebaseapp.com
 EXPO_PUBLIC_FIREBASE_PROJECT_ID=your_project_id
-EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET=your_project.appspot.com
-EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=your_sender_id
 EXPO_PUBLIC_FIREBASE_APP_ID=your_app_id
 ```
+
+For native Google Sign-In on iOS, register an iOS app in the same Firebase
+project with bundle ID `com.chilltech.pantrio`. Copy its iOS OAuth `CLIENT_ID`
+to `EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID`, and keep the project's Web OAuth client
+in `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID`. `app.config.js` derives the required
+reversed iOS URL scheme from the iOS client ID, so these values cannot drift.
+
+This project deliberately uses the Google Sign-In config plugin's explicit
+OAuth mode and does not bundle `GoogleService-Info.plist`; Firebase
+Authentication receives the native Google ID token through the JavaScript SDK.
+The Expo config fails early if any required Firebase or Google value is absent.
+
+Set both Google client IDs in the EAS `preview` and `production` environments.
+The `preview` profile intentionally selects the EAS `preview` environment so it
+can use staging endpoints without changing the production build.
+
+All three EAS profiles select a matching environment and update channel:
+`development`, `preview`, and `production`. Every EAS build requires the API,
+WebSocket, Firebase, and Google values listed in `.env.example`. Production also
+requires the Apple subscription product list and a public privacy-policy URL,
+and rejects non-HTTPS API/legal URLs, non-WSS sockets, loopback hosts,
+mismatched Firebase/Google project numbers, or an updates URL that does not
+match the configured EAS project ID.
+
+Run `npm run config:check` after pulling the target EAS environment and before
+publishing an EAS Update. EAS does not expose a stable config-time "update in
+progress" signal, so this explicit preflight applies the same production checks
+without relying on an undocumented environment variable.
+
+The runtime-version policy is `fingerprint`, so an update is delivered only to
+binaries with the same native/config fingerprint. Publish updates to the
+profile's channel and build a new binary whenever native dependencies or Expo
+config change.
+
+### Sentry builds
+
+Store `SENTRY_AUTH_TOKEN` as an EAS **Secret** in every environment whose builds
+should upload source maps. It is a build-only credential: never prefix it with
+`EXPO_PUBLIC_`, put it in `app.json`, or commit its value. Give the token only
+the organization/project release permissions required by Sentry. If a build is
+intentionally run without source-map upload, set Sentry's documented disable
+flag for that build rather than adding a placeholder token. The existing Sentry
+Expo config plugin reads the real token from the build environment.
+
+The EAS profiles pin a supported Node version. The iOS image/Xcode identifier is
+left unpinned until the exact Expo SDK 57 image used by the project is confirmed
+in EAS; do not guess an image name, because the custom Apple Intelligence module
+requires an Xcode toolchain that includes Foundation Models.
 
 Do not place Firebase Admin credentials or service-account JSON files in the client application.
 
@@ -744,23 +775,14 @@ GoogleService-Info.plist
 google-services.json
 ```
 
-Some Firebase client configuration files may be intentionally included depending on your project setup, but private signing credentials and server credentials must never be committed.
+Private signing credentials and server credentials must never be committed.
 
 ## Example Environment File
 
-Create `.env.example`:
-
-```env
-EXPO_PUBLIC_API_BASE_URL=http://192.168.0.100:3000
-EXPO_PUBLIC_WS_URL=ws://192.168.0.100:3000/chat
-
-EXPO_PUBLIC_FIREBASE_API_KEY=
-EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN=
-EXPO_PUBLIC_FIREBASE_PROJECT_ID=
-EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET=
-EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=
-EXPO_PUBLIC_FIREBASE_APP_ID=
-```
+The tracked `.env.example` lists every required public build value. Copy it to
+`.env` for local development and create matching EAS environment variables for
+cloud builds. Never put a secret in an `EXPO_PUBLIC_*` variable because Expo
+embeds those values in the client bundle.
 
 ## Privacy and Account Deletion
 

@@ -25,6 +25,8 @@ import {
   startOfDayLocal,
 } from "../utils/dateInput";
 
+const MAX_EXPIRATION_DAYS = 36_500;
+
 export default function ItemFormModal({
   visible,
   mode = "add",
@@ -55,6 +57,54 @@ export default function ItemFormModal({
   const expDateRef = useRef(null);
 
   const focusedRef = useRef(null);
+  const mountedRef = useRef(false);
+  const visibleRef = useRef(visible);
+  const scrollFrameIdsRef = useRef(new Set());
+  const scrollTimeoutIdsRef = useRef(new Set());
+  const submitLockedRef = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
+
+  const cancelScheduledScrolls = () => {
+    for (const frameId of scrollFrameIdsRef.current) {
+      cancelAnimationFrame(frameId);
+    }
+    scrollFrameIdsRef.current.clear();
+
+    for (const timeoutId of scrollTimeoutIdsRef.current) {
+      clearTimeout(timeoutId);
+    }
+    scrollTimeoutIdsRef.current.clear();
+  };
+
+  const scheduleScrollFrame = (callback) => {
+    const frameId = requestAnimationFrame(() => {
+      scrollFrameIdsRef.current.delete(frameId);
+      if (mountedRef.current && visibleRef.current) callback();
+    });
+    scrollFrameIdsRef.current.add(frameId);
+  };
+
+  const scheduleScrollTimeout = (callback, delay) => {
+    const timeoutId = setTimeout(() => {
+      scrollTimeoutIdsRef.current.delete(timeoutId);
+      if (mountedRef.current && visibleRef.current) callback();
+    }, delay);
+    scrollTimeoutIdsRef.current.add(timeoutId);
+  };
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      visibleRef.current = false;
+      cancelScheduledScrolls();
+    };
+  }, []);
+
+  useEffect(() => {
+    visibleRef.current = visible;
+    if (!visible) cancelScheduledScrolls();
+  }, [visible]);
 
   const scrollToRef = (ref) => {
     const sv = scrollRef.current;
@@ -80,8 +130,8 @@ export default function ItemFormModal({
     // close popovers/menus so layout is stable before scrolling
     closeAll();
 
-    requestAnimationFrame(() => scrollToRef(ref));
-    setTimeout(() => scrollToRef(ref), 60);
+    scheduleScrollFrame(() => scrollToRef(ref));
+    scheduleScrollTimeout(() => scrollToRef(ref), 60);
   };
 
   // When keyboard opens, ensure focused input is visible (NO keyboard avoidance; just scroll)
@@ -93,8 +143,8 @@ export default function ItemFormModal({
 
     const subShow = Keyboard.addListener(showEvt, () => {
       if (focusedRef.current) {
-        requestAnimationFrame(() => scrollToRef(focusedRef.current));
-        setTimeout(() => scrollToRef(focusedRef.current), 80);
+        scheduleScrollFrame(() => scrollToRef(focusedRef.current));
+        scheduleScrollTimeout(() => scrollToRef(focusedRef.current), 80);
       }
     });
 
@@ -103,6 +153,7 @@ export default function ItemFormModal({
     return () => {
       subShow.remove();
       subHide.remove();
+      cancelScheduledScrolls();
     };
   }, [visible]);
 
@@ -152,6 +203,7 @@ export default function ItemFormModal({
   const [expPickedDate, setExpPickedDate] = useState(() => startOfDayLocal(new Date()));
 
   const pickBtnRef = useRef(null);
+  const pickerOpeningRef = useRef(false);
   const [pickerVisible, setPickerVisible] = useState(false);
   const [pickerFromRect, setPickerFromRect] = useState(null);
 
@@ -160,12 +212,17 @@ export default function ItemFormModal({
     setOpenUrgency(false);
     setOpenFoodType(false);
     setOpenState(false);
+    pickerOpeningRef.current = false;
     setPickerVisible(false);
     setPickerFromRect(null);
   };
 
+  /* eslint-disable react-hooks/set-state-in-effect -- The form stays mounted and must be re-seeded when each modal session opens. */
   useEffect(() => {
     if (!visible) return;
+
+    submitLockedRef.current = false;
+    scheduleScrollFrame(() => setSubmitting(false));
 
     const it = initialItem;
 
@@ -180,10 +237,16 @@ export default function ItemFormModal({
       setStateTag(labels?.state || "");
 
       if (it.expiresAt) {
-        setExpMode("date");
         const local = startOfDayLocal(new Date(it.expiresAt));
-        setExpPickedDate(local);
-        setExpDateText(formatYYYYMMDDLocal(local));
+        if (local) {
+          setExpMode("date");
+          setExpPickedDate(local);
+          setExpDateText(formatYYYYMMDDLocal(local));
+        } else {
+          setExpMode("days");
+          setExpPickedDate(startOfDayLocal(new Date()));
+          setExpDateText("");
+        }
       } else {
         setExpMode("days");
         setExpPickedDate(startOfDayLocal(new Date()));
@@ -208,6 +271,7 @@ export default function ItemFormModal({
     closeAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   const buildExpiresAt = () => {
     let expiresAt = null;
@@ -216,13 +280,25 @@ export default function ItemFormModal({
       const raw = String(expDaysText || "").trim();
       if (raw) {
         const days = Number(raw);
-        if (!Number.isFinite(days) || days <= 0) {
-          Alert.alert("Days until expire", "Enter a valid number of days (e.g., 3, 7, 14).");
+        if (
+          !Number.isFinite(days) ||
+          days <= 0 ||
+          Math.round(days) > MAX_EXPIRATION_DAYS
+        ) {
+          Alert.alert(
+            "Days until expire",
+            `Enter a valid number of days from 1 to ${MAX_EXPIRATION_DAYS.toLocaleString()}.`
+          );
           return { ok: false, expiresAt: null };
         }
         const d = startOfDayLocal(new Date());
+        if (!d) return { ok: false, expiresAt: null };
         d.setDate(d.getDate() + Math.round(days));
         expiresAt = isoFromLocalDateOnly(d);
+        if (!expiresAt) {
+          Alert.alert("Days until expire", "Enter a valid expiration range.");
+          return { ok: false, expiresAt: null };
+        }
       } else {
         expiresAt = null;
       }
@@ -249,6 +325,8 @@ export default function ItemFormModal({
   };
 
   const handleSubmit = () => {
+    if (submitLockedRef.current) return;
+
     const n = String(name || "").trim();
     const q = String(quantity || "").trim();
 
@@ -265,14 +343,23 @@ export default function ItemFormModal({
     const { ok, expiresAt } = buildExpiresAt();
     if (!ok) return;
 
-    onSubmit?.({
-      ...(isEdit && initialItem?.id ? { id: initialItem.id } : {}),
-      name: n,
-      quantity: q,
-      tagIds,
-      expiresAt,
-      expMode,
-    });
+    submitLockedRef.current = true;
+    setSubmitting(true);
+
+    try {
+      onSubmit?.({
+        ...(isEdit && initialItem?.id ? { id: initialItem.id } : {}),
+        name: n,
+        quantity: q,
+        tagIds,
+        expiresAt,
+        expMode,
+      });
+    } catch (error) {
+      submitLockedRef.current = false;
+      setSubmitting(false);
+      throw error;
+    }
 
     closeAll();
     focusedRef.current = null;
@@ -449,11 +536,17 @@ export default function ItemFormModal({
                       ]}
                       activeOpacity={0.85}
                       onPress={() => {
+                        if (pickerOpeningRef.current || pickerVisible) return;
                         Keyboard.dismiss();
                         focusedRef.current = null;
 
-                        if (!pickBtnRef.current?.measureInWindow) return;
+                        if (!pickBtnRef.current?.measureInWindow || !visibleRef.current) return;
+                        pickerOpeningRef.current = true;
                         pickBtnRef.current.measureInWindow((x, y, width, height) => {
+                          if (!mountedRef.current || !visibleRef.current) {
+                            pickerOpeningRef.current = false;
+                            return;
+                          }
                           setPickerFromRect({ x, y, width, height });
                           setPickerVisible(true);
                         });
@@ -476,7 +569,10 @@ export default function ItemFormModal({
                     placement="bottom"
                     backgroundStyle={{ backgroundColor: "transparent" }}
                     popoverStyle={{ borderRadius: 16, backgroundColor: "transparent" }}
-                    onRequestClose={() => setPickerVisible(false)}
+                    onRequestClose={() => {
+                      pickerOpeningRef.current = false;
+                      setPickerVisible(false);
+                    }}
                   >
                     <View style={[styles.popover, { backgroundColor: theme?.background, borderColor: theme?.border }]}>
                       <DateTimePicker
@@ -484,11 +580,16 @@ export default function ItemFormModal({
                         mode="date"
                         display={Platform.OS === "ios" ? "inline" : "default"}
                         onChange={(event, date) => {
-                          if (Platform.OS !== "ios") setPickerVisible(false);
+                          if (Platform.OS !== "ios") {
+                            pickerOpeningRef.current = false;
+                            setPickerVisible(false);
+                          }
                           if (date) {
                             const local = startOfDayLocal(date);
-                            setExpPickedDate(local);
-                            setExpDateText(formatYYYYMMDDLocal(local));
+                            if (local) {
+                              setExpPickedDate(local);
+                              setExpDateText(formatYYYYMMDDLocal(local));
+                            }
                           }
                         }}
                       />
@@ -497,7 +598,10 @@ export default function ItemFormModal({
                         <TouchableOpacity
                           style={[styles.doneBtn, { backgroundColor: theme?.actionButton }]}
                           activeOpacity={0.85}
-                          onPress={() => setPickerVisible(false)}
+                          onPress={() => {
+                            pickerOpeningRef.current = false;
+                            setPickerVisible(false);
+                          }}
                         >
                           <Text style={{ color: "#fff", fontWeight: "900", fontSize }}>Done</Text>
                         </TouchableOpacity>
@@ -641,6 +745,7 @@ export default function ItemFormModal({
               <TouchableOpacity
                 style={[styles.btn, { backgroundColor: theme?.actionButton }]}
                 onPress={handleSubmit}
+                disabled={submitting}
               >
                 <Text style={{ fontSize, color: "#fff" }}>{isEdit ? submitLabelEdit : submitLabelAdd}</Text>
               </TouchableOpacity>

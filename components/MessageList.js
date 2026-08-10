@@ -17,15 +17,32 @@ import MessageBubble from "./MessageBubble";
 import { GlobalContext } from "../context/GlobalContext";
 import DropDownPicker from "react-native-dropdown-picker";
 
+function toDisplayText(value) {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return "";
+}
+
+function safeAction(value) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : null;
+}
+
 /**
  * Renders a UI action card inside the chat list.
  */
 function ActionCard({ action, onPress }) {
-  if (!action) return null;
+  const normalizedAction = safeAction(action);
+  if (!normalizedAction) return null;
 
-  if (action.kind === "add_all_to_fridge") {
-    const items = Array.isArray(action.items) ? action.items : [];
-    const title = action.title || "Add all to fridge";
+  if (normalizedAction.kind === "add_all_to_fridge") {
+    const items = Array.isArray(normalizedAction.items)
+      ? normalizedAction.items
+      : [];
+    const title = toDisplayText(normalizedAction.title) || "Add all to fridge";
 
     return (
       <View
@@ -43,8 +60,10 @@ function ActionCard({ action, onPress }) {
 
         {items.slice(0, 6).map((it, idx) => (
           <Text key={idx} style={{ marginBottom: 2 }}>
-            • {it?.name}
-            {it?.quantity ? ` — ${it.quantity}` : ""}
+            • {toDisplayText(it?.name) || "(unnamed)"}
+            {toDisplayText(it?.quantity)
+              ? ` — ${toDisplayText(it?.quantity)}`
+              : ""}
           </Text>
         ))}
         {items.length > 6 ? (
@@ -77,7 +96,7 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
   const { theme } = useContext(GlobalContext);
 
   const rawItems = Array.isArray(action?.items) ? action.items : [];
-  const title = action?.title || "Confirm items";
+  const title = toDisplayText(action?.title) || "Confirm items";
 
   const [draftItems, setDraftItems] = useState([]);
   const [expandedIdx, setExpandedIdx] = useState(null);
@@ -87,8 +106,37 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
   const setOpenFor = (key, nextOpen) => setOpenKey(nextOpen ? key : null);
 
   const [sheetH, setSheetH] = useState(0);
-  const translateY = useRef(new Animated.Value(9999)).current;
+  const [translateY] = useState(() => new Animated.Value(9999));
   const offscreenY = sheetH ? sheetH + 40 : 9999;
+  const [closing, setClosing] = useState(false);
+  const mountedRef = useRef(false);
+  const closingRef = useRef(false);
+  const activeAnimationRef = useRef(null);
+  const frameIdsRef = useRef(new Set());
+
+  const cancelFrames = () => {
+    for (const frameId of frameIdsRef.current) cancelAnimationFrame(frameId);
+    frameIdsRef.current.clear();
+  };
+
+  const scheduleFrame = (callback) => {
+    const frameId = requestAnimationFrame(() => {
+      frameIdsRef.current.delete(frameId);
+      if (mountedRef.current && visible) callback();
+    });
+    frameIdsRef.current.add(frameId);
+  };
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      closingRef.current = true;
+      activeAnimationRef.current?.stop();
+      activeAnimationRef.current = null;
+      cancelFrames();
+    };
+  }, []);
 
   // ✅ auto-scroll helpers
   const scrollRef = useRef(null);
@@ -208,20 +256,34 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
   useEffect(() => {
     if (visible && sheetH) {
       translateY.setValue(offscreenY);
-      Animated.timing(translateY, {
+      const animation = Animated.timing(translateY, {
         toValue: 0,
         duration: 260,
         easing: Easing.out(Easing.cubic),
         useNativeDriver: true,
-      }).start();
+      });
+      activeAnimationRef.current = animation;
+      animation.start(() => {
+        if (activeAnimationRef.current === animation) {
+          activeAnimationRef.current = null;
+        }
+      });
     }
   }, [visible, sheetH, offscreenY, translateY]);
 
+  /* eslint-disable react-hooks/set-state-in-effect -- The persistent confirmation sheet intentionally resets its draft when a new action opens. */
   useEffect(() => {
-    if (!visible) return;
+    if (!visible) {
+      closingRef.current = false;
+      cancelFrames();
+      return;
+    }
+
+    closingRef.current = false;
 
     const seeded = rawItems.map((it) => ({
-      ...it,
+      ...(it && typeof it === "object" && !Array.isArray(it) ? it : {}),
+      name: toDisplayText(it?.name),
       selected: true,
       quantity: it?.quantity === 0 || it?.quantity ? String(it.quantity) : "1",
       categories: coerceCategories(it?.categories),
@@ -235,6 +297,7 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
     setScrollY(0);
     setFooterH(0);
   }, [visible, action]); // eslint-disable-line react-hooks/exhaustive-deps
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   const toggleSelected = (idx) => {
     setDraftItems((prev) =>
@@ -263,10 +326,8 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
     );
   };
 
-  const [closing, setClosing] = useState(false);
-
   const handleConfirm = () => {
-    if (closing) return;
+    if (closingRef.current) return;
 
     const selectedItems = draftItems
       .filter((it) => it.selected)
@@ -280,29 +341,52 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
         };
       });
 
-    const updatedAction = { ...action, items: selectedItems };
+    const updatedAction = { ...(safeAction(action) || {}), items: selectedItems };
 
+    closingRef.current = true;
     setClosing(true);
-    Animated.timing(translateY, {
+    activeAnimationRef.current?.stop();
+    const animation = Animated.timing(translateY, {
       toValue: offscreenY,
       duration: 220,
       easing: Easing.in(Easing.cubic),
       useNativeDriver: true,
-    }).start(() => {
+    });
+    activeAnimationRef.current = animation;
+    animation.start(({ finished }) => {
+      if (activeAnimationRef.current === animation) {
+        activeAnimationRef.current = null;
+      }
+      if (!finished || !mountedRef.current) return;
+      closingRef.current = false;
       setClosing(false);
       onConfirm?.(updatedAction);
     });
   };
 
   const handleClose = () => {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    setClosing(true);
     setOpenKey(null);
     setExpandedIdx(null);
-    Animated.timing(translateY, {
+    activeAnimationRef.current?.stop();
+    const animation = Animated.timing(translateY, {
       toValue: offscreenY,
       duration: 220,
       easing: Easing.in(Easing.cubic),
       useNativeDriver: true,
-    }).start(() => onClose?.());
+    });
+    activeAnimationRef.current = animation;
+    animation.start(({ finished }) => {
+      if (activeAnimationRef.current === animation) {
+        activeAnimationRef.current = null;
+      }
+      if (!finished || !mountedRef.current) return;
+      closingRef.current = false;
+      setClosing(false);
+      onClose?.();
+    });
   };
 
   const selectedCount = draftItems.filter((it) => it.selected).length;
@@ -328,6 +412,7 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
       presentationStyle="overFullScreen"
       statusBarTranslucent
       onRequestClose={handleClose}
+      onShow={() => setClosing(false)}
     >
       <View style={styles.modalRoot}>
         <Pressable style={styles.backdrop} onPress={handleClose} />
@@ -401,8 +486,8 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
 
                               if (next === idx) {
                                 // ✅ after render/layout, scroll using anchor
-                                requestAnimationFrame(() => {
-                                  requestAnimationFrame(() => ensureEditorVisible(idx));
+                                scheduleFrame(() => {
+                                  scheduleFrame(() => ensureEditorVisible(idx));
                                 });
                               }
 
@@ -517,10 +602,11 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
                         <View
                           ref={(r) => {
                             if (r) editorEndRefs.current[idx] = r;
+                            else delete editorEndRefs.current[idx];
                           }}
                           onLayout={() => {
                             // when the editor finishes laying out, ensure anchor is visible
-                            requestAnimationFrame(() => ensureEditorVisible(idx));
+                            scheduleFrame(() => ensureEditorVisible(idx));
                           }}
                           style={{ height: 1 }}
                         />
@@ -541,9 +627,9 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
               style={[
                 styles.confirmBtn,
                 { borderColor: TextPrimary },
-                selectedCount === 0 && { opacity: 0.5 },
+                (selectedCount === 0 || closing) && { opacity: 0.5 },
               ]}
-              disabled={selectedCount === 0}
+              disabled={selectedCount === 0 || closing}
             >
               <Text style={{ fontWeight: "900", color: TextPrimary }}>
                 Confirm ({selectedCount})
@@ -557,9 +643,9 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
 }
 
 function TypingIndicator({ theme }) {
-  const d1 = useRef(new Animated.Value(0.2)).current;
-  const d2 = useRef(new Animated.Value(0.2)).current;
-  const d3 = useRef(new Animated.Value(0.2)).current;
+  const [d1] = useState(() => new Animated.Value(0.2));
+  const [d2] = useState(() => new Animated.Value(0.2));
+  const [d3] = useState(() => new Animated.Value(0.2));
 
   useEffect(() => {
     const mk = (v, delay) =>
@@ -626,6 +712,7 @@ function TypingIndicator({ theme }) {
 
 export default function MessageList({ messages, onUiAction }) {
   const listRef = useRef(null);
+  const scrollTimerRef = useRef(null);
   const { theme, waiting } = useContext(GlobalContext);
   const [modalVisible, setModalVisible] = useState(false);
   const [pendingAction, setPendingAction] = useState(null);
@@ -641,35 +728,59 @@ export default function MessageList({ messages, onUiAction }) {
   };
 
   const confirmActionModal = (updatedAction) => {
-    if (updatedAction) onUiAction?.(updatedAction);
+    if (updatedAction) {
+      try {
+        Promise.resolve(onUiAction?.(updatedAction)).catch((error) => {
+          console.error("Chat action failed:", error);
+        });
+      } catch (error) {
+        console.error("Chat action failed:", error);
+      }
+    }
     closeActionModal();
   };
 
+  useEffect(
+    () => () => {
+      if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
+    },
+    []
+  );
+
   const data = useMemo(() => {
-    const base = (messages || [])
-      .filter((msg) => !msg?.text?.startsWith("[fromTool]"))
-      .map((msg) => {
+    const sourceMessages = Array.isArray(messages) ? messages : [];
+    const base = sourceMessages
+      .filter((msg) => !toDisplayText(msg?.text).startsWith("[fromTool]"))
+      .map((msg, index) => {
+        const key =
+          toDisplayText(msg?.id || msg?.requestId) ||
+          `message-${index}-${toDisplayText(msg?.role)}-${toDisplayText(msg?.type)}`;
+
         if (msg?.type === "ui_action" && msg?.action) {
-          return { kind: "ui_action", action: msg.action };
+          return { kind: "ui_action", action: safeAction(msg.action), key };
         }
 
-        const text = msg?.content?.[0]?.text ?? msg?.text ?? null;
+        const contentText = Array.isArray(msg?.content)
+          ? msg.content.find((part) => part?.text != null)?.text
+          : msg?.content;
+        const text = toDisplayText(contentText ?? msg?.text);
 
-        const imageUri =
+        const rawImageUri =
           msg?.imageUri ||
           msg?.content?.[0]?.image_url ||
           msg?.content?.[0]?.imageUri ||
           null;
+        const imageUri = typeof rawImageUri === "string" ? rawImageUri : null;
 
         const isUser = msg?.role === "user";
 
         if (!text && !imageUri) return null;
 
-        return { kind: "bubble", text, imageUri, isUser };
+        return { kind: "bubble", text, imageUri, isUser, key };
       })
       .filter(Boolean);
 
-    if (waiting) base.push({ kind: "typing" });
+    if (waiting) base.push({ kind: "typing", key: "typing" });
 
     return base;
   }, [messages, waiting]);
@@ -679,7 +790,7 @@ export default function MessageList({ messages, onUiAction }) {
       <FlatList
         ref={listRef}
         data={data}
-        keyExtractor={(_, index) => index.toString()}
+        keyExtractor={(item) => item.key}
         renderItem={({ item }) => {
           if (item.kind === "ui_action") {
             return <ActionCard action={item.action} onPress={() => openActionModal(item.action)} />;
@@ -689,7 +800,11 @@ export default function MessageList({ messages, onUiAction }) {
         }}
         contentContainerStyle={{ padding: 10, paddingBottom: 20 }}
         onContentSizeChange={() => {
-          setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 150);
+          if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
+          scrollTimerRef.current = setTimeout(() => {
+            scrollTimerRef.current = null;
+            listRef.current?.scrollToEnd({ animated: true });
+          }, 150);
         }}
       />
 

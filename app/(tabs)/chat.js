@@ -1,4 +1,4 @@
-import { useContext, useEffect, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import {
   Keyboard,
   KeyboardAvoidingView,
@@ -41,8 +41,11 @@ export default function ChatScreen() {
   const { streamMessage } = useGpt();
   const { theme, messages, setMessages, setReceiving, setWaiting, addToFridge } =
     useContext(GlobalContext);
+  const mountedRef = useRef(false);
+  const sendGenerationRef = useRef(0);
 
   useEffect(() => {
+    mountedRef.current = true;
     const showSub = Keyboard.addListener(
       Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow",
       () => setKeyboardVisible(true)
@@ -53,12 +56,16 @@ export default function ChatScreen() {
     );
 
     return () => {
+      mountedRef.current = false;
+      sendGenerationRef.current += 1;
       showSub.remove();
       hideSub.remove();
     };
   }, []);
 
   const handleSend = async (message) => {
+    const generation = sendGenerationRef.current + 1;
+    sendGenerationRef.current = generation;
     setInput("");
     setReceiving(true);
     setWaiting(true);
@@ -70,28 +77,40 @@ export default function ChatScreen() {
           imageUri: message.imageUri || "",
         });
       } catch (error) {
+        if (
+          error?.code === "REQUEST_CANCELLED" ||
+          !mountedRef.current ||
+          sendGenerationRef.current !== generation
+        ) {
+          return;
+        }
         console.error("Error sending message to GPT:", error);
         const errorMessage = getChatErrorMessage(error);
 
         setMessages((prev) => [
-          ...prev,
+          ...(Array.isArray(prev) ? prev : []),
           {
             role: "assistant",
             content: [{ type: "output_text", text: errorMessage }],
           },
         ]);
       } finally {
+        if (mountedRef.current && sendGenerationRef.current === generation) {
+          setReceiving(false);
+          setWaiting(false);
+        }
+      }
+    } else {
+      if (mountedRef.current && sendGenerationRef.current === generation) {
         setReceiving(false);
         setWaiting(false);
       }
-    } else {
-      setReceiving(false);
-      setWaiting(false);
     }
   };
 
   // ✅ Works with your typed categories requirement in gptTools.js
   const handleUiAction = async (maybeAction) => {
+    if (!mountedRef.current) return;
     // Some components pass {kind,...}, others pass {action:{kind,...}}
     const action = maybeAction?.kind ? maybeAction : maybeAction?.action;
     if (action?.kind !== "add_all_to_fridge") return;
@@ -153,16 +172,21 @@ export default function ChatScreen() {
       try {
         // ✅ your new signature:
         // addToFridge(name, quantity, categories, expiresAt)
-        console.log({name, quantity, categories, expiresAt});
+        if (__DEV__) {
+          console.log("Adding proposed fridge item", { name });
+        }
         addToFridge(name, quantity, categories, expiresAt);
         added += 1;
       } catch (e) {
         failed.push({ name, reason: String(e?.message || e) });
-        console.log({ name, reason: String(e?.message || e) });
+        if (__DEV__) {
+          console.log({ name, reason: String(e?.message || e) });
+        }
       }
     }
   
     // Optional summary message
+    if (!mountedRef.current) return;
     setMessages((prev) => [
       ...(Array.isArray(prev) ? prev : []),
       {

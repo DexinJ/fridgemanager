@@ -1,6 +1,6 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
-import React, { useContext, useMemo, useState } from "react";
+import React, { useContext, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -12,26 +12,62 @@ import {
   View,
 } from "react-native";
 
-import { createUserWithEmailAndPassword } from "firebase/auth";
+import {
+  createUserWithEmailAndPassword,
+  deleteUser,
+  signOut as firebaseSignOut,
+} from "firebase/auth";
 
 import { signInWithApple } from "../../auth/appleAuth"; // ✅ CHANGED: Apple login helper
+import {
+  bindAuthProvisioningUser,
+  clearAuthProvisioningIntent,
+  markAuthProvisioningStarted,
+} from "../../api/authProvisioningStorage";
 import { API_BASE_URL } from "../../api/backendConfig";
+import { fetchWithTimeout } from "../../api/fetchWithTimeout";
 import { auth } from "../../auth/firebaseClient";
 import {
-  configureGoogleSignIn,
   signInWithGoogleNative,
+  signOutFromGoogleNative,
 } from "../../auth/googleAuth";
+import { useAuth } from "../../auth/useAuth";
 import { GlobalContext } from "../../context/GlobalContext";
 
-async function saveUserProfileToBackend({ idToken, username }) {
-  const resp = await fetch(`${API_BASE_URL}/api/users`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${idToken}`,
-    },
-    body: JSON.stringify({ username }),
-  });
+const PROFILE_REQUEST_TIMEOUT_MS = 15000;
+
+function accountSetupCancelledError() {
+  const error = new Error("Account setup was cancelled.");
+  error.code = "ACCOUNT_SETUP_CANCELLED";
+  return error;
+}
+
+async function saveUserProfileToBackend({ idToken, username, signal }) {
+  let resp;
+
+  try {
+    resp = await fetchWithTimeout(
+      `${API_BASE_URL}/api/users`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ username }),
+        signal,
+      },
+      {
+        timeoutMs: PROFILE_REQUEST_TIMEOUT_MS,
+        timeoutMessage: "Account setup timed out. Please try again.",
+      }
+    );
+  } catch (error) {
+    if (error?.name === "AbortError" && signal?.aborted) {
+      throw accountSetupCancelledError();
+    }
+    throw error;
+  }
 
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
@@ -55,6 +91,11 @@ function makeFallbackUsername(user, typedUsername = "") {
 
 export default function SignUpScreen() {
   const router = useRouter();
+  const {
+    abortProvisioning,
+    beginProvisioning,
+    completeProvisioning,
+  } = useAuth();
 
   const { theme, settings, setUsername: setUsernameInApp } =
     useContext(GlobalContext);
@@ -68,10 +109,34 @@ export default function SignUpScreen() {
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
   const [appleLoading, setAppleLoading] = useState(false); // ✅ CHANGED
+  const mountedRef = useRef(true);
+  const activeProvisioningRef = useRef(null);
+  const activeProvisioningProviderRef = useRef(null);
+  const profileRequestControllerRef = useRef(null);
+  const operationBusyRef = useRef(false);
 
-  useMemo(() => {
-    configureGoogleSignIn();
-  }, []);
+  const ensureProvisioningIsActive = (generation) => {
+    if (
+      !mountedRef.current ||
+      activeProvisioningRef.current !== generation
+    ) {
+      throw accountSetupCancelledError();
+    }
+  };
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      profileRequestControllerRef.current?.abort();
+      const generation = activeProvisioningRef.current;
+      if (generation !== null) {
+        void abortProvisioning(generation, {
+          provider: activeProvisioningProviderRef.current,
+        }).catch(() => {});
+      }
+    };
+  }, [abortProvisioning]);
 
   const isBusy = loading || googleLoading || appleLoading; // ✅ CHANGED
 
@@ -91,20 +156,82 @@ export default function SignUpScreen() {
     if (pw.length < 6) {
       return Alert.alert("Weak password", "Password must be at least 6 characters.");
     }
+    if (operationBusyRef.current) return;
 
+    operationBusyRef.current = true;
     setLoading(true);
+    let generation = null;
+    let markerStarted = false;
+    let createdUser = null;
+    let backendProfileSaved = false;
+    let firebaseUserDeleted = false;
     try {
+      generation = beginProvisioning();
+      activeProvisioningRef.current = generation;
+      activeProvisioningProviderRef.current = null;
+      await markAuthProvisioningStarted("password");
+      markerStarted = true;
+      if (!mountedRef.current) {
+        return;
+      }
+
       const cred = await createUserWithEmailAndPassword(auth, e, pw);
+      createdUser = cred.user;
+      ensureProvisioningIsActive(generation);
+      await bindAuthProvisioningUser(cred.user.uid);
+      ensureProvisioningIsActive(generation);
       const idToken = await cred.user.getIdToken();
+      ensureProvisioningIsActive(generation);
 
-      await saveUserProfileToBackend({ idToken, username: u });
+      const profileController = new AbortController();
+      profileRequestControllerRef.current = profileController;
+      try {
+        await saveUserProfileToBackend({
+          idToken,
+          username: u,
+          signal: profileController.signal,
+        });
+      } finally {
+        if (profileRequestControllerRef.current === profileController) {
+          profileRequestControllerRef.current = null;
+        }
+      }
+      backendProfileSaved = true;
+      await clearAuthProvisioningIntent().catch(() => {});
+      ensureProvisioningIsActive(generation);
 
-      setUsernameInApp(u);
-      router.replace("/(tabs)");
+      if (mountedRef.current) setUsernameInApp(u);
+      activeProvisioningRef.current = null;
+      activeProvisioningProviderRef.current = null;
+      completeProvisioning(generation);
     } catch (err) {
-      Alert.alert("Sign up failed", err?.message || "Unknown error");
+      if (createdUser && !backendProfileSaved) {
+        try {
+          await deleteUser(createdUser);
+          firebaseUserDeleted = true;
+        } catch {
+          // Keep the durable marker. A later sign-in will verify whether this
+          // Firebase account ever received its backend profile.
+        }
+      }
+      if (generation !== null) {
+        await abortProvisioning(generation).catch(() => false);
+      }
+      if (!mountedRef.current) {
+        await firebaseSignOut(auth).catch(() => {});
+      }
+      if (markerStarted && (backendProfileSaved || firebaseUserDeleted)) {
+        await clearAuthProvisioningIntent().catch(() => {});
+      }
+      activeProvisioningRef.current = null;
+      activeProvisioningProviderRef.current = null;
+      if (mountedRef.current && err?.code !== "ACCOUNT_SETUP_CANCELLED") {
+        Alert.alert("Sign up failed", err?.message || "Unknown error");
+      }
     } finally {
-      setLoading(false);
+      profileRequestControllerRef.current = null;
+      operationBusyRef.current = false;
+      if (mountedRef.current) setLoading(false);
     }
   };
 
@@ -116,36 +243,118 @@ export default function SignUpScreen() {
         "Missing EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID in .env"
       );
     }
+    if (operationBusyRef.current) return;
 
+    operationBusyRef.current = true;
     setGoogleLoading(true);
+    let generation = null;
+    let signedInUser = null;
+    let backendProfileSaved = false;
     try {
-      const userCred = await signInWithGoogleNative(auth);
-      if (!userCred?.user) return;
+      generation = beginProvisioning();
+      activeProvisioningRef.current = generation;
+      activeProvisioningProviderRef.current = "google";
+      await markAuthProvisioningStarted("google");
+      if (!mountedRef.current) {
+        return;
+      }
 
+      const userCred = await signInWithGoogleNative(auth);
+      signedInUser = userCred?.user || null;
+      ensureProvisioningIsActive(generation);
+      if (!userCred?.user) {
+        await abortProvisioning(generation, { provider: "google" });
+        await clearAuthProvisioningIntent().catch(() => {});
+        activeProvisioningRef.current = null;
+        activeProvisioningProviderRef.current = null;
+        return;
+      }
+
+      await bindAuthProvisioningUser(userCred.user.uid);
+      ensureProvisioningIsActive(generation);
       const fallbackUsername = makeFallbackUsername(userCred.user, username);
       const firebaseIdToken = await userCred.user.getIdToken();
+      ensureProvisioningIsActive(generation);
 
-      await saveUserProfileToBackend({
-        idToken: firebaseIdToken,
-        username: fallbackUsername,
-      });
+      const profileController = new AbortController();
+      profileRequestControllerRef.current = profileController;
+      try {
+        await saveUserProfileToBackend({
+          idToken: firebaseIdToken,
+          username: fallbackUsername,
+          signal: profileController.signal,
+        });
+      } finally {
+        if (profileRequestControllerRef.current === profileController) {
+          profileRequestControllerRef.current = null;
+        }
+      }
+      backendProfileSaved = true;
+      await clearAuthProvisioningIntent().catch(() => {});
+      ensureProvisioningIsActive(generation);
 
-      setUsernameInApp(fallbackUsername);
-      router.replace("/(tabs)");
+      if (mountedRef.current) setUsernameInApp(fallbackUsername);
+      activeProvisioningRef.current = null;
+      activeProvisioningProviderRef.current = null;
+      completeProvisioning(generation);
     } catch (err) {
-      Alert.alert("Google sign-in failed", err?.message || "Unknown error");
+      if (generation !== null) {
+        await abortProvisioning(generation, { provider: "google" }).catch(
+          () => false
+        );
+      }
+      if (backendProfileSaved) {
+        await clearAuthProvisioningIntent().catch(() => {});
+      }
+      if (!mountedRef.current && signedInUser) {
+        await firebaseSignOut(auth).catch(() => {});
+        await signOutFromGoogleNative().catch(() => {});
+      }
+      activeProvisioningRef.current = null;
+      activeProvisioningProviderRef.current = null;
+      if (mountedRef.current && err?.code !== "ACCOUNT_SETUP_CANCELLED") {
+        Alert.alert("Google sign-in failed", err?.message || "Unknown error");
+      }
     } finally {
-      setGoogleLoading(false);
+      profileRequestControllerRef.current = null;
+      operationBusyRef.current = false;
+      if (mountedRef.current) setGoogleLoading(false);
     }
   };
 
   // ✅ CHANGED: Apple sign-up/sign-in handler
   const onPressApple = async () => {
-    setAppleLoading(true);
-    try {
-      const result = await signInWithApple();
-      if (!result?.user) return;
+    if (operationBusyRef.current) return;
 
+    operationBusyRef.current = true;
+    setAppleLoading(true);
+    let generation = null;
+    let markerStarted = false;
+    let signedInUser = null;
+    let backendProfileSaved = false;
+    try {
+      generation = beginProvisioning();
+      activeProvisioningRef.current = generation;
+      activeProvisioningProviderRef.current = "apple";
+      await markAuthProvisioningStarted("apple");
+      markerStarted = true;
+      if (!mountedRef.current) {
+        return;
+      }
+
+      const result = await signInWithApple();
+      signedInUser = result?.user || null;
+      ensureProvisioningIsActive(generation);
+      if (!result?.user) {
+        await abortProvisioning(generation);
+        await clearAuthProvisioningIntent().catch(() => {});
+        activeProvisioningRef.current = null;
+        activeProvisioningProviderRef.current = null;
+        return;
+      }
+
+      await bindAuthProvisioningUser(result.user.uid);
+      ensureProvisioningIsActive(generation);
       const appleName = result.appleCredential?.fullName;
       const displayNameFromApple = appleName
         ? `${appleName.givenName || ""}${appleName.familyName || ""}`.trim()
@@ -160,19 +369,52 @@ export default function SignUpScreen() {
       );
 
       const firebaseIdToken = await result.user.getIdToken();
+      ensureProvisioningIsActive(generation);
 
-      await saveUserProfileToBackend({
-        idToken: firebaseIdToken,
-        username: fallbackUsername,
-      });
+      const profileController = new AbortController();
+      profileRequestControllerRef.current = profileController;
+      try {
+        await saveUserProfileToBackend({
+          idToken: firebaseIdToken,
+          username: fallbackUsername,
+          signal: profileController.signal,
+        });
+      } finally {
+        if (profileRequestControllerRef.current === profileController) {
+          profileRequestControllerRef.current = null;
+        }
+      }
+      backendProfileSaved = true;
+      await clearAuthProvisioningIntent().catch(() => {});
+      ensureProvisioningIsActive(generation);
 
-      setUsernameInApp(fallbackUsername);
-      router.replace("/(tabs)");
+      if (mountedRef.current) setUsernameInApp(fallbackUsername);
+      activeProvisioningRef.current = null;
+      activeProvisioningProviderRef.current = null;
+      completeProvisioning(generation);
     } catch (err) {
+      if (generation !== null) {
+        await abortProvisioning(generation).catch(() => false);
+      }
+      if (backendProfileSaved) {
+        await clearAuthProvisioningIntent().catch(() => {});
+      }
+      if (!mountedRef.current && signedInUser) {
+        await firebaseSignOut(auth).catch(() => {});
+      }
+      if (markerStarted && err?.code === "ERR_REQUEST_CANCELED") {
+        await clearAuthProvisioningIntent().catch(() => {});
+      }
+      activeProvisioningRef.current = null;
+      activeProvisioningProviderRef.current = null;
       if (err?.code === "ERR_REQUEST_CANCELED") return;
-      Alert.alert("Apple sign-in failed", err?.message || "Unknown error");
+      if (mountedRef.current && err?.code !== "ACCOUNT_SETUP_CANCELLED") {
+        Alert.alert("Apple sign-in failed", err?.message || "Unknown error");
+      }
     } finally {
-      setAppleLoading(false);
+      profileRequestControllerRef.current = null;
+      operationBusyRef.current = false;
+      if (mountedRef.current) setAppleLoading(false);
     }
   };
 
@@ -355,8 +597,13 @@ export default function SignUpScreen() {
       <Text style={[styles.footer, { color: theme.textSecondary }]}>
         Already have an account?{" "}
         <Text
-          style={[styles.link, { color: theme.accent }]}
-          onPress={() => router.push("/(auth)/sign-in")}
+          style={[
+            styles.link,
+            { color: theme.accent, opacity: isBusy ? 0.45 : 1 },
+          ]}
+          onPress={isBusy ? undefined : () => router.push("/(auth)/sign-in")}
+          accessibilityRole="link"
+          accessibilityState={{ disabled: isBusy }}
         >
           Log in
         </Text>

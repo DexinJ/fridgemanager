@@ -14,8 +14,65 @@ const MAX_SUMMARY_HISTORY_CHARACTERS = 9_000;
 const MAX_PREVIOUS_SUMMARY_CHARACTERS = 3_000;
 const SUMMARY_TIMEOUT_MS = 8_000;
 const SUMMARY_RETRY_DELAY_MS = 60_000;
+const MAX_PERSISTED_CHAT_MESSAGES = 500;
 const summaryRetryAtByUser = new Map();
 const chatGenerationByUser = new Map();
+
+function isPlainRecord(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function sanitizeChatContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return null;
+
+  return content
+    .filter((part) => typeof part === "string" || isPlainRecord(part))
+    .map((part) => (isPlainRecord(part) ? { ...part } : part));
+}
+
+export function sanitizePersistedChatMessages(value) {
+  if (!Array.isArray(value)) {
+    const error = new Error("Stored chat messages must be an array.");
+    error.code = "INVALID_CHAT_STORAGE";
+    throw error;
+  }
+
+  const sanitizedMessages = [];
+  const retainedMessages = value.slice(-MAX_PERSISTED_CHAT_MESSAGES);
+
+  for (const message of retainedMessages) {
+    if (!isPlainRecord(message)) continue;
+
+    if (message.type === "ui_action") {
+      if (!isPlainRecord(message.action)) continue;
+      sanitizedMessages.push({
+        ...message,
+        type: "ui_action",
+        action: { ...message.action },
+      });
+      continue;
+    }
+
+    if (typeof message.role !== "string" || !message.role.trim()) continue;
+
+    const content = sanitizeChatContent(message.content);
+    const hasLegacyText = typeof message.text === "string";
+    const hasLegacyImage = typeof message.imageUri === "string";
+    if (content === null && !hasLegacyText && !hasLegacyImage) continue;
+
+    const sanitizedMessage = {
+      ...message,
+      role: message.role.trim(),
+    };
+    if (content !== null) sanitizedMessage.content = content;
+    if (hasLegacyText) sanitizedMessage.text = message.text;
+    if (hasLegacyImage) sanitizedMessage.imageUri = message.imageUri;
+    sanitizedMessages.push(sanitizedMessage);
+  }
+
+  return sanitizedMessages;
+}
 
 // --- Add message (text + optional image) ---
 export function addMessage(setMessages, { role, text, imageUri }) {
@@ -33,7 +90,7 @@ export function addMessage(setMessages, { role, text, imageUri }) {
 
   return new Promise((resolve) => {
     setMessages((prev) => {
-      const updated = [...prev, newMessage];
+      const updated = [...(Array.isArray(prev) ? prev : []), newMessage];
       resolve(updated);
       return updated;
     });
@@ -84,18 +141,22 @@ export async function saveSummary(uid, newSummary, setSummary) {
 // --- Load messages + summary on startup ---
 export async function loadChatData(uid, setMessages, setSummary) {
   const { chatMessages, chatSummary } = getUserStorageKeys(uid);
+  const [msgData, summaryData] = await Promise.all([
+    AsyncStorage.getItem(chatMessages),
+    AsyncStorage.getItem(chatSummary),
+  ]);
+  const parsedMessages = msgData ? JSON.parse(msgData) : [];
+  const messages = sanitizePersistedChatMessages(parsedMessages);
+  const summary = summaryData || "";
 
-  try {
-    const [msgData, summaryData] = await Promise.all([
-      AsyncStorage.getItem(chatMessages),
-      AsyncStorage.getItem(chatSummary),
-    ]);
+  setMessages?.(messages);
+  setSummary?.(summary);
 
-    setMessages(msgData ? JSON.parse(msgData) : []);
-    setSummary(summaryData || "");
-  } catch (err) {
-    console.warn("Error loading chat data:", err);
-  }
+  return {
+    messages,
+    summary,
+    sanitized: messages.length !== parsedMessages.length,
+  };
 }
 
 // --- Clear all chat data ---
@@ -113,10 +174,12 @@ export async function clearChatData(uid, setMessages, setSummary) {
 
   try {
     await AsyncStorage.multiRemove([chatMessages, chatSummary]);
-    setMessages([]);
-    setSummary("");
+    setMessages?.([]);
+    setSummary?.("");
+    return { ok: true, error: null };
   } catch (err) {
     console.warn("Error clearing chat data:", err);
+    return { ok: false, error: err };
   }
 }
 

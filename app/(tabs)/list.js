@@ -4,7 +4,15 @@
 
 import { Ionicons } from "@expo/vector-icons";
 import { useNavigation } from "expo-router";
-import React, { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   Keyboard,
   KeyboardAvoidingView,
@@ -73,10 +81,20 @@ export default function ShoppingListScreen() {
   const [activeCategory, setActiveCategory] = useState("All");
 
   const quantityInputRef = useRef(null);
+  const addLockedRef = useRef(false);
+  const transferLockedRef = useRef(false);
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
 
   const hasCheckedItems = Object.values(checkedItems).some((v) => v);
+
+  useEffect(() => {
+    if (!newItemName && !newItemQuantity) addLockedRef.current = false;
+  }, [newItemName, newItemQuantity]);
+
+  useEffect(() => {
+    if (!hasCheckedItems) transferLockedRef.current = false;
+  }, [hasCheckedItems]);
 
   // -----------------------------
   // ✅ ⋯ Item menu (IMPLEMENTED)
@@ -90,7 +108,10 @@ export default function ShoppingListScreen() {
   const [editCategory, setEditCategory] = useState(""); // label
   const [categoryDropdownOpen, setCategoryDropdownOpen] = useState(false);
 
-  const toggleEditMode = () => setEditMode((prev) => !prev);
+  const toggleEditMode = useCallback(
+    () => setEditMode((prev) => !prev),
+    []
+  );
 
   useEffect(() => {
     const showSub = Keyboard.addListener(
@@ -128,7 +149,7 @@ export default function ShoppingListScreen() {
     return labelOrNull ? [labelOrNull] : [];
   };
 
-  const getItemCategoryLabel = (item) => {
+  const getItemCategoryLabel = useCallback((item) => {
     const ids = Array.isArray(item?.tagIds) ? item.tagIds : [];
     if (ids.length && FOOD_TYPE_TAGS.length) {
       const firstFoodType = FOOD_TYPE_TAGS.find((t) => ids.includes(t.id));
@@ -145,20 +166,31 @@ export default function ShoppingListScreen() {
       item?.aisle ||
       "";
     return typeof v === "string" && v.trim() ? v.trim() : "Uncategorized";
-  };
+  }, [FOOD_TYPE_TAGS]);
 
   const handleAdd = () => {
-    if (!newItemName.trim() || !newItemQuantity.trim()) return;
+    if (
+      addLockedRef.current ||
+      !newItemName.trim() ||
+      !newItemQuantity.trim()
+    ) {
+      return;
+    }
+    addLockedRef.current = true;
 
     const inferredLabel =
       typeof inferFoodTypeLabelFromName === "function" ? inferFoodTypeLabelFromName(newItemName) : null;
 
     const categories = normalizeCategoriesArg(inferredLabel);
 
-    addToShoppingList(newItemName, newItemQuantity, categories);
-
-    setNewItemName("");
-    setNewItemQuantity("");
+    try {
+      addToShoppingList(newItemName, newItemQuantity, categories);
+      setNewItemName("");
+      setNewItemQuantity("");
+    } catch (error) {
+      addLockedRef.current = false;
+      throw error;
+    }
   };
 
   const toggleCheck = (id) => {
@@ -166,23 +198,32 @@ export default function ShoppingListScreen() {
   };
 
   const handleDoneShopping = () => {
-    shoppingListItems.forEach((item) => {
-      if (checkedItems[item.id]) {
-        const categories = Array.isArray(item.tagIds) ? item.tagIds : [];
-        addToFridge(item.name, item.quantity, categories);
-        removeFromShoppingList(item.id);
-      }
-    });
-    setCheckedItems({});
+    if (transferLockedRef.current) return;
+    transferLockedRef.current = true;
+
+    try {
+      const items = Array.isArray(shoppingListItems) ? shoppingListItems : [];
+      items.forEach((item) => {
+        if (checkedItems[item.id]) {
+          const categories = Array.isArray(item.tagIds) ? item.tagIds : [];
+          addToFridge(item.name, item.quantity, categories);
+          removeFromShoppingList(item.id);
+        }
+      });
+      setCheckedItems({});
+    } catch (error) {
+      transferLockedRef.current = false;
+      throw error;
+    }
   };
 
-  const deleteSelectedItems = () => {
+  const deleteSelectedItems = useCallback(() => {
     const ids = Object.keys(checkedItems).filter((id) => checkedItems[id]);
     if (ids.length === 0) return;
 
     ids.forEach((id) => removeFromShoppingList(id));
     setCheckedItems({});
-  };
+  }, [checkedItems, removeFromShoppingList]);
 
   // -------------------------
   // Pills: only show categories that have items
@@ -223,7 +264,7 @@ export default function ShoppingListScreen() {
     });
 
     return ["All", ...present];
-  }, [shoppingListItems, FOOD_TYPE_TAGS, tags]);
+  }, [shoppingListItems, FOOD_TYPE_TAGS, getItemCategoryLabel, tags]);
 
   // ✅ NEW: tabs include counts (optional but nice)
   const categoryTabs = useMemo(() => {
@@ -238,12 +279,11 @@ export default function ShoppingListScreen() {
       label,
       count: label === "All" ? shoppingListItems.length : (counts.get(label) || 0),
     }));
-  }, [categoryPills, shoppingListItems]);
+  }, [categoryPills, getItemCategoryLabel, shoppingListItems]);
 
-  useEffect(() => {
-    if (activeCategory === "All") return;
-    if (!categoryPills.includes(activeCategory)) setActiveCategory("All");
-  }, [categoryPills, activeCategory]);
+  const effectiveActiveCategory = categoryPills.includes(activeCategory)
+    ? activeCategory
+    : "All";
 
   // ✅ NEW: search + category filter (before sectioning)
   const filteredShoppingItems = useMemo(() => {
@@ -252,10 +292,15 @@ export default function ShoppingListScreen() {
       if (q && !norm(it?.name).includes(q)) return false;
 
       const cat = getItemCategoryLabel(it);
-      if (activeCategory === "All") return true;
-      return cat === activeCategory;
+      if (effectiveActiveCategory === "All") return true;
+      return cat === effectiveActiveCategory;
     });
-  }, [shoppingListItems, search, activeCategory, getItemCategoryLabel]);
+  }, [
+    effectiveActiveCategory,
+    getItemCategoryLabel,
+    search,
+    shoppingListItems,
+  ]);
 
   // ✅ NEW: sort filtered items (stable-ish)
   const sortedShoppingItems = useMemo(() => {
@@ -318,9 +363,9 @@ export default function ShoppingListScreen() {
   // ---------------------------------------
   // ✅ Select All / Clear (respects current filtered/visible set)
   // ---------------------------------------
-  const clearAllChecked = () => setCheckedItems({});
+  const clearAllChecked = useCallback(() => setCheckedItems({}), []);
 
-  const selectAllVisible = () => {
+  const selectAllVisible = useCallback(() => {
     const ids = [];
     for (const sec of sections) {
       for (const it of sec.data || []) {
@@ -336,7 +381,7 @@ export default function ShoppingListScreen() {
       });
       return next;
     });
-  };
+  }, [sections]);
 
   // ---------------------------------------
   // ✅ Header
@@ -370,7 +415,15 @@ export default function ShoppingListScreen() {
         />
       ),
     });
-  }, [navigation, editMode, hasCheckedItems, sections, theme, checkedItems]);
+  }, [
+    clearAllChecked,
+    deleteSelectedItems,
+    editMode,
+    hasCheckedItems,
+    navigation,
+    selectAllVisible,
+    toggleEditMode,
+  ]);
 
   // -----------------------------
   // ✅ open modal + prefill category
@@ -530,7 +583,7 @@ export default function ShoppingListScreen() {
           <View style={{ marginTop: 10 }}>
             <FilterTabsRow
               tabs={categoryTabs}
-              activeKey={activeCategory}
+              activeKey={effectiveActiveCategory}
               onChange={setActiveCategory}
               theme={theme}
               fontSize={fontSize}

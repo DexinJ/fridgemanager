@@ -45,5 +45,8 @@ export async function signInWithApple() {
   return {
     user: userCred.user,
     appleCredential,
+    // Preserve the complete credential for existing callers while making the
+    // short-lived code explicit for backend account-linking/provisioning flows.
+    authorizationCode: appleCredential.authorizationCode || null,
   };
 }

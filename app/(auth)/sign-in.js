@@ -1,7 +1,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
-import { onAuthStateChanged, signInWithEmailAndPassword } from "firebase/auth";
-import React, { useContext, useEffect, useState } from "react";
+import { signInWithEmailAndPassword } from "firebase/auth";
+import React, { useContext, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -12,34 +12,15 @@ import {
   TextInput,
   View,
 } from "react-native";
-import { API_BASE_URL } from "../../api/backendConfig";
 import { auth } from "../../auth/firebaseClient";
 import { GlobalContext } from "../../context/GlobalContext";
 
 import { signInWithApple } from "../../auth/appleAuth"; // ✅ CHANGED: Apple login helper
 import { signInWithGoogleNative } from "../../auth/googleAuth";
 
-async function getUserProfileFromBackend({ idToken, uid }) {
-  const resp = await fetch(`${API_BASE_URL}/api/users/${uid}`, {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${idToken}`,
-    },
-  });
-
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    throw new Error(
-      `Backend GET failed: ${resp.status} ${text.slice(0, 200)}`
-    );
-  }
-
-  return resp.json();
-}
-
 export default function SignInScreen() {
   const router = useRouter();
-  const { theme, settings, setUsername } = useContext(GlobalContext);
+  const { theme, settings } = useContext(GlobalContext);
 
   const fontSize = settings?.ux?.fontSize || 16;
 
@@ -48,35 +29,15 @@ export default function SignInScreen() {
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
   const [appleLoading, setAppleLoading] = useState(false); // ✅ CHANGED
-
-  const [didBackendSync, setDidBackendSync] = useState(false);
+  const mountedRef = useRef(true);
+  const operationBusyRef = useRef(false);
 
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, async (user) => {
-      if (!user) {
-        setDidBackendSync(false);
-        return;
-      }
-
-      if (!didBackendSync) {
-        try {
-          const idToken = await user.getIdToken();
-          const uid = user.uid;
-          const profile = await getUserProfileFromBackend({ idToken, uid });
-
-          setUsername(profile.username);
-          setDidBackendSync(true);
-        } catch (err) {
-          Alert.alert("Backend sync failed", err?.message || "Unknown error");
-          return;
-        }
-      }
-
-      router.replace("/(tabs)");
-    });
-
-    return unsub;
-  }, [router, didBackendSync, setUsername]);
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const isBusy = loading || googleLoading || appleLoading; // ✅ CHANGED
 
@@ -86,40 +47,57 @@ export default function SignInScreen() {
     if (!e || !pw) {
       return Alert.alert("Missing info", "Enter email and password.");
     }
+    if (operationBusyRef.current) return;
 
+    operationBusyRef.current = true;
     setLoading(true);
     try {
       await signInWithEmailAndPassword(auth, e, pw);
     } catch (err) {
-      Alert.alert("Login failed", err?.message || "Unknown error");
+      if (mountedRef.current) {
+        Alert.alert("Login failed", err?.message || "Unknown error");
+      }
     } finally {
-      setLoading(false);
+      operationBusyRef.current = false;
+      if (mountedRef.current) setLoading(false);
     }
   };
 
   const onGoogle = async () => {
+    if (operationBusyRef.current) return;
+
+    operationBusyRef.current = true;
     setGoogleLoading(true);
     try {
       const userCred = await signInWithGoogleNative(auth);
       if (!userCred?.user) return;
     } catch (err) {
-      Alert.alert("Google sign-in failed", err?.message || "Unknown error");
+      if (mountedRef.current) {
+        Alert.alert("Google sign-in failed", err?.message || "Unknown error");
+      }
     } finally {
-      setGoogleLoading(false);
+      operationBusyRef.current = false;
+      if (mountedRef.current) setGoogleLoading(false);
     }
   };
 
   // ✅ CHANGED: Apple sign-in handler
   const onApple = async () => {
+    if (operationBusyRef.current) return;
+
+    operationBusyRef.current = true;
     setAppleLoading(true);
     try {
       const result = await signInWithApple();
       if (!result?.user) return;
     } catch (err) {
       if (err?.code === "ERR_REQUEST_CANCELED") return;
-      Alert.alert("Apple sign-in failed", err?.message || "Unknown error");
+      if (mountedRef.current) {
+        Alert.alert("Apple sign-in failed", err?.message || "Unknown error");
+      }
     } finally {
-      setAppleLoading(false);
+      operationBusyRef.current = false;
+      if (mountedRef.current) setAppleLoading(false);
     }
   };
 

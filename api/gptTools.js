@@ -332,6 +332,7 @@ export function useGPTTools() {
 
     proposeAddAllToFridge: async ({ items, title }) => {
       const clean = (v) => String(v ?? "").trim();
+      const safeTitle = typeof title === "string" ? title.trim() : "";
     
       const categoriesObjToArray = (cats) => {
         if (!cats || typeof cats !== "object" || Array.isArray(cats)) return undefined;
@@ -377,7 +378,7 @@ export function useGPTTools() {
           type: "ui_action",
           action: {
             kind: "add_all_to_fridge",
-            title: title || "Add all to fridge",
+            title: safeTitle || "Add all to fridge",
             items: safeItems,
     
             // expiresAt is OPTIONAL – predictor will fill if missing

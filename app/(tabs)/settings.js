@@ -18,6 +18,7 @@ import React, {
   useEffect,
   useLayoutEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import {
@@ -25,6 +26,7 @@ import {
   Alert,
   Animated,
   Dimensions,
+  InteractionManager,
   Linking,
   Modal,
   Platform,
@@ -43,7 +45,13 @@ import {
   setCustomAiProviderSettings,
 } from "../../api/aiProviderSettings";
 import { API_BASE_URL } from "../../api/backendConfig";
+import { fetchWithTimeout } from "../../api/fetchWithTimeout";
 import { clearChatData } from "../../api/memoryManager";
+import {
+  clearUserDataPurgePending,
+  confirmUserDataPurge,
+  markUserDataPurgePending,
+} from "../../api/storageKeys";
 import { useAuth } from "../../auth/useAuth";
 import { HeaderWithHiddenButton } from "../../components/Header";
 import { useAccountSession } from "../../context/AccountSessionContext";
@@ -64,6 +72,7 @@ const TERMS_OF_USE_URL =
 const PRIVACY_POLICY_URL = String(
   process.env.EXPO_PUBLIC_PRIVACY_POLICY_URL || ""
 ).trim();
+const LOCAL_AI_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
 const AI_PROVIDER_URLS = [
   { label: "OpenAI", value: "https://api.openai.com/v1" },
@@ -163,6 +172,52 @@ function formatSubscriptionPeriod(period) {
   return `${Math.trunc(value)} ${normalizedUnit}${value === 1 ? "" : "s"}`;
 }
 
+function validateCustomAiBaseUrl(value) {
+  const normalized = normalizeAiBaseUrl(value);
+  let parsed;
+
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    throw new Error("Enter a valid absolute API base URL.");
+  }
+
+  if (parsed.username || parsed.password) {
+    throw new Error("The API base URL must not contain credentials.");
+  }
+
+  const localDevelopmentUrl =
+    typeof __DEV__ !== "undefined" &&
+    __DEV__ &&
+    parsed.protocol === "http:" &&
+    LOCAL_AI_HOSTS.has(parsed.hostname.toLowerCase());
+
+  if (parsed.protocol !== "https:" && !localDevelopmentUrl) {
+    throw new Error(
+      "Custom AI providers must use HTTPS. Plain HTTP is allowed only for localhost during development."
+    );
+  }
+
+  return normalized;
+}
+
+function incompleteLocalDeletionError(result) {
+  const details = Array.isArray(result?.errors)
+    ? result.errors.map((item) => item?.message).filter(Boolean).join(" ")
+    : "";
+  const error = new Error(
+    [
+      "The account was deleted, but some data could not be removed from this device. Pantrio will retry the cleanup automatically.",
+      details,
+    ]
+      .filter(Boolean)
+      .join(" ")
+  );
+  error.code = "LOCAL_ACCOUNT_CLEANUP_PENDING";
+  error.cleanupResult = result || null;
+  return error;
+}
+
 export default function SettingsScreen() {
   const {
     settings,
@@ -179,7 +234,7 @@ export default function SettingsScreen() {
     setUrgencyDays,
   } = useContext(GlobalContext);
 
-  const { user, signOut, loggedIn } = useAuth();
+  const { user, signOut, loggedIn, queuePostAuthNotice } = useAuth();
   const {
     subscription,
     loading: subscriptionLoading,
@@ -196,18 +251,28 @@ export default function SettingsScreen() {
     applePlans,
     appleProductsLoading,
     appleProductsError,
+    accountOperation,
     appleOperation,
     appleError,
     refreshSession,
     purchaseApplePlan,
     restoreApplePurchases,
     refreshAppleSubscription,
+    beginAccountTeardown,
   } = useAccountSession();
 
   const [currentSubMenu, setCurrentSubMenu] = useState(null);
   const [anim] = useState(() => new Animated.Value(0));
+  const mountedRef = useRef(false);
   const navigation = useNavigation();
   const [opened, setOpened] = useState(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const [remindDays, setRemindDays] = useState(
     settings?.expiration?.remindDays ?? 5
@@ -288,6 +353,7 @@ export default function SettingsScreen() {
     apple?.enabled === true &&
     Boolean(apple?.appAccountToken);
   const appleBusy = Boolean(appleOperation);
+  const accountBusy = Boolean(accountOperation);
 
   const stylesWithFont = useMemo(
     () => dynamicStyles(theme, fontSize),
@@ -357,13 +423,13 @@ export default function SettingsScreen() {
   ]);
 
   const checkAppleAi = useCallback(async () => {
-    setCheckingAppleAi(true);
+    if (mountedRef.current) setCheckingAppleAi(true);
     try {
       const availability = await getAppleIntelligenceAvailability();
-      setAppleAvailability(availability);
+      if (mountedRef.current) setAppleAvailability(availability);
       return availability;
     } finally {
-      setCheckingAppleAi(false);
+      if (mountedRef.current) setCheckingAppleAi(false);
     }
   }, []);
 
@@ -388,6 +454,7 @@ export default function SettingsScreen() {
   const selectAiProvider = async (nextProvider) => {
     if (nextProvider === "apple") {
       const availability = await checkAppleAi();
+      if (!mountedRef.current) return;
       if (!availability.available) {
         if (availability.status === "not_enabled") {
           Alert.alert(
@@ -410,12 +477,14 @@ export default function SettingsScreen() {
   };
 
   const saveAiProvider = async () => {
-    const baseUrl = normalizeAiBaseUrl(aiBaseUrl);
-    const model = aiModel.trim();
-    if (!/^https?:\/\//i.test(baseUrl)) {
-      Alert.alert("Invalid URL", "Enter a full HTTP or HTTPS API base URL.");
+    let baseUrl;
+    try {
+      baseUrl = validateCustomAiBaseUrl(aiBaseUrl);
+    } catch (error) {
+      Alert.alert("Invalid URL", error?.message || "Enter a valid HTTPS URL.");
       return;
     }
+    const model = aiModel.trim();
     if (!model || !aiApiKey.trim()) {
       Alert.alert("Missing details", "Enter both a model name and API key.");
       return;
@@ -427,6 +496,7 @@ export default function SettingsScreen() {
         apiKey: aiApiKey,
         model,
       });
+      if (!mountedRef.current) return;
       updateSetting("advanced", "aiBaseUrl", baseUrl);
       updateSetting("advanced", "aiModel", model);
       Alert.alert(
@@ -434,19 +504,41 @@ export default function SettingsScreen() {
         "This provider's API key and model name were saved securely."
       );
     } catch (error) {
-      Alert.alert("Save failed", error?.message || "Could not save AI settings.");
+      if (mountedRef.current) {
+        Alert.alert(
+          "Save failed",
+          error?.message || "Could not save AI settings."
+        );
+      }
     } finally {
-      setSavingAi(false);
+      if (mountedRef.current) setSavingAi(false);
     }
   };
 
   const handleClearAllData = async () => {
-    await Promise.resolve(clearAllData?.());
-    setAiApiKey("");
-    setAiBaseUrlDraft(null);
-    setAiModelDraft(null);
-    setAiProviderSettingsBaseUrl(null);
-    setAiProviderSettingsRevision((revision) => revision + 1);
+    try {
+      const result = await Promise.resolve(clearAllData?.());
+      if (!mountedRef.current) return;
+      setAiApiKey("");
+      setAiBaseUrlDraft(null);
+      setAiModelDraft(null);
+      setAiProviderSettingsBaseUrl(null);
+      setAiProviderSettingsRevision((revision) => revision + 1);
+      if (!result || result.ok !== true) {
+        Alert.alert(
+          "Cleanup incomplete",
+          "Some local data could not be cleared. Pantrio will retry automatically."
+        );
+      }
+    } catch (error) {
+      if (mountedRef.current) {
+        Alert.alert(
+          "Cleanup incomplete",
+          error?.message ||
+            "Some local data could not be cleared. Pantrio will retry automatically."
+        );
+      }
+    }
   };
 
   const categories = [
@@ -481,14 +573,18 @@ export default function SettingsScreen() {
 
     const token = await user.getIdToken();
 
-    const resp = await fetch(`${API_BASE_URL}/api/users/me`, {
-      method: "PATCH",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
+    const resp = await fetchWithTimeout(
+      `${API_BASE_URL}/api/users/me`,
+      {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ name }),
       },
-      body: JSON.stringify({ name }),
-    });
+      { timeoutMessage: "Updating the username timed out. Please try again." }
+    );
 
     if (!resp.ok) {
       const text = await resp.text().catch(() => "");
@@ -520,8 +616,9 @@ export default function SettingsScreen() {
     try {
       // Update backend.
       await updateUsernameOnBackend(next);
-      setModalVisible(false);
+      if (mountedRef.current) setModalVisible(false);
     } catch (e) {
+      if (!mountedRef.current) return;
       // Roll back local username if backend update fails.
       updateSetting("user", "name", prev);
 
@@ -530,7 +627,7 @@ export default function SettingsScreen() {
         e?.message || "Could not update username on server."
       );
     } finally {
-      setSavingName(false);
+      if (mountedRef.current) setSavingName(false);
     }
   };
 
@@ -543,15 +640,39 @@ export default function SettingsScreen() {
       {
         text: "Log out",
         style: "destructive",
-        onPress: async () => {
-          try {
-            await signOut?.();
-          } catch (e) {
-            Alert.alert(
-              "Logout failed",
-              e?.message || "Could not log out."
-            );
-          }
+        onPress: () => {
+          // Let iOS dismiss its native alert window before auth removes the
+          // active tabs/native-stack hierarchy underneath it.
+          InteractionManager.runAfterInteractions(() => {
+            requestAnimationFrame(() => {
+              if (!mountedRef.current || !user) return;
+
+              void (async () => {
+                let releaseAccountOperation = null;
+                try {
+                  releaseAccountOperation = beginAccountTeardown("logout");
+                  const result = await signOut?.();
+                  if (result?.providerCleanupError) {
+                    console.warn(
+                      "[logout] native provider cleanup warning",
+                      result.providerCleanupError
+                    );
+                  }
+                } catch (e) {
+                  if (mountedRef.current) {
+                    Alert.alert(
+                      e?.code === "ACCOUNT_OPERATION_IN_PROGRESS"
+                        ? "Action in progress"
+                        : "Logout failed",
+                      e?.message || "Could not log out."
+                    );
+                  }
+                } finally {
+                  releaseAccountOperation?.();
+                }
+              })();
+            });
+          });
         },
       },
     ]);
@@ -585,6 +706,7 @@ export default function SettingsScreen() {
 
     try {
       const result = await purchaseApplePlan(plan.productId);
+      if (!mountedRef.current) return;
       if (result?.outcome === "cancelled") return;
       if (result?.outcome === "pending") {
         Alert.alert(
@@ -600,6 +722,9 @@ export default function SettingsScreen() {
         );
       }
     } catch (nextError) {
+      if (!mountedRef.current || nextError?.code === "APPLE_REQUEST_SUPERSEDED") {
+        return;
+      }
       Alert.alert(
         "Purchase not completed",
         nextError?.message || "Could not complete the Apple purchase."
@@ -612,6 +737,7 @@ export default function SettingsScreen() {
 
     try {
       const result = await restoreApplePurchases();
+      if (!mountedRef.current) return;
       if (result?.verification || result?.evidence?.length) {
         Alert.alert(
           "Purchases restored",
@@ -624,6 +750,9 @@ export default function SettingsScreen() {
         );
       }
     } catch (nextError) {
+      if (!mountedRef.current || nextError?.code === "APPLE_REQUEST_SUPERSEDED") {
+        return;
+      }
       Alert.alert(
         "Restore failed",
         nextError?.message || "Could not restore Apple purchases."
@@ -637,6 +766,9 @@ export default function SettingsScreen() {
     try {
       await refreshAppleSubscription();
     } catch (nextError) {
+      if (!mountedRef.current || nextError?.code === "APPLE_REQUEST_SUPERSEDED") {
+        return;
+      }
       Alert.alert(
         "Refresh failed",
         nextError?.message || "Could not refresh the Apple subscription."
@@ -653,32 +785,47 @@ export default function SettingsScreen() {
    * 3. Delete the user's database rows.
    * 4. Delete the Firebase Authentication account.
    */
-  const deleteAccountFromBackend = async () => {
-    if (!user) {
+  const deleteAccountFromBackend = async (
+    deletionUser,
+    { beforeRequest } = {}
+  ) => {
+    if (!deletionUser) {
       throw new Error(
         "You must be logged in to delete your account."
       );
     }
 
     // Force-refresh the ID token before making this destructive request.
-    const token = await user.getIdToken(true);
+    const token = await deletionUser.getIdToken(true);
+    await beforeRequest?.();
 
-    const resp = await fetch(
-      `${API_BASE_URL}/api/users/${encodeURIComponent(user.uid)}`,
+    const resp = await fetchWithTimeout(
+      `${API_BASE_URL}/api/users/${encodeURIComponent(deletionUser.uid)}`,
       {
         method: "DELETE",
         headers: {
           Authorization: `Bearer ${token}`,
         },
+      },
+      {
+        timeoutMs: 30000,
+        timeoutMessage:
+          "Account deletion timed out. Check your connection and try again.",
       }
     );
 
     const data = await resp.json().catch(() => ({}));
 
     if (!resp.ok) {
-      throw new Error(
+      const error = new Error(
         data?.error || `Failed to delete account (${resp.status})`
       );
+      error.status = resp.status;
+      // A 4xx response (other than an already-absent account) is a definitive
+      // rejection, so the pre-delete local purge marker can be removed safely.
+      error.accountDeletionRejected =
+        resp.status >= 400 && resp.status < 500 && resp.status !== 404;
+      throw error;
     }
 
     return data;
@@ -701,44 +848,126 @@ export default function SettingsScreen() {
           text: "Delete Account",
           style: "destructive",
           onPress: async () => {
-            setDeletingAccount(true);
-
+            const deletionUser = user;
+            const deletionUid = deletionUser?.uid || null;
+            let releaseAccountOperation = null;
+            let purgeIntentMarked = false;
+            let backendDeleted = false;
+            let signOutCompleted = false;
             try {
+              releaseAccountOperation = beginAccountTeardown("delete-account");
+              setDeletingAccount(true);
+
+              if (
+                !storageHydrated ||
+                !deletionUid ||
+                storageOwnerUid !== deletionUid
+              ) {
+                throw new Error(
+                  "Local account data is still loading. Wait a moment and try again."
+                );
+              }
+
               // Delete the server profile and Firebase Auth user first.
-              await deleteAccountFromBackend();
+              await deleteAccountFromBackend(deletionUser, {
+                beforeRequest: async () => {
+                  await markUserDataPurgePending(deletionUid, {
+                    reason: "account-delete",
+                  });
+                  purgeIntentMarked = true;
+                },
+              });
+              backendDeleted = true;
+              await confirmUserDataPurge(deletionUid);
 
-              // Clear all app data stored locally.
-              await Promise.resolve(clearAllData?.());
-
-              // Clear chat-specific storage and context state.
-              await Promise.resolve(
-                clearChatData(storageOwnerUid, setMessages, setSummary)
-              );
+              // clearAllData retains the durable marker unless every scoped
+              // AsyncStorage, SecureStore, and chat cleanup succeeds.
+              const cleanupResult = await Promise.resolve(clearAllData?.());
+              if (!cleanupResult || cleanupResult.ok !== true) {
+                throw incompleteLocalDeletionError(cleanupResult);
+              }
 
               /*
                * The Firebase account was already deleted by the backend.
                * Calling signOut clears any remaining local Firebase session.
                */
-              try {
-                await signOut?.();
-              } catch (signOutError) {
+              const signOutResult = await signOut?.({
+                revokeProviderAccess: true,
+              });
+              signOutCompleted = true;
+              if (signOutResult?.providerCleanupError) {
                 console.warn(
-                  "[delete account] local sign-out warning",
-                  signOutError
+                  "[delete account] native provider cleanup warning",
+                  signOutResult.providerCleanupError
                 );
               }
-
-              // Return to the authentication screen.
-              router.replace("/(auth)/sign-in");
             } catch (e) {
               console.error("[delete account]", e);
 
-              Alert.alert(
-                "Delete failed",
-                e?.message || "Could not delete your account."
-              );
+              if (
+                purgeIntentMarked &&
+                !backendDeleted &&
+                e?.accountDeletionRejected
+              ) {
+                await clearUserDataPurgePending(deletionUid).catch(
+                  (markerError) => {
+                    console.error(
+                      "[delete account] could not clear rejected-delete purge marker",
+                      markerError
+                    );
+                  }
+                );
+              }
+
+              // The backend account is already gone. Always complete local
+              // Firebase logout; an incomplete data purge remains marked for
+              // the startup retry path.
+              if (backendDeleted && !signOutCompleted) {
+                try {
+                  const signOutResult = await signOut?.({
+                    revokeProviderAccess: true,
+                  });
+                  signOutCompleted = true;
+                  if (signOutResult?.providerCleanupError) {
+                    console.warn(
+                      "[delete account] native provider cleanup warning",
+                      signOutResult.providerCleanupError
+                    );
+                  }
+                } catch (signOutError) {
+                  console.error(
+                    "[delete account] local sign-out failed",
+                    signOutError
+                  );
+                }
+              }
+
+              const alertTitle = backendDeleted
+                ? "Account deleted"
+                : e?.code === "ACCOUNT_OPERATION_IN_PROGRESS"
+                  ? "Action in progress"
+                  : "Delete failed";
+              const alertMessage =
+                e?.message || "Could not delete your account.";
+
+              if (backendDeleted && signOutCompleted) {
+                // The root auth provider survives the protected-route switch
+                // and presents this only after the sign-in stack is stable.
+                queuePostAuthNotice({
+                  title: alertTitle,
+                  message: alertMessage,
+                });
+              } else if (mountedRef.current) {
+                Alert.alert(alertTitle, alertMessage);
+              } else if (backendDeleted) {
+                queuePostAuthNotice({
+                  title: alertTitle,
+                  message: alertMessage,
+                });
+              }
             } finally {
-              setDeletingAccount(false);
+              if (mountedRef.current) setDeletingAccount(false);
+              releaseAccountOperation?.();
             }
           },
         },
@@ -1511,7 +1740,9 @@ export default function SettingsScreen() {
                   </View>
                   <CustomButton
                     title="Log out"
-                    onPress={deletingAccount ? null : handleLogout}
+                    onPress={
+                      deletingAccount || accountBusy ? null : handleLogout
+                    }
                     fontSize={fontSize}
                     color={theme.accent}
                   />
@@ -1547,7 +1778,9 @@ export default function SettingsScreen() {
                         : "Delete Account"
                     }
                     onPress={
-                      deletingAccount ? null : handleDeleteAccount
+                      deletingAccount || accountBusy
+                        ? null
+                        : handleDeleteAccount
                     }
                     fontSize={fontSize}
                     color={theme.danger}

@@ -397,7 +397,13 @@ export const useGpt = () => {
       // 1) Assistant text stream
       if (type === "delta") {
         setWaiting(false);
-        const delta = msg.text || "";
+        const delta =
+          typeof msg.text === "string"
+            ? msg.text
+            : typeof msg.text === "number" || typeof msg.text === "boolean"
+              ? String(msg.text)
+              : "";
+        if (!delta) return;
         job.text += delta;
 
         setMessages((prev) => {
@@ -460,15 +466,15 @@ export const useGpt = () => {
             if (inflightRef.current.get(requestId) !== job) return;
 
             // Optional: show tool outcome in chat for debugging / transparency
-            if (resultObj?.__context) {
+            if (__DEV__ && resultObj?.__context) {
               console.log({
                 role: "assistant",
-                text: `[Tool:${name}] ${JSON.stringify(resultObj)}`,
+                text: `[Tool:${name}] completed`,
               });
-            } else if (resultObj?.message) {
+            } else if (__DEV__ && resultObj?.message) {
               console.log({
                 role: "assistant",
-                text: `[fromTool] ${resultObj.message}`,
+                text: `[fromTool:${name}] completed`,
               });
             }
 
@@ -700,11 +706,22 @@ ${toolDescriptions}`;
     language = "en",
   }) => {
     const lifecycleGeneration = lifecycleGenerationRef.current;
+    const normalizedText =
+      typeof text === "string"
+        ? text
+        : typeof text === "number" || typeof text === "boolean"
+          ? String(text)
+          : "";
+    const normalizedImageUri = typeof imageUri === "string" ? imageUri : "";
+    if (!normalizedText.trim() && !normalizedImageUri.trim()) {
+      throw new Error("A chat message must include text or an image.");
+    }
+
     // 1) Add user message locally
     const updatedMessages = await addMessage(setMessages, {
       role: "user",
-      text,
-      imageUri,
+      text: normalizedText,
+      imageUri: normalizedImageUri,
     });
     // Custom and on-device providers never route summarization through our backend.
     const selectedProvider = settings?.advanced?.aiProvider ||
@@ -742,8 +759,10 @@ ${toolDescriptions}`;
     const systemText = memoryText
       ? `${baseSystemText}\n\n${memoryText}`
       : baseSystemText;
-    const img = imageUri || "";
-    console.log("FE IMG:", img.slice(0, 30), "len=", img.length);
+    const img = normalizedImageUri;
+    if (__DEV__ && img) {
+      console.log("Attaching an image to the chat request");
+    }
     const ccMessages = toChatCompletionsMessages(requestMessages, systemText);
 
     if (selectedProvider === "custom") {

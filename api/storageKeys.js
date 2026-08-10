@@ -2,6 +2,10 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 
 const USER_STORAGE_PREFIX = "@pantrio:user";
 const LEGACY_STORAGE_OWNER_KEY = "@pantrio:legacyStorageOwner:v1";
+const LEGACY_STORAGE_QUARANTINE_PREFIX = "@pantrio:legacyQuarantine:v1";
+const USER_DATA_PURGE_INTENT_VERSION = 1;
+const USER_DATA_PURGE_INTENT_SUFFIX = ":purgeIntent";
+const USER_DATA_PURGE_PHASES = new Set(["requested", "confirmed", "purging"]);
 
 export const LEGACY_ASYNC_STORAGE_KEYS = Object.freeze({
   fridgeItems: "@fridgeItems",
@@ -27,6 +31,33 @@ function encodeUid(uid) {
   ).join("");
 }
 
+function decodeUid(encodedUid) {
+  if (!encodedUid || encodedUid.length % 6 !== 0 || /[^0-9a-f]/i.test(encodedUid)) {
+    return null;
+  }
+
+  try {
+    const codePoints = [];
+    for (let index = 0; index < encodedUid.length; index += 6) {
+      codePoints.push(Number.parseInt(encodedUid.slice(index, index + 6), 16));
+    }
+    return String.fromCodePoint(...codePoints);
+  } catch {
+    return null;
+  }
+}
+
+function uidFromPurgeIntentKey(key) {
+  const prefix = `${USER_STORAGE_PREFIX}:`;
+  if (!key.startsWith(prefix) || !key.endsWith(USER_DATA_PURGE_INTENT_SUFFIX)) {
+    return null;
+  }
+
+  return decodeUid(
+    key.slice(prefix.length, -USER_DATA_PURGE_INTENT_SUFFIX.length)
+  );
+}
+
 function withLegacyMigrationLock(operation) {
   const result = legacyMigrationOperation.then(operation, operation);
   legacyMigrationOperation = result.catch(() => {});
@@ -42,6 +73,7 @@ export function getUserStorageKeys(uid) {
     appSettings: `${namespace}:appSettings`,
     chatMessages: `${namespace}:chatMessages`,
     chatSummary: `${namespace}:chatSummary`,
+    purgeIntent: `${namespace}:purgeIntent`,
   };
 }
 
@@ -57,21 +89,214 @@ export function getUserSecureStorageKey(uid, name) {
   return `pantrio.user.${encodeUid(uid)}.${normalizedName}`;
 }
 
+export async function getLegacyStorageOwner() {
+  const ownerUid = await AsyncStorage.getItem(LEGACY_STORAGE_OWNER_KEY);
+  return ownerUid ? String(ownerUid).trim() || null : null;
+}
+
 export async function isLegacyStorageOwner(uid) {
-  return (
-    (await AsyncStorage.getItem(LEGACY_STORAGE_OWNER_KEY)) === normalizeUid(uid)
+  return (await getLegacyStorageOwner()) === normalizeUid(uid);
+}
+
+function normalizePurgeReason(reason) {
+  return String(reason || "clear-all").trim().slice(0, 80) || "clear-all";
+}
+
+function normalizePurgeIntent(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+
+  return {
+    version: USER_DATA_PURGE_INTENT_VERSION,
+    uid:
+      typeof value.uid === "string" && value.uid.trim()
+        ? value.uid.trim()
+        : null,
+    reason: normalizePurgeReason(value.reason),
+    phase: USER_DATA_PURGE_PHASES.has(value.phase)
+      ? value.phase
+      : normalizePurgeReason(value.reason) === "account-delete"
+        ? "requested"
+        : "confirmed",
+    requestedAt:
+      typeof value.requestedAt === "string" ? value.requestedAt : null,
+    attempts:
+      Number.isSafeInteger(value.attempts) && value.attempts >= 0
+        ? value.attempts
+        : 0,
+    lastAttemptAt:
+      typeof value.lastAttemptAt === "string" ? value.lastAttemptAt : null,
+    lastError:
+      typeof value.lastError === "string"
+        ? value.lastError.slice(0, 500)
+        : null,
+  };
+}
+
+function parsePurgeIntent(storedValue, fallbackUid) {
+  try {
+    const parsedValue = JSON.parse(storedValue);
+    const normalizedIntent = normalizePurgeIntent(parsedValue);
+    if (normalizedIntent) {
+      return {
+        ...normalizedIntent,
+        // The UID encoded in the key is authoritative. A corrupt marker must
+        // never be able to redirect a purge to a different account namespace.
+        uid: fallbackUid || normalizedIntent.uid,
+      };
+    }
+  } catch {
+    // Fall through to an intentionally pending invalid marker.
+  }
+
+  return {
+    version: USER_DATA_PURGE_INTENT_VERSION,
+    uid: fallbackUid,
+    reason: "unknown",
+    phase: "requested",
+    requestedAt: null,
+    attempts: 0,
+    lastAttemptAt: null,
+    lastError: "The stored purge intent could not be parsed.",
+  };
+}
+
+export async function getUserDataPurgeIntent(uid) {
+  const normalizedUid = normalizeUid(uid);
+  const { purgeIntent } = getUserStorageKeys(uid);
+  const storedValue = await AsyncStorage.getItem(purgeIntent);
+  if (storedValue === null) return null;
+
+  // An unreadable marker must still be treated as pending. Treating it as
+  // absent could expose data that a previous deletion attempt meant to purge.
+  return parsePurgeIntent(storedValue, normalizedUid);
+}
+
+export async function listUserDataPurgeIntents() {
+  const allKeys = await AsyncStorage.getAllKeys();
+  const purgeIntentKeys = allKeys.filter(
+    (key) => uidFromPurgeIntentKey(key) !== null
   );
+  if (purgeIntentKeys.length === 0) return [];
+
+  const entries = await AsyncStorage.multiGet(purgeIntentKeys);
+  return entries
+    .filter(([, value]) => value !== null)
+    .map(([key, value]) => parsePurgeIntent(value, uidFromPurgeIntentKey(key)))
+    .filter((intent) => intent.uid);
+}
+
+export async function markUserDataPurgePending(
+  uid,
+  { reason = "clear-all", phase } = {}
+) {
+  const normalizedUid = normalizeUid(uid);
+  const { purgeIntent } = getUserStorageKeys(uid);
+  const existingIntent = await getUserDataPurgeIntent(uid);
+  const normalizedReason = normalizePurgeReason(existingIntent?.reason || reason);
+  const requestedPhase = USER_DATA_PURGE_PHASES.has(phase)
+    ? phase
+    : normalizedReason === "account-delete"
+      ? "requested"
+      : "confirmed";
+  const nextIntent = {
+    version: USER_DATA_PURGE_INTENT_VERSION,
+    uid: normalizedUid,
+    reason: normalizedReason,
+    phase:
+      existingIntent?.phase === "confirmed" ||
+      existingIntent?.phase === "purging"
+        ? existingIntent.phase
+        : requestedPhase,
+    requestedAt: existingIntent?.requestedAt || new Date().toISOString(),
+    attempts: existingIntent?.attempts || 0,
+    lastAttemptAt: existingIntent?.lastAttemptAt || null,
+    lastError: existingIntent?.lastError || null,
+  };
+
+  await AsyncStorage.setItem(purgeIntent, JSON.stringify(nextIntent));
+  return nextIntent;
+}
+
+export async function confirmUserDataPurge(uid) {
+  const existingIntent = await getUserDataPurgeIntent(uid);
+  return markUserDataPurgePending(uid, {
+    reason: existingIntent?.reason || "account-delete",
+    phase: "confirmed",
+  });
+}
+
+export async function recordUserDataPurgeFailure(uid, error) {
+  const { purgeIntent } = getUserStorageKeys(uid);
+  const existingIntent =
+    (await getUserDataPurgeIntent(uid)) ||
+    (await markUserDataPurgePending(uid));
+  const nextIntent = {
+    ...existingIntent,
+    attempts: existingIntent.attempts + 1,
+    lastAttemptAt: new Date().toISOString(),
+    lastError: String(error?.message || error || "Unknown purge failure").slice(
+      0,
+      500
+    ),
+  };
+
+  await AsyncStorage.setItem(purgeIntent, JSON.stringify(nextIntent));
+  return nextIntent;
+}
+
+export async function clearUserDataPurgePending(uid) {
+  const { purgeIntent } = getUserStorageKeys(uid);
+  await AsyncStorage.removeItem(purgeIntent);
 }
 
 export async function migrateLegacyAsyncStorageForUser(uid) {
   const normalizedUid = normalizeUid(uid);
 
   return withLegacyMigrationLock(async () => {
-    let ownerUid = await AsyncStorage.getItem(LEGACY_STORAGE_OWNER_KEY);
+    const ownerUid = await getLegacyStorageOwner();
 
     if (!ownerUid) {
-      await AsyncStorage.setItem(LEGACY_STORAGE_OWNER_KEY, normalizedUid);
-      ownerUid = normalizedUid;
+      const legacyEntries = await AsyncStorage.multiGet(
+        Object.values(LEGACY_ASYNC_STORAGE_KEYS)
+      );
+      const ambiguousEntries = legacyEntries.filter(
+        ([, value]) => value !== null
+      );
+      const quarantineKeys = [];
+
+      if (ambiguousEntries.length > 0) {
+        // Unscoped values have no trustworthy owner. Assigning them to the
+        // first user who signs in can disclose a previous user's data. Keep a
+        // non-user-addressable recovery copy before removing the live keys.
+        const quarantineId = `${Date.now()}:${Math.random()
+          .toString(16)
+          .slice(2)}`;
+        const quarantineEntries = ambiguousEntries.map(
+          ([sourceKey, value], index) => {
+            const quarantineKey = `${LEGACY_STORAGE_QUARANTINE_PREFIX}:${quarantineId}:${index}`;
+            quarantineKeys.push(quarantineKey);
+            return [
+              quarantineKey,
+              JSON.stringify({
+                sourceKey,
+                quarantinedAt: new Date().toISOString(),
+                value,
+              }),
+            ];
+          }
+        );
+        await AsyncStorage.multiSet(quarantineEntries);
+        await AsyncStorage.multiRemove(
+          ambiguousEntries.map(([key]) => key)
+        );
+      }
+
+      return {
+        claimed: false,
+        migratedKeys: [],
+        quarantinedAmbiguousKeys: ambiguousEntries.map(([key]) => key),
+        quarantineKeys,
+      };
     }
 
     if (ownerUid !== normalizedUid) {

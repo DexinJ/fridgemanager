@@ -54,7 +54,7 @@ export default function OnboardingScreen() {
   const {theme} = useContext(GlobalContext);
   const fontSize = 16;
   const listRef = useRef(null);
-  const scrollX = useRef(new Animated.Value(0)).current;
+  const [scrollX] = useState(() => new Animated.Value(0));
 
   const [index, setIndex] = useState(0);
   const [isAdvancing, setIsAdvancing] = useState(false);
@@ -63,7 +63,7 @@ export default function OnboardingScreen() {
   const progress = useMemo(() => (index + 1) / PAGES.length, [index]);
 
   // Optional: a subtle "float" animation you can reuse for an image later
-  const floatY = useRef(new Animated.Value(0)).current;
+  const [floatY] = useState(() => new Animated.Value(0));
   React.useEffect(() => {
     const loop = Animated.loop(
       Animated.sequence([
