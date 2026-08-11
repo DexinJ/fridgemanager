@@ -60,6 +60,8 @@ export function HeaderWithButton({
         <TouchableOpacity
           onPress={onLeftPress}
           hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+          accessibilityRole="button"
+          accessibilityLabel={leftButtonLabel}
           style={styles.leftBtnWrap} // ✅ limits visual width only (does NOT change layout positions)
         >
           <Text
@@ -99,6 +101,8 @@ export function HeaderWithButton({
       <TouchableOpacity
         onPress={onPress}
         hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+        accessibilityRole="button"
+        accessibilityLabel={buttonLabel}
         style={styles.rightBtnWrap} // ✅ optional: also cap right side so it doesn't balloon
       >
         <View>
@@ -125,7 +129,11 @@ export function HeaderWithHiddenButton({ title, onPress, hideButton = true }) {
             { paddingTop: insets.top, backgroundColor: theme.card, borderBottomColor: theme.border },
           ]}
         >
-          <TouchableOpacity onPress={onPress}>
+          <TouchableOpacity
+            onPress={onPress}
+            accessibilityRole="button"
+            accessibilityLabel="Go back"
+          >
             <Ionicons name="arrow-back" size={24} color={theme.accent} />
           </TouchableOpacity>
           <Text

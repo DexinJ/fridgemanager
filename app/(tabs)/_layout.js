@@ -4,6 +4,7 @@ import { useContext, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import "react-native-get-random-values";
 import { useAuth } from "../../auth/useAuth";
+import { GptProvider } from "../../api/gpt";
 import { PlainHeader } from "../../components/Header";
 import {
   AccountSessionProvider,
@@ -11,6 +12,163 @@ import {
 } from "../../context/AccountSessionContext";
 import { GlobalContext, GlobalProvider } from "../../context/GlobalContext";
 import { AppleSubscriptionProvider } from "../../context/SubscriptionContext";
+import { canExposeAccountData } from "../../context/refreshPolicy";
+
+function SessionBackedGlobalProvider({ authUser, children }) {
+  const {
+    session,
+    initializing,
+    loading,
+    error,
+    refreshSession,
+    beginAccountTeardown,
+  } = useAccountSession();
+  const { accountDeletionPending, signOut } = useAuth();
+  const [actionError, setActionError] = useState("");
+  const [working, setWorking] = useState(false);
+
+  if (!canExposeAccountData(session, accountDeletionPending)) {
+    const waiting = initializing || loading || accountDeletionPending;
+    const retry = async () => {
+      if (working) return;
+      setActionError("");
+      setWorking(true);
+      try {
+        await refreshSession({ maxAgeMs: 0 });
+      } catch (nextError) {
+        setActionError(
+          String(nextError?.message || "Could not verify account access.")
+        );
+      } finally {
+        setWorking(false);
+      }
+    };
+    const logout = async () => {
+      if (working) return;
+      setActionError("");
+      setWorking(true);
+      let releaseAccountOperation = null;
+      try {
+        releaseAccountOperation = beginAccountTeardown("logout");
+        await signOut();
+      } catch (nextError) {
+        setActionError(String(nextError?.message || "Could not log out."));
+      } finally {
+        releaseAccountOperation?.();
+        setWorking(false);
+      }
+    };
+
+    return (
+      <View
+        style={{
+          flex: 1,
+          alignItems: "center",
+          justifyContent: "center",
+          paddingHorizontal: 28,
+          backgroundColor: "#F7F8FA",
+        }}
+        accessibilityLabel={
+          waiting ? "Verifying account access" : "Account access unavailable"
+        }
+      >
+        {waiting ? (
+          <>
+            <ActivityIndicator size="large" color="#2563EB" />
+            <Text
+              style={{ marginTop: 14, color: "#30343B", textAlign: "center" }}
+            >
+              {accountDeletionPending
+                ? "Finishing account deletion…"
+                : "Verifying account access…"}
+            </Text>
+          </>
+        ) : (
+          <>
+            <Ionicons name="cloud-offline-outline" size={44} color="#B3261E" />
+            <Text
+              style={{
+                marginTop: 16,
+                color: "#1E2229",
+                fontSize: 20,
+                fontWeight: "700",
+                textAlign: "center",
+              }}
+            >
+              Account access could not be verified
+            </Text>
+            <Text
+              style={{
+                marginTop: 10,
+                color: "#5F6672",
+                fontSize: 15,
+                lineHeight: 22,
+                textAlign: "center",
+              }}
+            >
+              {actionError || error || "Check your connection and try again."}
+            </Text>
+            <Pressable
+              onPress={() => void retry()}
+              disabled={working}
+              accessibilityRole="button"
+              accessibilityLabel="Retry account verification"
+              style={({ pressed }) => ({
+                marginTop: 22,
+                minWidth: 128,
+                alignItems: "center",
+                paddingHorizontal: 22,
+                paddingVertical: 12,
+                borderRadius: 10,
+                backgroundColor: "#2563EB",
+                opacity: working ? 0.5 : pressed ? 0.75 : 1,
+              })}
+            >
+              {working ? (
+                <ActivityIndicator color="#FFFFFF" />
+              ) : (
+                <Text style={{ color: "#FFFFFF", fontWeight: "700" }}>
+                  Retry
+                </Text>
+              )}
+            </Pressable>
+            <Pressable
+              onPress={() => void logout()}
+              disabled={working}
+              accessibilityRole="button"
+              accessibilityLabel="Log out of this account"
+              style={({ pressed }) => ({
+                marginTop: 12,
+                minWidth: 128,
+                alignItems: "center",
+                paddingHorizontal: 22,
+                paddingVertical: 12,
+                borderRadius: 10,
+                borderWidth: 1,
+                borderColor: "#AEB4BE",
+                opacity: working ? 0.5 : pressed ? 0.75 : 1,
+              })}
+            >
+              <Text style={{ color: "#30343B", fontWeight: "700" }}>
+                Log out
+              </Text>
+            </Pressable>
+          </>
+        )}
+      </View>
+    );
+  }
+
+  return (
+    <GlobalProvider
+      authUser={authUser}
+      accountProfile={session.user}
+      accountProfileLoading={false}
+    >
+      {children}
+    </GlobalProvider>
+  );
+}
 
 function ThemedTabs() {
   const { signOut } = useAuth();
@@ -263,9 +421,11 @@ export default function TabsLayout() {
   return (
     <AppleSubscriptionProvider key={user.uid} accountId={user.uid} enabled>
       <AccountSessionProvider authUser={user}>
-        <GlobalProvider authUser={user}>
-          <ThemedTabs />
-        </GlobalProvider>
+        <SessionBackedGlobalProvider authUser={user}>
+          <GptProvider>
+            <ThemedTabs />
+          </GptProvider>
+        </SessionBackedGlobalProvider>
       </AccountSessionProvider>
     </AppleSubscriptionProvider>
   );

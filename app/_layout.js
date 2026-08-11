@@ -75,7 +75,12 @@ function RootErrorFallback({ resetError }) {
   );
 }
 
-function AuthRecoveryFallback({ error, onRetry, onSignOut }) {
+function AuthRecoveryFallback({
+  error,
+  onRetry,
+  onSignOut,
+  onClearDeviceData,
+}) {
   return (
     <View style={styles.errorFallback} accessibilityRole="alert">
       <Text style={styles.errorTitle}>We could not verify your account</Text>
@@ -84,26 +89,67 @@ function AuthRecoveryFallback({ error, onRetry, onSignOut }) {
           "Check your connection and try again. Your account data has not been opened."}
       </Text>
       <View style={styles.recoveryActions}>
-        <Pressable
-          accessibilityRole="button"
-          onPress={onRetry}
-          style={styles.retryButton}
-        >
-          <Text style={styles.retryButtonText}>Retry</Text>
-        </Pressable>
+        {!error?.signedOutRecovery ? (
+          <Pressable
+            accessibilityRole="button"
+            onPress={onRetry}
+            style={styles.retryButton}
+          >
+            <Text style={styles.retryButtonText}>Retry</Text>
+          </Pressable>
+        ) : null}
         <Pressable
           accessibilityRole="button"
           onPress={onSignOut}
           style={styles.signOutButton}
         >
-          <Text style={styles.signOutButtonText}>Sign out</Text>
+          <Text style={styles.signOutButtonText}>
+            {error?.signedOutRecovery ? "Continue to sign in" : "Sign out"}
+          </Text>
         </Pressable>
+        {onClearDeviceData ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityHint="Permanently removes the pending account's data from this device"
+            onPress={onClearDeviceData}
+            style={styles.clearDataButton}
+          >
+            <Text style={styles.clearDataButtonText}>
+              Clear device data & sign out
+            </Text>
+          </Pressable>
+        ) : null}
       </View>
     </View>
   );
 }
 
-function AppNavigator({ user, loading }) {
+function AppNavigator({
+  user,
+  loading,
+  accountDeletionPending,
+  accountDeletionPhase,
+}) {
+  if (accountDeletionPending) {
+    const clearingLocalData = accountDeletionPhase === "purging-local-data";
+    return (
+      <View
+        style={styles.deletionOverlay}
+        accessibilityRole="progressbar"
+        accessibilityLabel="Deleting account"
+        accessibilityLiveRegion="polite"
+      >
+        <ActivityIndicator size="large" color="#0A8E91" />
+        <Text style={styles.deletionTitle}>Deleting your account…</Text>
+        <Text style={styles.deletionMessage}>
+          {clearingLocalData
+            ? "Clearing account data from this device."
+            : "Keep Pantrio open while this finishes."}
+        </Text>
+      </View>
+    );
+  }
+
   return (
     <View style={styles.container}>
       <Stack screenOptions={{ headerShown: false }}>
@@ -129,7 +175,12 @@ function AppNavigator({ user, loading }) {
 
 function RootLayoutContent() {
   const {
+    accountDeletionPending,
+    accountDeletionPhase,
+    accountDeletionError,
     authRecoveryError,
+    clearPendingDeletionDataFromRecovery,
+    consumeAccountDeletionError,
     consumePostAuthNotice,
     loading,
     postAuthNotice,
@@ -138,8 +189,55 @@ function RootLayoutContent() {
     user,
   } = useAuth();
 
+  const confirmRecoveryDataClear = () => {
+    Alert.alert(
+      "Clear this account's device data?",
+      "This permanently removes the pending account's fridge items, shopping list, chat history, settings, reminders, and saved custom-AI credentials from this device. It does not prove that server deletion completed.",
+      [
+        { text: "Keep Data", style: "cancel" },
+        {
+          text: "Clear Device Data",
+          style: "destructive",
+          onPress: () => {
+            void clearPendingDeletionDataFromRecovery().catch((error) => {
+              Alert.alert(
+                "Cleanup incomplete",
+                error?.message ||
+                  "Some account data could not be removed from this device."
+              );
+            });
+          },
+        },
+      ]
+    );
+  };
+
   useEffect(() => {
-    if (authRecoveryError || loading || user || !postAuthNotice) {
+    if (accountDeletionPending || !accountDeletionError) return;
+    consumeAccountDeletionError();
+    Alert.alert(
+      accountDeletionError?.code === "RECENT_AUTH_REQUIRED"
+        ? "Sign-in confirmation expired"
+        : "Delete failed",
+      accountDeletionError?.message || "Could not delete your account."
+    );
+  }, [
+    accountDeletionError,
+    accountDeletionPending,
+    consumeAccountDeletionError,
+  ]);
+
+  useEffect(() => {
+    const noticeAudienceMatches = user
+      ? postAuthNotice?.audienceUid === user.uid
+      : !postAuthNotice?.audienceUid;
+    if (
+      accountDeletionPending ||
+      authRecoveryError ||
+      loading ||
+      !postAuthNotice ||
+      !noticeAudienceMatches
+    ) {
       return undefined;
     }
 
@@ -155,6 +253,7 @@ function RootLayoutContent() {
       task.cancel?.();
     };
   }, [
+    accountDeletionPending,
     authRecoveryError,
     consumePostAuthNotice,
     loading,
@@ -164,14 +263,24 @@ function RootLayoutContent() {
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      {authRecoveryError ? (
+      {authRecoveryError && !accountDeletionPending ? (
         <AuthRecoveryFallback
           error={authRecoveryError}
           onRetry={retryAuthRecovery}
           onSignOut={signOutFromRecovery}
+          onClearDeviceData={
+            authRecoveryError.accountDeletionRecoveryRequired
+              ? confirmRecoveryDataClear
+              : null
+          }
         />
       ) : (
-        <AppNavigator user={user} loading={loading} />
+        <AppNavigator
+          user={user}
+          loading={loading}
+          accountDeletionPending={accountDeletionPending}
+          accountDeletionPhase={accountDeletionPhase}
+        />
       )}
     </GestureHandlerRootView>
   );
@@ -200,6 +309,27 @@ const styles = StyleSheet.create({
     alignItems: "center",
     backgroundColor: "#ffffff",
     justifyContent: "center",
+  },
+  deletionOverlay: {
+    alignItems: "center",
+    backgroundColor: "#ffffff",
+    flex: 1,
+    justifyContent: "center",
+    padding: 28,
+  },
+  deletionTitle: {
+    color: "#182022",
+    fontSize: 22,
+    fontWeight: "700",
+    marginTop: 18,
+    textAlign: "center",
+  },
+  deletionMessage: {
+    color: "#526064",
+    fontSize: 15,
+    lineHeight: 22,
+    marginTop: 9,
+    textAlign: "center",
   },
   errorFallback: {
     alignItems: "center",
@@ -249,5 +379,19 @@ const styles = StyleSheet.create({
     color: "#0A7376",
     fontSize: 16,
     fontWeight: "700",
+  },
+  clearDataButton: {
+    borderColor: "#B42318",
+    borderRadius: 12,
+    borderWidth: 1,
+    marginTop: 12,
+    paddingHorizontal: 22,
+    paddingVertical: 12,
+  },
+  clearDataButtonText: {
+    color: "#B42318",
+    fontSize: 16,
+    fontWeight: "700",
+    textAlign: "center",
   },
 });

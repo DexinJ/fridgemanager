@@ -12,24 +12,26 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { useColorScheme } from "react-native";
+import { AppState, useColorScheme } from "react-native";
 import { v4 as uuidv4 } from "uuid";
 import { API_BASE_URL } from "../api/backendConfig";
 import { fetchWithTimeout } from "../api/fetchWithTimeout";
-import { clearChatData, loadChatData } from "../api/memoryManager";
+import { loadChatData } from "../api/memoryManager";
+import { pruneChatAttachments } from "../api/chatAttachments";
+import { syncLocalReminders } from "../api/reminderScheduler";
+import { migrateLegacyCustomAiProviderSettings } from "../api/aiProviderSettings";
 import {
-  clearCustomAiProviderSettings,
-  migrateLegacyCustomAiProviderSettings,
-} from "../api/aiProviderSettings";
-import {
-  clearUserDataPurgePending,
   getUserDataPurgeIntent,
   getUserStorageKeys,
   listUserDataPurgeIntents,
   markUserDataPurgePending,
   migrateLegacyAsyncStorageForUser,
-  recordUserDataPurgeFailure,
 } from "../api/storageKeys";
+import {
+  completePendingUserDataPurge,
+  publicUserDataPurgeResult,
+  userDataPurgeErrorMessage,
+} from "../api/userDataPurge";
 
 // ❌ REMOVED: import { useAuth } from "../auth/useAuth";
 
@@ -53,6 +55,7 @@ import {
   makeReplaceTagByType,
 } from "../utils/itemTagLabels";
 import {
+  canMigrateLegacyProviderCredentials,
   migrateFridgeItems,
   migrateShoppingItems,
 } from "../utils/migrations";
@@ -61,9 +64,76 @@ import {
   findPresetTagId,
   normalizeToPresetTagIds,
 } from "../utils/tags";
+import {
+  boundRuntimeChatMessages,
+  collectChatAttachmentUris,
+  prepareChatMessagesForPersistence,
+  replaceChatImagesWithPlaceholders,
+  shouldClearChatOnIncognitoExit,
+  shouldPersistChat,
+} from "../utils/chatStoragePolicy";
+import {
+  buildReminderSyncSignature,
+  canSynchronizeReminders,
+} from "../utils/reminderPolicy";
 
 const AI_PROVIDER_VALUES = new Set(["pantrio", "apple", "custom"]);
 const STORAGE_SLICE_NAMES = ["fridge", "shopping", "settings", "chat"];
+const DEFAULT_URGENCY_DAYS = Object.freeze({
+  expired: 0,
+  eat_first: 2,
+  use_soon: 7,
+  lasts_a_while: 30,
+  long_keeper: 180,
+});
+const LIGHT_THEME = Object.freeze({
+  background: "#FFFFFF",
+  card: "#f5f5f5",
+  border: "#ddd",
+  textPrimary: "#333",
+  text: "#333",
+  textSecondary: "#666",
+  textPlaceholder: "#888",
+  accent: "#2196F3",
+  warning: "#FF9800",
+  warningBackground: "#FFF1DD",
+  actionButton: "#4CAF50",
+  actionButtonText: "#fff",
+  modalBackground: "rgba(0,0,0,0.9)",
+  inputText: "#000",
+  inputBackground: "#fff",
+  userBubble: "#DCF8C6",
+  aiBubble: "#EAEAEA",
+  danger: "#E53935",
+  dangerBackground: "#FFE5E5",
+  cancelButton: "#ccc",
+  shoppingItemBackground: "#eaf7ea",
+  shoppingCheckedText: "#777",
+});
+const DARK_THEME = Object.freeze({
+  background: "#111",
+  card: "#1C1C1E",
+  border: "#333",
+  textPrimary: "#f5f5f5",
+  text: "#f5f5f5",
+  textSecondary: "#aaa",
+  textPlaceholder: "#888",
+  accent: "#64B5F6",
+  warning: "#FFB74D",
+  warningBackground: "#3A2A14",
+  actionButton: "#056162",
+  actionButtonText: "#fff",
+  modalBackground: "rgba(0,0,0,0.9)",
+  inputText: "#fff",
+  inputBackground: "#222",
+  userBubble: "#056162",
+  aiBubble: "#262d31",
+  danger: "#EF5350",
+  dangerBackground: "#3A1616",
+  cancelButton: "#555",
+  shoppingItemBackground: "#056162",
+  shoppingCheckedText: "#aaa",
+});
 
 function createStorageHydrationState({ resolved = false } = {}) {
   return Object.fromEntries(
@@ -120,6 +190,8 @@ function mergeStoredSettings(previousSettings, parsedSettings) {
     : storedAdvanced.useCustomAi
       ? "custom"
       : "pantrio";
+  const reminderPermissionRequested =
+    storedNotifications.reminderPermissionRequested === true;
 
   return {
     ...previousSettings,
@@ -128,6 +200,10 @@ function mergeStoredSettings(previousSettings, parsedSettings) {
     notifications: {
       ...previousSettings.notifications,
       ...storedNotifications,
+      reminderPermissionRequested,
+      dailyReminders: reminderPermissionRequested
+        ? storedNotifications.dailyReminders === true
+        : false,
     },
     privacy: { ...previousSettings.privacy, ...storedPrivacy },
     advanced: {
@@ -136,129 +212,37 @@ function mergeStoredSettings(previousSettings, parsedSettings) {
       aiProvider: restoredAiProvider,
       useCustomAi: restoredAiProvider === "custom",
     },
-    expiration: { ...previousSettings.expiration, ...storedExpiration },
+    expiration: {
+      ...previousSettings.expiration,
+      ...storedExpiration,
+      expirationAlerts: reminderPermissionRequested
+        ? storedExpiration.expirationAlerts === true
+        : false,
+      urgencyDays: {
+        ...previousSettings.expiration.urgencyDays,
+        ...(isPlainRecord(storedExpiration.urgencyDays)
+          ? storedExpiration.urgencyDays
+          : {}),
+      },
+    },
     user: { ...previousSettings.user, ...storedUser },
   };
 }
 
-function errorMessage(error) {
-  return String(error?.message || error || "Unknown storage error");
-}
-
-async function purgeStoredUserData(uid) {
-  const storageKeys = getUserStorageKeys(uid);
-  const operations = [
-    ["fridge", () => AsyncStorage.removeItem(storageKeys.fridgeItems)],
-    [
-      "shopping",
-      () => AsyncStorage.removeItem(storageKeys.shoppingListItems),
-    ],
-    ["settings", () => AsyncStorage.removeItem(storageKeys.appSettings)],
-    ["customAi", () => clearCustomAiProviderSettings(uid)],
-    [
-      "chat",
-      async () => {
-        const result = await clearChatData(uid);
-        if (!result.ok) throw result.error || new Error("Chat purge failed.");
-      },
-    ],
-  ];
-  const settledOperations = await Promise.allSettled(
-    operations.map(([, operation]) => operation())
-  );
-  const outcomes = {};
-  const cleared = [];
-  const errors = [];
-
-  settledOperations.forEach((result, index) => {
-    const scope = operations[index][0];
-    if (result.status === "fulfilled") {
-      outcomes[scope] = true;
-      cleared.push(scope);
-      return;
-    }
-
-    outcomes[scope] = false;
-    errors.push({
-      scope,
-      message: errorMessage(result.reason),
-      cause: result.reason,
-    });
-  });
-
-  return { ok: errors.length === 0, outcomes, cleared, errors };
-}
-
-function publicPurgeResult(result) {
-  return {
-    ok: result.ok,
-    pendingRetry: !result.ok,
-    cleared: result.cleared,
-    errors: result.errors.map(({ scope, message }) => ({ scope, message })),
-  };
-}
-
-async function completePendingUserDataPurge(uid) {
-  const intent = await getUserDataPurgeIntent(uid);
-  if (
-    intent &&
-    intent.phase !== "confirmed" &&
-    intent.phase !== "purging"
-  ) {
-    return {
-      ok: false,
-      outcomes: {},
-      cleared: [],
-      errors: [
-        {
-          scope: "purgeIntent",
-          message:
-            "The pending data cleanup has not been confirmed yet.",
-        },
-      ],
-      awaitingConfirmation: true,
-    };
-  }
-
-  const purgeResult = await purgeStoredUserData(uid);
-
-  if (purgeResult.ok) {
-    try {
-      await clearUserDataPurgePending(uid);
-      return purgeResult;
-    } catch (error) {
-      purgeResult.ok = false;
-      purgeResult.errors.push({
-        scope: "purgeIntent",
-        message: errorMessage(error),
-        cause: error,
-      });
-    }
-  }
-
-  try {
-    await recordUserDataPurgeFailure(
-      uid,
-      purgeResult.errors[0]?.cause || new Error("User data purge failed.")
-    );
-  } catch (error) {
-    purgeResult.errors.push({
-      scope: "purgeJournal",
-      message: errorMessage(error),
-      cause: error,
-    });
-  }
-
-  return purgeResult;
-}
-
 export const GlobalContext = createContext();
+export const ChatContext = createContext();
+export const ChatActionsContext = createContext();
 
 // ✅ central threshold (used everywhere)
 const ALMOST_EXPIRE_DAYS = DEFAULT_ALMOST_EXPIRE_DAYS;
 
 // ✅ CHANGED: GlobalProvider now accepts authUser from _layout
-export const GlobalProvider = ({ children, authUser = null }) => {
+export const GlobalProvider = ({
+  children,
+  authUser = null,
+  accountProfile = null,
+  accountProfileLoading = false,
+}) => {
   // --- Default settings ---
   const defaultSettings = useMemo(
     () => ({
@@ -269,7 +253,8 @@ export const GlobalProvider = ({ children, authUser = null }) => {
       },
       notifications: {
         turnOn: true,
-        dailyReminders: true,
+        dailyReminders: false,
+        reminderPermissionRequested: false,
       },
       privacy: {
         incognito: false,
@@ -281,8 +266,9 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         aiModel: "gpt-4o-mini",
       },
       expiration: {
-        expirationAlerts: true,
+        expirationAlerts: false,
         remindDays: 5,
+        urgencyDays: DEFAULT_URGENCY_DAYS,
       },
       user: {
         uid: null,
@@ -313,20 +299,49 @@ export const GlobalProvider = ({ children, authUser = null }) => {
       Object.fromEntries(
         STORAGE_SLICE_NAMES.flatMap((slice) =>
           storageHydration[slice].error
-            ? [[slice, errorMessage(storageHydration[slice].error)]]
+            ? [[slice, userDataPurgeErrorMessage(storageHydration[slice].error)]]
             : []
         )
       ),
     [storageHydration]
   );
 
-  const [urgencyDays, setUrgencyDays] = useState({
-    expired: 0,
-    eat_first: 2,
-    use_soon: 7,
-    lasts_a_while: 30,
-    long_keeper: 180,
-  });
+  const urgencyDays = useMemo(
+    () => ({
+      ...DEFAULT_URGENCY_DAYS,
+      ...(isPlainRecord(settings?.expiration?.urgencyDays)
+        ? settings.expiration.urgencyDays
+        : {}),
+      expired: 0,
+    }),
+    [settings?.expiration?.urgencyDays]
+  );
+  const setUrgencyDays = useCallback((valueOrUpdater) => {
+    setSettings((previous) => {
+      const current = {
+        ...DEFAULT_URGENCY_DAYS,
+        ...(isPlainRecord(previous?.expiration?.urgencyDays)
+          ? previous.expiration.urgencyDays
+          : {}),
+        expired: 0,
+      };
+      const requested =
+        typeof valueOrUpdater === "function"
+          ? valueOrUpdater(current)
+          : valueOrUpdater;
+      return {
+        ...previous,
+        expiration: {
+          ...previous.expiration,
+          urgencyDays: {
+            ...current,
+            ...(isPlainRecord(requested) ? requested : {}),
+            expired: 0,
+          },
+        },
+      };
+    });
+  }, []);
 
   // 🏷️ Preset tags ONLY
   const PRESET_TAGS = useMemo(
@@ -536,13 +551,65 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   );
 
   // Conversation state
-  const [messages, setMessages] = useState([]);
+  const [messages, setMessagesState] = useState([]);
+  const setMessages = useCallback((valueOrUpdater) => {
+    setMessagesState((previous) => {
+      const requested =
+        typeof valueOrUpdater === "function"
+          ? valueOrUpdater(previous)
+          : valueOrUpdater;
+      if (requested === previous) return previous;
+      return boundRuntimeChatMessages(requested);
+    });
+  }, []);
   const [summary, setSummary] = useState("");
   const [receiving, setReceiving] = useState(false);
   const [waiting, setWaiting] = useState(false);
+  const chatStateRef = useRef({
+    messages: [],
+    summary: "",
+    receiving: false,
+    waiting: false,
+  });
+  chatStateRef.current = { messages, summary, receiving, waiting };
+  const getChatSnapshot = useCallback(() => chatStateRef.current, []);
 
   // System theme from device
   const systemScheme = useColorScheme();
+  const [expiryClock, setExpiryClock] = useState(() => Date.now());
+
+  useEffect(() => {
+    const refresh = () => setExpiryClock(Date.now());
+    let midnightTimeoutId = null;
+    const scheduleNextMidnight = () => {
+      clearTimeout(midnightTimeoutId);
+      const now = new Date();
+      const nextMidnight = new Date(
+        now.getFullYear(),
+        now.getMonth(),
+        now.getDate() + 1,
+        0,
+        0,
+        0,
+        25
+      );
+      midnightTimeoutId = setTimeout(() => {
+        refresh();
+        scheduleNextMidnight();
+      }, Math.max(1, nextMidnight.getTime() - now.getTime()));
+    };
+    scheduleNextMidnight();
+    const appStateSubscription = AppState.addEventListener("change", (state) => {
+      if (state === "active") {
+        refresh();
+        scheduleNextMidnight();
+      }
+    });
+    return () => {
+      clearTimeout(midnightTimeoutId);
+      appStateSubscription.remove();
+    };
+  }, []);
 
   // ✅ CHANGED:
   // Use authUser passed from _layout.
@@ -555,7 +622,9 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   const storageWriteEnabledRef = useRef(
     Object.fromEntries(STORAGE_SLICE_NAMES.map((slice) => [slice, false]))
   );
+  const hydratedStorageOwnerUidRef = useRef(null);
   const retryStorageHydration = useCallback(() => {
+    hydratedStorageOwnerUidRef.current = null;
     storageWriteEnabledRef.current = Object.fromEntries(
       STORAGE_SLICE_NAMES.map((slice) => [slice, false])
     );
@@ -565,54 +634,9 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   }, []);
   const chatSaveTimerRef = useRef(null);
   const chatLastSavedAtRef = useRef(0);
+  const chatAttachmentSignatureRef = useRef("");
 
-  const lightTheme = {
-    background: "#FFFFFF",
-    card: "#f5f5f5",
-    border: "#ddd",
-    textPrimary: "#333",
-    textSecondary: "#666",
-    textPlaceholder: "#888",
-    accent: "#2196F3",
-    warning: "#FF9800",
-    warningBackground: "#FFF1DD",
-    actionButton: "#4CAF50",
-    modalBackground: "rgba(0,0,0,0.9)",
-    inputText: "#000",
-    inputBackground: "#fff",
-    userBubble: "#DCF8C6",
-    aiBubble: "#EAEAEA",
-    danger: "#E53935",
-    dangerBackground: "#FFE5E5",
-    cancelButton: "#ccc",
-    shoppingItemBackground: "#eaf7ea",
-    shoppingCheckedText: "#777",
-  };
-
-  const darkTheme = {
-    background: "#111",
-    card: "#1C1C1E",
-    border: "#333",
-    textPrimary: "#f5f5f5",
-    textSecondary: "#aaa",
-    textPlaceholder: "#888",
-    accent: "#64B5F6",
-    warning: "#FFB74D",
-    warningBackground: "#3A2A14",
-    actionButton: "#056162",
-    modalBackground: "rgba(0,0,0,0.9)",
-    inputText: "#fff",
-    inputBackground: "#222",
-    userBubble: "#056162",
-    aiBubble: "#262d31",
-    danger: "#EF5350",
-    dangerBackground: "#3A1616",
-    cancelButton: "#555",
-    shoppingItemBackground: "#056162",
-    shoppingCheckedText: "#aaa",
-  };
-
-  const theme = settings.ux.darkMode ? darkTheme : lightTheme;
+  const theme = settings.ux.darkMode ? DARK_THEME : LIGHT_THEME;
 
   // --- Apply system theme if enabled ---
   useEffect(() => {
@@ -634,6 +658,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   // Per-slice hydration prevents a corrupt/read-failed slice from being saved.
   useEffect(() => {
     let cancelled = false;
+    hydratedStorageOwnerUidRef.current = null;
 
     const resetHydration = () => {
       storageWriteEnabledRef.current = Object.fromEntries(
@@ -681,7 +706,12 @@ export const GlobalProvider = ({ children, authUser = null }) => {
             ok: false,
             pendingRetry: true,
             cleared: [],
-            errors: [{ scope: "purgeJournal", message: errorMessage(error) }],
+            errors: [
+              {
+                scope: "purgeJournal",
+                message: userDataPurgeErrorMessage(error),
+              },
+            ],
           });
           resolveAllReadOnly(error);
         }
@@ -697,7 +727,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         if (cancelled) return;
         sweepCleared.push(...result.cleared);
         if (!result.ok) {
-          const visibleResult = publicPurgeResult(result);
+          const visibleResult = publicUserDataPurgeResult(result);
           setStoragePurgeResult(visibleResult);
           resolveAllReadOnly(
             new Error(
@@ -783,16 +813,23 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         ? parsedSettings.advanced
         : {};
       let settingsMigrationError = null;
-      try {
-        await migrateLegacyCustomAiProviderSettings(storageOwnerUid, {
-          baseUrl:
-            storedAdvanced.aiBaseUrl || defaultSettings.advanced.aiBaseUrl,
-          fallbackModel:
-            storedAdvanced.aiModel || defaultSettings.advanced.aiModel,
-        });
-      } catch (error) {
-        settingsMigrationError = error;
-        console.error("Legacy AI provider migration failed:", error);
+      if (
+        canMigrateLegacyProviderCredentials({
+          settingsReadStatus: settingsResult.status,
+          settingsLoadError,
+        })
+      ) {
+        try {
+          await migrateLegacyCustomAiProviderSettings(storageOwnerUid, {
+            baseUrl:
+              storedAdvanced.aiBaseUrl || defaultSettings.advanced.aiBaseUrl,
+            fallbackModel:
+              storedAdvanced.aiModel || defaultSettings.advanced.aiModel,
+          });
+        } catch (error) {
+          settingsMigrationError = error;
+          console.error("Legacy AI provider migration failed:", error);
+        }
       }
       const settingsError = settingsLoadError || settingsMigrationError;
 
@@ -818,6 +855,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         setSummary(chatData.summary);
       }
       chatLastSavedAtRef.current = Date.now();
+      hydratedStorageOwnerUidRef.current = storageOwnerUid;
 
       resolveSlice("fridge", {
         writeEnabled: !fridgeError && !legacyMigrationError,
@@ -842,11 +880,60 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     return () => {
       cancelled = true;
     };
-  }, [defaultSettings, storageHydrationAttempt, storageOwnerUid]);
+  }, [defaultSettings, setMessages, storageHydrationAttempt, storageOwnerUid]);
 
   // ---------------------------------------
   // Smart chat saving
   // ---------------------------------------
+  const incognitoEnabled = !shouldPersistChat(settings);
+  const previousIncognitoRef = useRef(incognitoEnabled);
+  const leavingIncognito = shouldClearChatOnIncognitoExit(
+    previousIncognitoRef.current,
+    incognitoEnabled
+  );
+  useEffect(() => {
+    previousIncognitoRef.current = incognitoEnabled;
+    if (leavingIncognito) {
+      // Incognito messages belong only to that in-memory session. Clearing on
+      // exit prevents them from being written when normal persistence resumes.
+      setMessages([]);
+      setSummary("");
+      return;
+    }
+
+    if (
+      !incognitoEnabled ||
+      !storageOwnerUid ||
+      hydratedStorageOwnerUidRef.current !== storageOwnerUid ||
+      !storageHydration.chat.resolved ||
+      !storageHydration.settings.resolved
+    ) {
+      return;
+    }
+
+    if (chatSaveTimerRef.current) {
+      clearTimeout(chatSaveTimerRef.current);
+      chatSaveTimerRef.current = null;
+    }
+
+    const { chatMessages, chatSummary } = getUserStorageKeys(storageOwnerUid);
+    setSummary("");
+    setMessages((previous) => replaceChatImagesWithPlaceholders(previous));
+    Promise.all([
+      AsyncStorage.multiRemove([chatMessages, chatSummary]),
+      pruneChatAttachments(storageOwnerUid, []),
+    ]).catch((error) => {
+      console.warn("Could not remove incognito chat storage:", error);
+    });
+  }, [
+    incognitoEnabled,
+    leavingIncognito,
+    setMessages,
+    storageHydration.chat.resolved,
+    storageHydration.settings.resolved,
+    storageOwnerUid,
+  ]);
+
   useEffect(() => {
     if (
       !storageHydration.chat.writeEnabled ||
@@ -856,17 +943,33 @@ export const GlobalProvider = ({ children, authUser = null }) => {
       return;
     }
 
+    // Message updates may still stream while incognito. They must stay purely
+    // in memory; cleanup is handled once by the transition/owner effect above.
+    if (incognitoEnabled || leavingIncognito) return;
+
     const { chatMessages } = getUserStorageKeys(storageOwnerUid);
+
+    // Avoid serializing the whole conversation for each streaming token. The
+    // final state is persisted once receiving finishes.
+    if (receiving) return;
 
     const doSave = async () => {
       if (!storageWriteEnabledRef.current.chat) return;
       try {
         chatLastSavedAtRef.current = Date.now();
-
+        const persistedMessages = prepareChatMessagesForPersistence(messages);
         await AsyncStorage.setItem(
           chatMessages,
-          JSON.stringify(messages)
+          JSON.stringify(persistedMessages)
         );
+        const attachmentUris = collectChatAttachmentUris(persistedMessages);
+        const attachmentSignature = `${storageOwnerUid}:${[...attachmentUris]
+          .sort()
+          .join("|")}`;
+        if (chatAttachmentSignatureRef.current !== attachmentSignature) {
+          await pruneChatAttachments(storageOwnerUid, attachmentUris);
+          chatAttachmentSignatureRef.current = attachmentSignature;
+        }
       } catch (error) {
         storageWriteEnabledRef.current = {
           ...storageWriteEnabledRef.current,
@@ -888,28 +991,6 @@ export const GlobalProvider = ({ children, authUser = null }) => {
       chatSaveTimerRef.current = null;
     }
 
-    if (receiving) {
-      const THROTTLE_MS = 800;
-      const elapsed =
-        Date.now() - chatLastSavedAtRef.current;
-      const wait = Math.max(
-        THROTTLE_MS - elapsed,
-        0
-      );
-
-      chatSaveTimerRef.current = setTimeout(() => {
-        doSave();
-        chatSaveTimerRef.current = null;
-      }, wait);
-
-      return () => {
-        if (chatSaveTimerRef.current) {
-          clearTimeout(chatSaveTimerRef.current);
-          chatSaveTimerRef.current = null;
-        }
-      };
-    }
-
     doSave();
 
     return () => {
@@ -921,6 +1002,8 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   }, [
     messages,
     receiving,
+    incognitoEnabled,
+    leavingIncognito,
     storageHydration.chat.writeEnabled,
     storageOwnerUid,
   ]);
@@ -948,6 +1031,27 @@ export const GlobalProvider = ({ children, authUser = null }) => {
 
         return;
       }
+
+      if (accountProfile?.uid === user.uid) {
+        setSettings((previous) => {
+          const nextName =
+            accountProfile.username ?? previous.user?.name ?? "freeUser";
+          if (previous.user?.uid === user.uid && previous.user?.name === nextName) {
+            return previous;
+          }
+          return {
+            ...previous,
+            user: {
+              ...previous.user,
+              uid: user.uid,
+              name: nextName,
+            },
+          };
+        });
+        return;
+      }
+
+      if (accountProfileLoading) return;
 
       try {
         const token = await user.getIdToken();
@@ -1028,7 +1132,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
       cancelled = true;
       controller.abort();
     };
-  }, [storageHydrated, user]);
+  }, [accountProfile, accountProfileLoading, storageHydrated, user]);
 
   // ---------------------------------------
   // Save fridge, shopping list, and settings
@@ -1145,6 +1249,15 @@ export const GlobalProvider = ({ children, authUser = null }) => {
   // -----------------------------
   // Expiration status on each item
   // -----------------------------
+  const getCurrentExpiryMeta = useCallback(
+    (
+      expiresAt,
+      almostDays = ALMOST_EXPIRE_DAYS,
+      thresholds = urgencyDays
+    ) => getExpiryMeta(expiresAt, almostDays, thresholds, expiryClock),
+    [expiryClock, urgencyDays]
+  );
+
   const fridgeItems = useMemo(() => {
     const {
       tagById: mappedTagById,
@@ -1162,7 +1275,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
 
     return (fridgeItemsRaw || []).map(
       (item) => {
-        const meta = getExpiryMeta(
+        const meta = getCurrentExpiryMeta(
           item?.expiresAt,
           ALMOST_EXPIRE_DAYS,
           urgencyDays
@@ -1210,93 +1323,135 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     fridgeItemsRaw,
     tags,
     urgencyDays,
+    getCurrentExpiryMeta,
+  ]);
+
+  const reminderSyncSignature = useMemo(
+    () => buildReminderSyncSignature(settings, fridgeItemsRaw),
+    [fridgeItemsRaw, settings]
+  );
+  const reminderSyncPayloadRef = useRef(null);
+  if (reminderSyncPayloadRef.current?.signature !== reminderSyncSignature) {
+    reminderSyncPayloadRef.current = {
+      signature: reminderSyncSignature,
+      settings,
+      fridgeItems: fridgeItemsRaw,
+    };
+  }
+
+  useEffect(() => {
+    if (!canSynchronizeReminders({
+      storageHydrated,
+      storageOwnerUid,
+      fridgeWriteEnabled: storageHydration.fridge.writeEnabled,
+      settingsWriteEnabled: storageHydration.settings.writeEnabled,
+    })) {
+      return;
+    }
+    let cancelled = false;
+    let retryTimeoutId = null;
+    let retryAttempt = 0;
+    const synchronize = () => {
+      const payload = reminderSyncPayloadRef.current;
+      syncLocalReminders(payload).then(() => {
+        retryAttempt = 0;
+      }).catch((error) => {
+        if (cancelled) return;
+        console.warn("Could not synchronize local reminders:", error);
+        const retryDelay = Math.min(5 * 60_000, 5_000 * (2 ** retryAttempt));
+        retryAttempt += 1;
+        retryTimeoutId = setTimeout(synchronize, retryDelay);
+      });
+    };
+    const timeoutId = setTimeout(synchronize, 750);
+    return () => {
+      cancelled = true;
+      clearTimeout(timeoutId);
+      clearTimeout(retryTimeoutId);
+    };
+  }, [
+    reminderSyncSignature,
+    storageHydrated,
+    storageHydration.fridge.writeEnabled,
+    storageHydration.settings.writeEnabled,
+    storageOwnerUid,
   ]);
 
   // -----------------------------
   // Fridge and shopping helpers
   // -----------------------------
-  const addToShoppingList = (
-    name,
-    quantity,
-    categories
-  ) => {
-    const tagIds =
-      normalizeCategoriesToTagIds(
-        categories
-      );
-
+  const addManyToShoppingList = (items = []) => {
+    if (!Array.isArray(items) || items.length === 0) return [];
     const now = new Date().toISOString();
-
-    setShoppingListItems((prev) => [
-      ...prev,
-      {
-        id: uuidv4(),
-        name,
-        quantity,
-        tagIds,
-        createdAt: now,
-        updatedAt: now,
-      },
-    ]);
+    const additions = items.map((item) => ({
+      id: uuidv4(),
+      name: item?.name,
+      quantity: item?.quantity,
+      tagIds: normalizeCategoriesToTagIds(
+        item?.tagIds ?? item?.categories
+      ),
+      createdAt: now,
+      updatedAt: now,
+    }));
+    setShoppingListItems((previous) => [...previous, ...additions]);
+    return additions;
   };
 
-  const addToFridge = (
-    name,
-    quantity,
-    categories,
-    expiresAt
-  ) => {
-    const tagIds =
-      normalizeCategoriesToTagIds(
-        categories
+  const addToShoppingList = (name, quantity, categories) =>
+    addManyToShoppingList([{ name, quantity, categories }])[0];
+
+  const addManyToFridge = (items = []) => {
+    if (!Array.isArray(items) || items.length === 0) return [];
+    const nowIso = new Date().toISOString();
+    const additions = items.map((item) => {
+      const tagIds = normalizeCategoriesToTagIds(
+        item?.tagIds ?? item?.categories
       );
-
-    const nowIso =
-      new Date().toISOString();
-
-    let finalExpiresAt =
-      toIsoOrNull(expiresAt);
-
-    if (!finalExpiresAt) {
-      finalExpiresAt =
-        predictExpiresAtIso({
+      let finalExpiresAt = toIsoOrNull(item?.expiresAt);
+      if (!finalExpiresAt) {
+        finalExpiresAt = predictExpiresAtIso({
           createdAtIso: nowIso,
           tagIds,
           tagById,
         });
-    }
-
-    setFridgeItemsRaw((prev) => [
-      ...prev,
-      {
+      }
+      return {
         id: uuidv4(),
-        name,
-        quantity,
+        name: item?.name,
+        quantity: item?.quantity,
         tagIds,
         createdAt: nowIso,
         updatedAt: nowIso,
         expiresAt: finalExpiresAt,
-      },
-    ]);
+      };
+    });
+    setFridgeItemsRaw((previous) => [...previous, ...additions]);
+    return additions;
   };
 
-  const removeFromFridge = (id) => {
-    setFridgeItemsRaw((prev) =>
-      prev.filter(
-        (item) => item.id !== id
-      )
+  const addToFridge = (name, quantity, categories, expiresAt) =>
+    addManyToFridge([{ name, quantity, categories, expiresAt }])[0];
+
+  const removeManyFromFridge = (ids = []) => {
+    const idsToRemove = new Set(Array.isArray(ids) ? ids.filter(Boolean) : []);
+    if (idsToRemove.size === 0) return;
+    setFridgeItemsRaw((previous) =>
+      previous.filter((item) => !idsToRemove.has(item.id))
     );
   };
 
-  const removeFromShoppingList = (
-    id
-  ) => {
-    setShoppingListItems((prev) =>
-      prev.filter(
-        (item) => item.id !== id
-      )
+  const removeFromFridge = (id) => removeManyFromFridge([id]);
+
+  const removeManyFromShoppingList = (ids = []) => {
+    const idsToRemove = new Set(Array.isArray(ids) ? ids.filter(Boolean) : []);
+    if (idsToRemove.size === 0) return;
+    setShoppingListItems((previous) =>
+      previous.filter((item) => !idsToRemove.has(item.id))
     );
   };
+
+  const removeFromShoppingList = (id) =>
+    removeManyFromShoppingList([id]);
 
   const editFridgeItem = (
     id,
@@ -1583,8 +1738,9 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         return false;
       }
 
+      const secondIds = new Set(second);
       for (const id of first) {
-        if (!second.includes(id)) {
+        if (!secondIds.has(id)) {
           return false;
         }
       }
@@ -1626,6 +1782,10 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     const changes = {
       shopping: [],
       fridge: [],
+    };
+    const patches = {
+      shopping: new Map(),
+      fridge: new Map(),
     };
 
     const processOne = (
@@ -1732,19 +1892,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
                 : {}),
             };
 
-            if (
-              listName === "shopping"
-            ) {
-              editShoppingListItem(
-                item.id,
-                patch
-              );
-            } else {
-              editFridgeItem(
-                item.id,
-                patch
-              );
-            }
+            patches[listName].set(item.id, patch);
           }
         }
       }
@@ -1761,6 +1909,26 @@ export const GlobalProvider = ({ children, authUser = null }) => {
       processOne(
         "fridge",
         fridgeItemsRaw
+      );
+    }
+
+    if (!dryRun && patches.shopping.size > 0) {
+      const updatedAt = new Date().toISOString();
+      setShoppingListItems((previous) =>
+        previous.map((item) => {
+          const patch = patches.shopping.get(item.id);
+          return patch ? { ...item, ...patch, updatedAt } : item;
+        })
+      );
+    }
+
+    if (!dryRun && patches.fridge.size > 0) {
+      const updatedAt = new Date().toISOString();
+      setFridgeItemsRaw((previous) =>
+        previous.map((item) => {
+          const patch = patches.fridge.get(item.id);
+          return patch ? { ...item, ...patch, updatedAt } : item;
+        })
       );
     }
 
@@ -1843,7 +2011,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
         errors: [
           {
             scope: "purge",
-            message: errorMessage(error),
+            message: userDataPurgeErrorMessage(error),
             cause: error,
           },
         ],
@@ -1853,7 +2021,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     if (journalError && !purgeResult.ok) {
       purgeResult.errors.push({
         scope: "purgeJournal",
-        message: errorMessage(journalError),
+        message: userDataPurgeErrorMessage(journalError),
         cause: journalError,
       });
     }
@@ -1888,7 +2056,7 @@ export const GlobalProvider = ({ children, authUser = null }) => {
       )
     );
 
-    const visibleResult = publicPurgeResult(purgeResult);
+    const visibleResult = publicUserDataPurgeResult(purgeResult);
     setStoragePurgeResult(visibleResult);
 
     if (__DEV__ && visibleResult.ok) {
@@ -1901,59 +2069,145 @@ export const GlobalProvider = ({ children, authUser = null }) => {
     return visibleResult;
   };
 
+  const actionImplementationsRef = useRef(null);
+  actionImplementationsRef.current = {
+    streamlineLists,
+    addToFridge,
+    addManyToFridge,
+    addToShoppingList,
+    addManyToShoppingList,
+    removeFromFridge,
+    removeManyFromFridge,
+    removeFromShoppingList,
+    removeManyFromShoppingList,
+    editFridgeItem,
+    editShoppingListItem,
+    addPresetTagToItem,
+    removePresetTagFromItem,
+    updateSetting,
+    setUsername,
+    clearAllData,
+  };
+  const actions = useMemo(() => {
+    const call = (name) => (...args) =>
+      actionImplementationsRef.current?.[name]?.(...args);
+    return {
+      streamlineLists: call("streamlineLists"),
+      addToFridge: call("addToFridge"),
+      addManyToFridge: call("addManyToFridge"),
+      addToShoppingList: call("addToShoppingList"),
+      addManyToShoppingList: call("addManyToShoppingList"),
+      removeFromFridge: call("removeFromFridge"),
+      removeManyFromFridge: call("removeManyFromFridge"),
+      removeFromShoppingList: call("removeFromShoppingList"),
+      removeManyFromShoppingList: call("removeManyFromShoppingList"),
+      editFridgeItem: call("editFridgeItem"),
+      editShoppingListItem: call("editShoppingListItem"),
+      addPresetTagToItem: call("addPresetTagToItem"),
+      removePresetTagFromItem: call("removePresetTagFromItem"),
+      updateSetting: call("updateSetting"),
+      setUsername: call("setUsername"),
+      clearAllData: call("clearAllData"),
+    };
+  }, []);
+
+  const globalContextValue = useMemo(
+    () => ({
+      fridgeItems,
+      shoppingListItems,
+      settings,
+      retryStorageHydration,
+      storageHydrated,
+      storageHydration,
+      storageHydrationAttempt,
+      storageHydrationErrors,
+      storageOwnerUid,
+      storagePurgeResult,
+      tags,
+      FOOD_TYPE_RULES,
+      inferFoodTypeLabelFromName: inferFoodTypeLabelFromNameSafe,
+      streamlineLists: actions.streamlineLists,
+      ALMOST_EXPIRE_DAYS,
+      getExpiryMeta: getCurrentExpiryMeta,
+      urgencyDays,
+      setUrgencyDays,
+      // Stable setters remain here for settings/tool compatibility. Changing
+      // chat state no longer changes this context value.
+      setMessages,
+      setSummary,
+      setReceiving,
+      setWaiting,
+      addToFridge: actions.addToFridge,
+      addManyToFridge: actions.addManyToFridge,
+      addToShoppingList: actions.addToShoppingList,
+      addManyToShoppingList: actions.addManyToShoppingList,
+      removeFromFridge: actions.removeFromFridge,
+      removeManyFromFridge: actions.removeManyFromFridge,
+      removeFromShoppingList: actions.removeFromShoppingList,
+      removeManyFromShoppingList: actions.removeManyFromShoppingList,
+      editFridgeItem: actions.editFridgeItem,
+      editShoppingListItem: actions.editShoppingListItem,
+      normalizeToPresetTagIds: normalizeCategoriesToTagIds,
+      addPresetTagToItem: actions.addPresetTagToItem,
+      removePresetTagFromItem: actions.removePresetTagFromItem,
+      updateSetting: actions.updateSetting,
+      setUsername: actions.setUsername,
+      theme,
+      clearAllData: actions.clearAllData,
+    }),
+    [
+      actions,
+      fridgeItems,
+      getCurrentExpiryMeta,
+      inferFoodTypeLabelFromNameSafe,
+      normalizeCategoriesToTagIds,
+      retryStorageHydration,
+      settings,
+      shoppingListItems,
+      storageHydrated,
+      storageHydration,
+      storageHydrationAttempt,
+      storageHydrationErrors,
+      storageOwnerUid,
+      storagePurgeResult,
+      tags,
+      theme,
+      urgencyDays,
+      setUrgencyDays,
+      setMessages,
+    ]
+  );
+  const chatContextValue = useMemo(
+    () => ({
+      messages,
+      summary,
+      setMessages,
+      setSummary,
+      receiving,
+      setReceiving,
+      waiting,
+      setWaiting,
+    }),
+    [messages, receiving, setMessages, summary, waiting]
+  );
+  const chatActionsContextValue = useMemo(
+    () => ({
+      setMessages,
+      setSummary,
+      setReceiving,
+      setWaiting,
+      getChatSnapshot,
+    }),
+    [getChatSnapshot, setMessages]
+  );
+
   return (
-    <GlobalContext.Provider
-      value={{
-        fridgeItems,
-        shoppingListItems,
-        settings,
-        retryStorageHydration,
-        storageHydrated,
-        storageHydration,
-        storageHydrationAttempt,
-        storageHydrationErrors,
-        storageOwnerUid,
-        storagePurgeResult,
-        tags,
-
-        FOOD_TYPE_RULES,
-        inferFoodTypeLabelFromName:
-          inferFoodTypeLabelFromNameSafe,
-        streamlineLists,
-
-        ALMOST_EXPIRE_DAYS,
-        getExpiryMeta,
-        urgencyDays,
-        setUrgencyDays,
-
-        messages,
-        summary,
-        setMessages,
-        setSummary,
-        receiving,
-        setReceiving,
-        waiting,
-        setWaiting,
-
-        addToFridge,
-        addToShoppingList,
-        removeFromFridge,
-        removeFromShoppingList,
-        editFridgeItem,
-        editShoppingListItem,
-
-        normalizeToPresetTagIds:
-          normalizeCategoriesToTagIds,
-        addPresetTagToItem,
-        removePresetTagFromItem,
-
-        updateSetting,
-        setUsername,
-        theme,
-        clearAllData,
-      }}
-    >
-      {children}
+    <GlobalContext.Provider value={globalContextValue}>
+      <ChatActionsContext.Provider value={chatActionsContextValue}>
+        <ChatContext.Provider value={chatContextValue}>
+          {children}
+        </ChatContext.Provider>
+      </ChatActionsContext.Provider>
     </GlobalContext.Provider>
   );
 };

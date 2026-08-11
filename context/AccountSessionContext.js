@@ -14,7 +14,13 @@ import {
   createBackendResponseError,
   parseBackendResponseText,
 } from "../api/backendErrors";
+import { isRefreshFresh } from "./refreshPolicy";
 import { useAppleSubscription } from "./SubscriptionContext";
+import { useAuth } from "../auth/useAuth";
+
+const {
+  deletionSessionDisposition,
+} = require("../api/accountDeletionPolicy.cjs");
 
 const EMPTY_ENTITLEMENT = Object.freeze({
   plan: "free",
@@ -28,7 +34,9 @@ const EMPTY_ENTITLEMENT = Object.freeze({
 });
 
 const SESSION_REQUEST_TIMEOUT_MS = 10_000;
+const SESSION_FOREGROUND_MAX_AGE_MS = 30_000;
 const APPLE_REQUEST_TIMEOUT_MS = 20_000;
+const APPLE_FOREGROUND_MAX_AGE_MS = 60_000;
 const APPLE_EVIDENCE_MAX_ITEMS = 20;
 const APPLE_EVIDENCE_SOURCES = new Set([
   "purchase",
@@ -108,10 +116,6 @@ function normalizeQuota(value, previous = null) {
     resetsAt: source.resetsAt ?? source.resetAt ?? previous?.resetsAt ?? null,
     timezone: source.timezone ?? previous?.timezone ?? null,
   };
-}
-
-function responseMessage(payload, fallback) {
-  return payload?.error?.message || payload?.error || payload?.message || fallback;
 }
 
 function isSupersededAppleRequest(error) {
@@ -267,6 +271,7 @@ const AccountSessionContext = createContext({
 });
 
 export function AccountSessionProvider({ authUser = null, children }) {
+  const { acceptRemoteAccountDeletion } = useAuth();
   const {
     products: storeKitProducts,
     productsLoading: appleProductsLoading,
@@ -294,12 +299,16 @@ export function AccountSessionProvider({ authUser = null, children }) {
   const sessionRef = useRef(null);
   const sessionRequestControllerRef = useRef(null);
   const sessionRequestGenerationRef = useRef(0);
+  const sessionRefreshPromiseRef = useRef(null);
+  const sessionLastRefreshedAtRef = useRef(0);
   const appleRequestControllersRef = useRef(new Set());
   const authUserUidRef = useRef(authUserUid);
   const authGenerationRef = useRef(0);
   const appleEvidenceRequestsRef = useRef(new Map());
   const accountOperationLeaseRef = useRef(null);
   const appleBootstrapKeyRef = useRef(null);
+  const appleBackgroundReconciliationPromiseRef = useRef(null);
+  const appleLastReconciledAtRef = useRef(0);
 
   const acquireAccountOperation = useCallback((operation) => {
     const activeOperation = accountOperationLeaseRef.current?.operation;
@@ -345,6 +354,8 @@ export function AccountSessionProvider({ authUser = null, children }) {
       sessionRequestGenerationRef.current += 1;
       sessionRequestControllerRef.current?.abort();
       sessionRequestControllerRef.current = null;
+      sessionRefreshPromiseRef.current = null;
+      appleBackgroundReconciliationPromiseRef.current = null;
       for (const controller of appleRequestControllersRef.current) {
         controller.abort();
       }
@@ -360,6 +371,7 @@ export function AccountSessionProvider({ authUser = null, children }) {
     if (!payload || typeof payload !== "object") return;
 
     sessionRef.current = payload;
+    sessionLastRefreshedAtRef.current = Date.now();
     setSession(payload);
     if (payload.entitlement && typeof payload.entitlement === "object") {
       setEntitlement({ ...EMPTY_ENTITLEMENT, ...payload.entitlement });
@@ -370,6 +382,32 @@ export function AccountSessionProvider({ authUser = null, children }) {
     if (payload.model && typeof payload.model === "object") {
       setModel(payload.model);
     }
+  }, []);
+
+  const invalidateSessionAccess = useCallback(() => {
+    sessionRef.current = null;
+    sessionLastRefreshedAtRef.current = 0;
+    setSession(null);
+    setEntitlement(EMPTY_ENTITLEMENT);
+    setQuota(null);
+    setModel(null);
+  }, []);
+
+  const cancelConcurrentAccountWork = useCallback(() => {
+    // A deletion tombstone outranks all account work. Invalidate callback
+    // generations as well as aborting fetches so a native StoreKit operation
+    // that cannot be cancelled cannot republish a previously cached session.
+    authGenerationRef.current += 1;
+    sessionRequestGenerationRef.current += 1;
+    sessionRequestControllerRef.current?.abort();
+    sessionRequestControllerRef.current = null;
+    sessionRefreshPromiseRef.current = null;
+    appleBackgroundReconciliationPromiseRef.current = null;
+    for (const controller of appleRequestControllersRef.current) {
+      controller.abort();
+    }
+    appleRequestControllersRef.current.clear();
+    appleEvidenceRequestsRef.current.clear();
   }, []);
 
   const authenticatedAppleRequest = useCallback(
@@ -453,13 +491,13 @@ export function AccountSessionProvider({ authUser = null, children }) {
     [authUser]
   );
 
-  const refreshSession = useCallback(async () => {
-    const requestGeneration = sessionRequestGenerationRef.current + 1;
-    sessionRequestGenerationRef.current = requestGeneration;
-    sessionRequestControllerRef.current?.abort();
-
+  const refreshSession = useCallback((options = {}) => {
     if (!authUser) {
+      sessionRequestGenerationRef.current += 1;
+      sessionRequestControllerRef.current?.abort();
       sessionRequestControllerRef.current = null;
+      sessionRefreshPromiseRef.current = null;
+      sessionLastRefreshedAtRef.current = 0;
       sessionRef.current = null;
       setSession(null);
       setEntitlement(EMPTY_ENTITLEMENT);
@@ -468,9 +506,38 @@ export function AccountSessionProvider({ authUser = null, children }) {
       setInitialized(true);
       setLoading(false);
       setError(null);
-      return null;
+      return Promise.resolve(null);
     }
 
+    if (
+      ACCOUNT_TEARDOWN_OPERATIONS.has(
+        accountOperationLeaseRef.current?.operation
+      )
+    ) {
+      return Promise.resolve(sessionRef.current);
+    }
+
+    const requestUid = authUser.uid;
+    const requestAuthGeneration = authGenerationRef.current;
+    if (authUserUidRef.current !== requestUid) return Promise.resolve(null);
+
+    const inFlight = sessionRefreshPromiseRef.current;
+    if (inFlight) return inFlight;
+
+    const maxAgeMs = Number(options?.maxAgeMs) || 0;
+    if (
+      sessionRef.current &&
+      isRefreshFresh(sessionLastRefreshedAtRef.current, maxAgeMs)
+    ) {
+      return Promise.resolve(sessionRef.current);
+    }
+
+    const requestGeneration = sessionRequestGenerationRef.current + 1;
+    sessionRequestGenerationRef.current = requestGeneration;
+    const requestWasSuperseded = () =>
+      sessionRequestGenerationRef.current !== requestGeneration ||
+      authGenerationRef.current !== requestAuthGeneration ||
+      authUserUidRef.current !== requestUid;
     const controller = new AbortController();
     sessionRequestControllerRef.current = controller;
     setLoading(true);
@@ -489,60 +556,107 @@ export function AccountSessionProvider({ authUser = null, children }) {
       }, SESSION_REQUEST_TIMEOUT_MS);
     });
 
-    try {
-      const payload = await Promise.race([
-        (async () => {
-          const token = await authUser.getIdToken();
-          const response = await fetch(`${API_BASE_URL}/api/session`, {
-            headers: { Authorization: `Bearer ${token}` },
-            signal: controller.signal,
-          });
-          const responsePayload = await response.json().catch(() => ({}));
-          if (!response.ok) {
-            throw new Error(
-              responseMessage(
+    const request = (async () => {
+      try {
+        const payload = await Promise.race([
+          (async () => {
+            const token = await authUser.getIdToken();
+            const response = await fetch(`${API_BASE_URL}/api/session`, {
+              headers: { Authorization: `Bearer ${token}` },
+              signal: controller.signal,
+            });
+            const responseText = await response.text().catch(() => "");
+            const responsePayload =
+              parseBackendResponseText(responseText) || {};
+            if (!response.ok) {
+              const deletionDisposition = deletionSessionDisposition(
+                response.status,
                 responsePayload,
-                `Could not load account access (${response.status}).`
-              )
-            );
-          }
+                requestUid
+              );
+              if (deletionDisposition.invalidateSession) {
+                return {
+                  kind: "accepted-account-deletion",
+                  payload: responsePayload,
+                  deletionDisposition,
+                };
+              }
+              throw createBackendResponseError(responsePayload, {
+                status: response.status,
+                fallbackMessage: `Could not load account access (${response.status}).`,
+              });
+            }
 
-          return responsePayload;
-        })(),
-        timeoutPromise,
-      ]);
+            return { kind: "session", payload: responsePayload };
+          })(),
+          timeoutPromise,
+        ]);
 
-      if (sessionRequestGenerationRef.current !== requestGeneration) {
-        return null;
-      }
-
-      applySessionPayload(payload);
-      setError(null);
-      return payload;
-    } catch (nextError) {
-      if (sessionRequestGenerationRef.current !== requestGeneration) {
-        return null;
-      }
-
-      const errorToReport = timedOut
-        ? Object.assign(
-            new Error("Checking account access timed out. Please try again."),
-            { code: "SESSION_TIMEOUT" }
-          )
-        : nextError;
-      setError(errorToReport?.message || "Could not load account access.");
-      throw errorToReport;
-    } finally {
-      clearTimeout(timeoutId);
-      if (sessionRequestGenerationRef.current === requestGeneration) {
-        if (sessionRequestControllerRef.current === controller) {
-          sessionRequestControllerRef.current = null;
+        if (requestWasSuperseded()) {
+          return null;
         }
-        setInitialized(true);
-        setLoading(false);
+
+        if (payload?.kind === "accepted-account-deletion") {
+          // A deletion-like 410 always invalidates prior access immediately.
+          // Only an exact UID binding is allowed to trigger destructive local
+          // cleanup; malformed or misrouted responses remain on the closed
+          // session gate and surface a retryable verification error.
+          invalidateSessionAccess();
+          cancelConcurrentAccountWork();
+          if (!payload.deletionDisposition?.shouldPurge) {
+            const bindingError = new Error(
+              "The server returned account deletion for a different account."
+            );
+            bindingError.code = "ACCOUNT_DELETION_UID_MISMATCH";
+            setError(bindingError.message);
+            setInitialized(true);
+            setLoading(false);
+            return null;
+          }
+          await acceptRemoteAccountDeletion(payload.payload);
+          return null;
+        }
+
+        applySessionPayload(payload.payload);
+        setError(null);
+        return payload.payload;
+      } catch (nextError) {
+        if (requestWasSuperseded()) {
+          return null;
+        }
+
+        const errorToReport = timedOut
+          ? Object.assign(
+              new Error("Checking account access timed out. Please try again."),
+              { code: "SESSION_TIMEOUT" }
+            )
+          : nextError;
+        setError(errorToReport?.message || "Could not load account access.");
+        throw errorToReport;
+      } finally {
+        clearTimeout(timeoutId);
+        if (sessionRefreshPromiseRef.current === request) {
+          sessionRefreshPromiseRef.current = null;
+        }
+        if (!requestWasSuperseded()) {
+          if (sessionRequestControllerRef.current === controller) {
+            sessionRequestControllerRef.current = null;
+          }
+          setInitialized(true);
+          setLoading(false);
+        }
       }
-    }
-  }, [applySessionPayload, authUser]);
+    })();
+
+    sessionRefreshPromiseRef.current = request;
+    return request;
+  }, [
+    acceptRemoteAccountDeletion,
+    applySessionPayload,
+    authUser,
+    cancelConcurrentAccountWork,
+    invalidateSessionAccess,
+  ]);
 
   const verifyAppleEvidence = useCallback(
     async (envelope, source = "refresh", sessionPayload = sessionRef.current) => {
@@ -560,6 +674,10 @@ export function AccountSessionProvider({ authUser = null, children }) {
 
       const evidence = normalizeAppleEvidence(envelope, appAccountToken);
       if (!evidence.length) return null;
+      const verificationGeneration = authGenerationRef.current;
+      if (authUserUidRef.current !== authUserUid) {
+        throw supersededAppleRequestError();
+      }
 
       const fingerprint = `${authUserUid || ""}:${String(
         appAccountToken
@@ -576,6 +694,12 @@ export function AccountSessionProvider({ authUser = null, children }) {
               body: JSON.stringify({ source: normalizedSource, evidence }),
             }
           );
+          if (
+            authGenerationRef.current !== verificationGeneration ||
+            authUserUidRef.current !== authUserUid
+          ) {
+            throw supersededAppleRequestError();
+          }
 
           if (result?.session) applySessionPayload(result.session);
 
@@ -600,12 +724,31 @@ export function AccountSessionProvider({ authUser = null, children }) {
           if (acceptedTransactionIds.length) {
             await finishTransactions(acceptedTransactionIds);
           }
-          await refreshLocalAppleSubscription().catch(() => null);
-          if (!result?.session) await refreshSession();
-          if (mountedRef.current) setAppleError(null);
+          const fallbackSession = result?.session
+            ? null
+            : await refreshSession();
+          if (
+            authGenerationRef.current === verificationGeneration &&
+            authUserUidRef.current === authUserUid &&
+            (result?.session || fallbackSession)
+          ) {
+            appleLastReconciledAtRef.current = Date.now();
+          }
+          if (
+            mountedRef.current &&
+            authGenerationRef.current === verificationGeneration &&
+            authUserUidRef.current === authUserUid
+          ) {
+            setAppleError(null);
+          }
           return result;
         } catch (nextError) {
-          if (mountedRef.current && !isSupersededAppleRequest(nextError)) {
+          if (
+            mountedRef.current &&
+            authGenerationRef.current === verificationGeneration &&
+            authUserUidRef.current === authUserUid &&
+            !isSupersededAppleRequest(nextError)
+          ) {
             setAppleError(
               nextError?.message || "Could not verify the Apple subscription."
             );
@@ -628,27 +771,41 @@ export function AccountSessionProvider({ authUser = null, children }) {
       authUserUid,
       authenticatedAppleRequest,
       finishTransactions,
-      refreshLocalAppleSubscription,
       refreshSession,
     ]
   );
 
   const refreshServerAppleEntitlement = useCallback(async () => {
+    const requestGeneration = authGenerationRef.current;
     const result = await authenticatedAppleRequest(
       "/api/subscriptions/apple/refresh",
       { method: "POST" }
     );
+    if (authGenerationRef.current !== requestGeneration) {
+      throw supersededAppleRequestError();
+    }
     if (result?.session) {
       applySessionPayload(result.session);
+      if (authGenerationRef.current === requestGeneration) {
+        appleLastReconciledAtRef.current = Date.now();
+      }
       return result.session;
     }
-    return refreshSession();
+    const refreshedSession = await refreshSession();
+    if (
+      refreshedSession &&
+      authGenerationRef.current === requestGeneration
+    ) {
+      appleLastReconciledAtRef.current = Date.now();
+    }
+    return refreshedSession;
   }, [applySessionPayload, authenticatedAppleRequest, refreshSession]);
 
   const reconcileAppleSubscription = useCallback(
     async (
       sessionPayload = sessionRef.current,
-      operationAlreadyAcquired = false
+      operationAlreadyAcquired = false,
+      refreshLocalStatus = false
     ) => {
       const apple = sessionPayload?.apple;
       if (
@@ -658,6 +815,8 @@ export function AccountSessionProvider({ authUser = null, children }) {
       ) {
         return null;
       }
+      const reconciliationUid = authUserUid;
+      const reconciliationGeneration = authGenerationRef.current;
 
       let releaseOperation = null;
       if (operationAlreadyAcquired) {
@@ -686,8 +845,17 @@ export function AccountSessionProvider({ authUser = null, children }) {
           refreshedSession = verification?.session || sessionRef.current;
         } else {
           refreshedSession = await refreshServerAppleEntitlement();
-          await refreshLocalAppleSubscription().catch(() => null);
+          if (refreshLocalStatus) {
+            await refreshLocalAppleSubscription().catch(() => null);
+          }
         }
+        if (
+          authGenerationRef.current !== reconciliationGeneration ||
+          authUserUidRef.current !== reconciliationUid
+        ) {
+          throw supersededAppleRequestError();
+        }
+        appleLastReconciledAtRef.current = Date.now();
         if (mountedRef.current) setAppleError(null);
         return refreshedSession;
       } finally {
@@ -696,12 +864,48 @@ export function AccountSessionProvider({ authUser = null, children }) {
     },
     [
       acquireAccountOperation,
+      authUserUid,
       configureProductCatalog,
       getUnfinishedTransactions,
       refreshLocalAppleSubscription,
       refreshServerAppleEntitlement,
       verifyAppleEvidence,
     ]
+  );
+
+  const reconcileAppleSubscriptionInBackground = useCallback(
+    (sessionPayload = sessionRef.current, options = {}) => {
+      const apple = sessionPayload?.apple;
+      if (
+        Platform.OS !== "ios" ||
+        apple?.enabled !== true ||
+        !apple?.appAccountToken
+      ) {
+        return Promise.resolve(null);
+      }
+
+      const inFlight = appleBackgroundReconciliationPromiseRef.current;
+      if (inFlight) return inFlight;
+
+      if (
+        options?.force !== true &&
+        isRefreshFresh(
+          appleLastReconciledAtRef.current,
+          APPLE_FOREGROUND_MAX_AGE_MS
+        )
+      ) {
+        return Promise.resolve(sessionRef.current);
+      }
+
+      const request = reconcileAppleSubscription(sessionPayload).finally(() => {
+        if (appleBackgroundReconciliationPromiseRef.current === request) {
+          appleBackgroundReconciliationPromiseRef.current = null;
+        }
+      });
+      appleBackgroundReconciliationPromiseRef.current = request;
+      return request;
+    },
+    [reconcileAppleSubscription]
   );
 
   const purchaseApplePlan = useCallback(
@@ -812,7 +1016,6 @@ export function AccountSessionProvider({ authUser = null, children }) {
         ? await verifyAppleEvidence(accountEnvelope, "restore", sessionPayload)
         : null;
       if (!verification) await refreshServerAppleEntitlement();
-      await refreshLocalAppleSubscription().catch(() => null);
       return {
         ...envelope,
         evidence: accountEnvelope.evidence,
@@ -830,7 +1033,6 @@ export function AccountSessionProvider({ authUser = null, children }) {
     acquireAccountOperation,
     authUserUid,
     configureProductCatalog,
-    refreshLocalAppleSubscription,
     refreshServerAppleEntitlement,
     restorePurchases,
     verifyAppleEvidence,
@@ -843,6 +1045,7 @@ export function AccountSessionProvider({ authUser = null, children }) {
       const refreshedSession = await refreshSession();
       return await reconcileAppleSubscription(
         refreshedSession || sessionRef.current,
+        true,
         true
       );
     } catch (nextError) {
@@ -867,6 +1070,8 @@ export function AccountSessionProvider({ authUser = null, children }) {
       sessionRequestGenerationRef.current += 1;
       sessionRequestControllerRef.current?.abort();
       sessionRequestControllerRef.current = null;
+      sessionRefreshPromiseRef.current = null;
+      appleBackgroundReconciliationPromiseRef.current = null;
       for (const controller of appleRequestControllers) {
         controller.abort();
       }
@@ -935,6 +1140,8 @@ export function AccountSessionProvider({ authUser = null, children }) {
     sessionRequestGenerationRef.current += 1;
     sessionRequestControllerRef.current?.abort();
     sessionRequestControllerRef.current = null;
+    sessionRefreshPromiseRef.current = null;
+    sessionLastRefreshedAtRef.current = 0;
     for (const controller of appleRequestControllersRef.current) {
       controller.abort();
     }
@@ -943,6 +1150,8 @@ export function AccountSessionProvider({ authUser = null, children }) {
     accountOperationLeaseRef.current = null;
     sessionRef.current = null;
     appleBootstrapKeyRef.current = null;
+    appleBackgroundReconciliationPromiseRef.current = null;
+    appleLastReconciledAtRef.current = 0;
   }, [authUserUid]);
 
   useEffect(() => {
@@ -986,20 +1195,22 @@ export function AccountSessionProvider({ authUser = null, children }) {
     appleBootstrapKeyRef.current = bootstrapKey;
 
     const bootstrapTimer = setTimeout(() => {
-      reconcileAppleSubscription(session).catch((nextError) => {
-        if (
-          mountedRef.current &&
-          !isSupersededAppleRequest(nextError) &&
-          nextError?.code !== "ACCOUNT_OPERATION_IN_PROGRESS"
-        ) {
-          setAppleError(
-            nextError?.message || "Could not verify the Apple subscription."
-          );
+      reconcileAppleSubscriptionInBackground(session, { force: true }).catch(
+        (nextError) => {
+          if (
+            mountedRef.current &&
+            !isSupersededAppleRequest(nextError) &&
+            nextError?.code !== "ACCOUNT_OPERATION_IN_PROGRESS"
+          ) {
+            setAppleError(
+              nextError?.message || "Could not verify the Apple subscription."
+            );
+          }
         }
-      });
+      );
     }, 0);
     return () => clearTimeout(bootstrapTimer);
-  }, [authUserUid, reconcileAppleSubscription, session]);
+  }, [authUserUid, reconcileAppleSubscriptionInBackground, session]);
 
   useEffect(() => {
     if (
@@ -1052,16 +1263,18 @@ export function AccountSessionProvider({ authUser = null, children }) {
         previousState = nextState;
         if (!becameActive) return;
 
-        refreshSession()
+        refreshSession({ maxAgeMs: SESSION_FOREGROUND_MAX_AGE_MS })
           .then((refreshedSession) =>
-            reconcileAppleSubscription(refreshedSession || sessionRef.current)
+            reconcileAppleSubscriptionInBackground(
+              refreshedSession || sessionRef.current
+            )
           )
           .catch(() => {});
       }
     );
 
     return () => appStateSubscription.remove();
-  }, [authUser, reconcileAppleSubscription, refreshSession]);
+  }, [authUser, reconcileAppleSubscriptionInBackground, refreshSession]);
 
   const applePlans = useMemo(
     () => mergeApplePlans(session, storeKitProducts),

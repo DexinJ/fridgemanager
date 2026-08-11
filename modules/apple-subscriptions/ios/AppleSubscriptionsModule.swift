@@ -118,7 +118,10 @@ public final class AppleSubscriptionsModule: Module {
       let unfinishedIDs = await Self.unfinishedTransactionIDs(
         productIDs: normalizedIDs
       )
-      let snapshot = await Self.makeSnapshot(productIDs: normalizedIDs)
+      let snapshot = await Self.makeSnapshot(
+        productIDs: normalizedIDs,
+        includeTransactionHistory: true
+      )
       return Self.outcome(
         "restored",
         evidence: evidence,
@@ -446,18 +449,26 @@ public final class AppleSubscriptionsModule: Module {
     product: Product,
     appAccountToken: UUID
   ) async throws -> Product.PurchaseResult {
-    let windowScenes = UIApplication.shared.connectedScenes
-      .compactMap { $0 as? UIWindowScene }
-    guard let windowScene = windowScenes.first(where: {
-      $0.activationState == .foregroundActive
-    }) ?? windowScenes.first else {
-      throw AppleSubscriptionBridgeError.noActiveWindowScene
+    let options: Set<Product.PurchaseOption> = [
+      .appAccountToken(appAccountToken)
+    ]
+
+    if #available(iOS 17.0, *) {
+      let windowScenes = UIApplication.shared.connectedScenes
+        .compactMap { $0 as? UIWindowScene }
+      guard let windowScene = windowScenes.first(where: {
+        $0.activationState == .foregroundActive
+      }) ?? windowScenes.first else {
+        throw AppleSubscriptionBridgeError.noActiveWindowScene
+      }
+
+      return try await product.purchase(
+        confirmIn: windowScene,
+        options: options
+      )
     }
 
-    return try await product.purchase(
-      confirmIn: windowScene,
-      options: [.appAccountToken(appAccountToken)]
-    )
+    return try await product.purchase(options: options)
   }
 
   private static func makeEvidence(
@@ -668,38 +679,19 @@ public final class AppleSubscriptionsModule: Module {
     }
   }
 
-  private static func makeSnapshot(productIDs: [String]) async -> [String: Any] {
-    var discoveredProductIDs = Set(productIDs)
-    var latestTransactionsByGroup: [String: StoreKit.Transaction] = [:]
-    var sawUnverifiedSubscription = false
-
-    for await verificationResult in StoreKit.Transaction.all {
-      let transaction: StoreKit.Transaction
-      switch verificationResult {
-      case .verified(let verifiedTransaction):
-        transaction = verifiedTransaction
-      case .unverified(let unverifiedTransaction, _):
-        transaction = unverifiedTransaction
-        if transaction.productType == .autoRenewable {
-          sawUnverifiedSubscription = true
-        }
-      }
-
-      guard transaction.productType == .autoRenewable else {
-        continue
-      }
-
-      discoveredProductIDs.insert(transaction.productID)
-      guard let groupID = transaction.subscriptionGroupID else {
-        continue
-      }
-
-      if let current = latestTransactionsByGroup[groupID],
-         current.purchaseDate >= transaction.purchaseDate {
-        continue
-      }
-      latestTransactionsByGroup[groupID] = transaction
-    }
+  private static func makeSnapshot(
+    productIDs: [String],
+    includeTransactionHistory: Bool = false
+  ) async -> [String: Any] {
+    let transactionDiscovery = await discoverSubscriptionTransactions(
+      productIDs: productIDs,
+      includeTransactionHistory: includeTransactionHistory
+    )
+    let discoveredProductIDs = transactionDiscovery.productIDs
+    let latestTransactionsByGroup =
+      transactionDiscovery.latestTransactionsByGroup
+    let sawUnverifiedSubscription =
+      transactionDiscovery.sawUnverifiedSubscription
 
     var productMetadata: [String: SubscriptionProductMetadata] = [:]
     var productsByGroup: [String: Product] = [:]
@@ -833,6 +825,31 @@ public final class AppleSubscriptionsModule: Module {
     ]
   }
 
+  private static func discoverSubscriptionTransactions(
+    productIDs: [String],
+    includeTransactionHistory: Bool
+  ) async -> SubscriptionTransactionDiscovery {
+    var discovery = SubscriptionTransactionDiscovery(productIDs: productIDs)
+
+    if includeTransactionHistory {
+      // Restore is an explicit, infrequent operation where historical product
+      // discovery is useful, so paying for the complete transaction sequence is
+      // intentional.
+      for await verificationResult in StoreKit.Transaction.all {
+        discovery.include(verificationResult)
+      }
+    } else {
+      // Routine listener, foreground, purchase, and status snapshots need only
+      // current entitlements. Configured Product.subscription.status calls below
+      // still retain expired/retry/grace details for the active catalog.
+      for await verificationResult in StoreKit.Transaction.currentEntitlements {
+        discovery.include(verificationResult)
+      }
+    }
+
+    return discovery
+  }
+
   private static func deduplicatedAndSorted(
     _ records: [SubscriptionRecord]
   ) -> [SubscriptionRecord] {
@@ -902,6 +919,46 @@ private struct SubscriptionProductMetadata {
   let displayName: String
   let groupID: String
   let groupLevel: Int
+}
+
+private struct SubscriptionTransactionDiscovery {
+  var productIDs: Set<String>
+  var latestTransactionsByGroup: [String: StoreKit.Transaction] = [:]
+  var sawUnverifiedSubscription = false
+
+  init(productIDs: [String]) {
+    self.productIDs = Set(productIDs)
+  }
+
+  mutating func include(
+    _ verificationResult: VerificationResult<StoreKit.Transaction>
+  ) {
+    let transaction: StoreKit.Transaction
+    switch verificationResult {
+    case .verified(let verifiedTransaction):
+      transaction = verifiedTransaction
+    case .unverified(let unverifiedTransaction, _):
+      transaction = unverifiedTransaction
+      if transaction.productType == .autoRenewable {
+        sawUnverifiedSubscription = true
+      }
+    }
+
+    guard transaction.productType == .autoRenewable else {
+      return
+    }
+
+    productIDs.insert(transaction.productID)
+    guard let groupID = transaction.subscriptionGroupID else {
+      return
+    }
+
+    if let current = latestTransactionsByGroup[groupID],
+       current.purchaseDate >= transaction.purchaseDate {
+      return
+    }
+    latestTransactionsByGroup[groupID] = transaction
+  }
 }
 
 private struct SubscriptionRecord {

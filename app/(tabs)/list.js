@@ -3,8 +3,9 @@
 // It only adds search UI + filtering + sort-sheet modal (optional but matches your pattern).
 
 import { Ionicons } from "@expo/vector-icons";
-import { useNavigation } from "expo-router";
+import { useFocusEffect, useNavigation } from "expo-router";
 import React, {
+  memo,
   useCallback,
   useContext,
   useEffect,
@@ -48,12 +49,97 @@ const SORT_ITEMS = [
 
 const norm = (s) => String(s || "").trim().toLowerCase();
 
+const ShoppingListRow = memo(function ShoppingListRow({
+  item,
+  isChecked,
+  editMode,
+  theme,
+  fontSize,
+  onToggle,
+  onRightAction,
+}) {
+  const quantity = String(item?.quantity ?? "");
+  return (
+    <View style={styles.itemRow}>
+      <TouchableOpacity
+        style={[styles.item, { backgroundColor: theme.shoppingItemBackground }]}
+        onPress={() => onToggle(item.id)}
+      >
+        <Ionicons
+          name={isChecked ? "checkbox" : "square-outline"}
+          size={fontSize}
+          color={isChecked ? theme.actionButton : theme.textSecondary}
+        />
+        <View style={{ flex: 1, marginLeft: 10 }}>
+          <Text
+            style={[
+              styles.itemTitle,
+              { fontSize: fontSize * 1.02, color: theme.text },
+              isChecked && {
+                textDecorationLine: "line-through",
+                color: theme.shoppingCheckedText,
+              },
+            ]}
+            numberOfLines={1}
+            ellipsizeMode="tail"
+          >
+            {item.name}
+          </Text>
+        </View>
+        {!!quantity && (
+          <View
+            style={[
+              styles.qtyPill,
+              {
+                borderColor: theme.border,
+                backgroundColor: theme.inputBackground,
+              },
+            ]}
+          >
+            <Text
+              style={[
+                styles.qtyText,
+                {
+                  fontSize: Math.max(12, fontSize * 0.85),
+                  color: theme.textSecondary,
+                },
+                isChecked && { color: theme.shoppingCheckedText },
+              ]}
+              numberOfLines={1}
+            >
+              {quantity}
+            </Text>
+          </View>
+        )}
+        <TouchableOpacity
+          onPress={() => onRightAction(item)}
+          activeOpacity={0.7}
+          style={[
+            styles.rightActionButton,
+            {
+              borderColor: editMode ? "transparent" : theme.border,
+              backgroundColor: editMode ? theme.danger : "transparent",
+            },
+          ]}
+        >
+          <Ionicons
+            name={editMode ? "trash" : "ellipsis-horizontal"}
+            size={fontSize * 1.1}
+            color={editMode ? "#fff" : theme.textSecondary}
+          />
+        </TouchableOpacity>
+      </TouchableOpacity>
+    </View>
+  );
+});
+
 export default function ShoppingListScreen() {
   const {
     shoppingListItems,
     addToShoppingList,
     removeFromShoppingList,
-    addToFridge,
+    addManyToFridge,
+    removeManyFromShoppingList,
     editShoppingListItem,
     settings,
     theme,
@@ -113,21 +199,24 @@ export default function ShoppingListScreen() {
     []
   );
 
-  useEffect(() => {
-    const showSub = Keyboard.addListener(
-      Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow",
-      () => setKeyboardVisible(true)
-    );
-    const hideSub = Keyboard.addListener(
-      Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide",
-      () => setKeyboardVisible(false)
-    );
+  useFocusEffect(
+    useCallback(() => {
+      const showSub = Keyboard.addListener(
+        Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow",
+        () => setKeyboardVisible(true)
+      );
+      const hideSub = Keyboard.addListener(
+        Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide",
+        () => setKeyboardVisible(false)
+      );
 
-    return () => {
-      showSub.remove();
-      hideSub.remove();
-    };
-  }, []);
+      return () => {
+        showSub.remove();
+        hideSub.remove();
+        setKeyboardVisible(false);
+      };
+    }, [])
+  );
 
   // ---------------------------------------
   // ✅ OPTIONAL: keep list tidy
@@ -144,16 +233,20 @@ export default function ShoppingListScreen() {
   const FOOD_TYPE_TAGS = useMemo(() => {
     return (Array.isArray(tags) ? tags : []).filter((t) => t?.type === "food_type");
   }, [tags]);
+  const foodTypeLabelById = useMemo(
+    () => new Map(FOOD_TYPE_TAGS.map((tag) => [tag.id, tag.label])),
+    [FOOD_TYPE_TAGS]
+  );
 
   const normalizeCategoriesArg = (labelOrNull) => {
     return labelOrNull ? [labelOrNull] : [];
   };
 
-  const getItemCategoryLabel = useCallback((item) => {
+  const deriveItemCategoryLabel = useCallback((item) => {
     const ids = Array.isArray(item?.tagIds) ? item.tagIds : [];
-    if (ids.length && FOOD_TYPE_TAGS.length) {
-      const firstFoodType = FOOD_TYPE_TAGS.find((t) => ids.includes(t.id));
-      if (firstFoodType?.label) return firstFoodType.label;
+    for (const id of ids) {
+      const label = foodTypeLabelById.get(id);
+      if (label) return label;
     }
 
     const v =
@@ -166,7 +259,26 @@ export default function ShoppingListScreen() {
       item?.aisle ||
       "";
     return typeof v === "string" && v.trim() ? v.trim() : "Uncategorized";
-  }, [FOOD_TYPE_TAGS]);
+  }, [foodTypeLabelById]);
+  const categoryByItemId = useMemo(
+    () => new Map(
+      (Array.isArray(shoppingListItems) ? shoppingListItems : [])
+        .map((item) => [item?.id, deriveItemCategoryLabel(item)])
+    ),
+    [deriveItemCategoryLabel, shoppingListItems]
+  );
+  const getItemCategoryLabel = useCallback(
+    (item) => categoryByItemId.get(item?.id) || deriveItemCategoryLabel(item),
+    [categoryByItemId, deriveItemCategoryLabel]
+  );
+  const categoryCounts = useMemo(() => {
+    const counts = new Map();
+    for (const item of Array.isArray(shoppingListItems) ? shoppingListItems : []) {
+      const category = categoryByItemId.get(item?.id) || deriveItemCategoryLabel(item);
+      counts.set(category, (counts.get(category) || 0) + 1);
+    }
+    return counts;
+  }, [categoryByItemId, deriveItemCategoryLabel, shoppingListItems]);
 
   const handleAdd = () => {
     if (
@@ -193,23 +305,19 @@ export default function ShoppingListScreen() {
     }
   };
 
-  const toggleCheck = (id) => {
+  const toggleCheck = useCallback((id) => {
     setCheckedItems((prev) => ({ ...prev, [id]: !prev[id] }));
-  };
+  }, []);
 
   const handleDoneShopping = () => {
     if (transferLockedRef.current) return;
     transferLockedRef.current = true;
 
     try {
-      const items = Array.isArray(shoppingListItems) ? shoppingListItems : [];
-      items.forEach((item) => {
-        if (checkedItems[item.id]) {
-          const categories = Array.isArray(item.tagIds) ? item.tagIds : [];
-          addToFridge(item.name, item.quantity, categories);
-          removeFromShoppingList(item.id);
-        }
-      });
+      const items = (Array.isArray(shoppingListItems) ? shoppingListItems : [])
+        .filter((item) => checkedItems[item.id]);
+      addManyToFridge(items);
+      removeManyFromShoppingList(items.map((item) => item.id));
       setCheckedItems({});
     } catch (error) {
       transferLockedRef.current = false;
@@ -221,21 +329,14 @@ export default function ShoppingListScreen() {
     const ids = Object.keys(checkedItems).filter((id) => checkedItems[id]);
     if (ids.length === 0) return;
 
-    ids.forEach((id) => removeFromShoppingList(id));
+    removeManyFromShoppingList(ids);
     setCheckedItems({});
-  }, [checkedItems, removeFromShoppingList]);
+  }, [checkedItems, removeManyFromShoppingList]);
 
   // -------------------------
   // Pills: only show categories that have items
   // -------------------------
   const categoryPills = useMemo(() => {
-    const counts = new Map();
-    for (const it of shoppingListItems) {
-      const cat = getItemCategoryLabel(it);
-      if (!cat) continue;
-      counts.set(cat, (counts.get(cat) || 0) + 1);
-    }
-
     const fromPreset = FOOD_TYPE_TAGS.map((t) => t.label).filter(Boolean);
 
     const raw =
@@ -249,9 +350,9 @@ export default function ShoppingListScreen() {
       .filter(Boolean);
 
     const merged = Array.from(new Set([...fromPreset, ...cleaned]));
-    const present = merged.filter((label) => (counts.get(label) || 0) > 0);
+    const present = merged.filter((label) => (categoryCounts.get(label) || 0) > 0);
 
-    if ((counts.get("Uncategorized") || 0) > 0 && !present.includes("Uncategorized")) {
+    if ((categoryCounts.get("Uncategorized") || 0) > 0 && !present.includes("Uncategorized")) {
       present.push("Uncategorized");
     }
 
@@ -264,22 +365,16 @@ export default function ShoppingListScreen() {
     });
 
     return ["All", ...present];
-  }, [shoppingListItems, FOOD_TYPE_TAGS, getItemCategoryLabel, tags]);
+  }, [categoryCounts, FOOD_TYPE_TAGS, tags]);
 
   // ✅ NEW: tabs include counts (optional but nice)
   const categoryTabs = useMemo(() => {
-    const counts = new Map();
-    for (const it of shoppingListItems) {
-      const c = getItemCategoryLabel(it);
-      counts.set(c, (counts.get(c) || 0) + 1);
-    }
-
     return categoryPills.map((label) => ({
       key: label,
       label,
-      count: label === "All" ? shoppingListItems.length : (counts.get(label) || 0),
+      count: label === "All" ? shoppingListItems.length : (categoryCounts.get(label) || 0),
     }));
-  }, [categoryPills, getItemCategoryLabel, shoppingListItems]);
+  }, [categoryCounts, categoryPills, shoppingListItems.length]);
 
   const effectiveActiveCategory = categoryPills.includes(activeCategory)
     ? activeCategory
@@ -428,13 +523,13 @@ export default function ShoppingListScreen() {
   // -----------------------------
   // ✅ open modal + prefill category
   // -----------------------------
-  const openItemMenu = (item) => {
+  const openItemMenu = useCallback((item) => {
     setActiveItem(item);
     setEditName(String(item?.name ?? ""));
     setEditQty(String(item?.quantity ?? ""));
     setEditCategory(getItemCategoryLabel(item));
     setItemMenuVisible(true);
-  };
+  }, [getItemCategoryLabel]);
 
   const closeItemMenu = () => {
     setItemMenuVisible(false);
@@ -465,78 +560,34 @@ export default function ShoppingListScreen() {
   // -----------------------------
   // ✅ Row
   // -----------------------------
-  const renderRow = ({ item }) => {
-    const qty = String(item?.quantity ?? "");
-    const isChecked = !!checkedItems[item.id];
-
-    const onRightActionPress = () => {
+  const handleRowRightAction = useCallback(
+    (item) => {
       if (editMode) removeFromShoppingList(item.id);
       else openItemMenu(item);
-    };
-
-    return (
-      <View style={styles.itemRow}>
-        <TouchableOpacity
-          style={[styles.item, { backgroundColor: theme.shoppingItemBackground }]}
-          onPress={() => toggleCheck(item.id)}
-          disabled={false}
-        >
-          <Ionicons
-            name={isChecked ? "checkbox" : "square-outline"}
-            size={fontSize}
-            color={isChecked ? theme.actionButton : theme.textSecondary}
-          />
-
-          <View style={{ flex: 1, marginLeft: 10 }}>
-            <Text
-              style={[
-                styles.itemTitle,
-                { fontSize: fontSize * 1.02, color: theme.text },
-                isChecked && { textDecorationLine: "line-through", color: theme.shoppingCheckedText },
-              ]}
-              numberOfLines={1}
-              ellipsizeMode="tail"
-            >
-              {item.name}
-            </Text>
-          </View>
-
-          {!!qty && (
-            <View style={[styles.qtyPill, { borderColor: theme.border, backgroundColor: theme.inputBackground }]}>
-              <Text
-                style={[
-                  styles.qtyText,
-                  { fontSize: Math.max(12, fontSize * 0.85), color: theme.textSecondary },
-                  isChecked && { color: theme.shoppingCheckedText },
-                ]}
-                numberOfLines={1}
-              >
-                {qty}
-              </Text>
-            </View>
-          )}
-
-          <TouchableOpacity
-            onPress={onRightActionPress}
-            activeOpacity={0.7}
-            style={[
-              styles.rightActionButton,
-              {
-                borderColor: editMode ? "transparent" : theme.border,
-                backgroundColor: editMode ? theme.danger : "transparent",
-              },
-            ]}
-          >
-            <Ionicons
-              name={editMode ? "trash" : "ellipsis-horizontal"}
-              size={fontSize * 1.1}
-              color={editMode ? "#fff" : theme.textSecondary}
-            />
-          </TouchableOpacity>
-        </TouchableOpacity>
-      </View>
-    );
-  };
+    },
+    [editMode, openItemMenu, removeFromShoppingList]
+  );
+  const renderRow = useCallback(
+    ({ item }) => (
+      <ShoppingListRow
+        item={item}
+        isChecked={Boolean(checkedItems[item.id])}
+        editMode={editMode}
+        theme={theme}
+        fontSize={fontSize}
+        onToggle={toggleCheck}
+        onRightAction={handleRowRightAction}
+      />
+    ),
+    [
+      checkedItems,
+      editMode,
+      fontSize,
+      handleRowRightAction,
+      theme,
+      toggleCheck,
+    ]
+  );
 
   const categoryOptions = useMemo(() => {
     const preset = FOOD_TYPE_TAGS.map((t) => t.label).filter(Boolean);

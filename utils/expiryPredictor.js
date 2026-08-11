@@ -2,20 +2,48 @@
 // Purpose: infer expiresAt when user doesn't provide one, based on tags.
 // Pure utilities; GlobalContext can call predictExpiresAtIso(...)
 
-const MS_PER_DAY = 86400000;
-
 const norm = (s) => String(s || "").trim().toLowerCase();
+
+function dateOnlyToEndOfDayIso(value) {
+  const match = String(value || "").trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]) - 1;
+  const day = Number(match[3]);
+  const date = new Date(year, month, day, 23, 59, 59, 999);
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month ||
+    date.getDate() !== day
+  ) {
+    return null;
+  }
+  return date.toISOString();
+}
 
 export function addDaysIso(baseIso, days) {
   const base = new Date(baseIso);
   if (Number.isNaN(base.getTime())) return null;
-  return new Date(base.getTime() + Number(days || 0) * MS_PER_DAY).toISOString();
+  const normalizedDays = Number(days || 0);
+  if (!Number.isFinite(normalizedDays)) return null;
+  const expiration = new Date(
+    base.getFullYear(),
+    base.getMonth(),
+    base.getDate() + Math.round(normalizedDays),
+    23,
+    59,
+    59,
+    999
+  );
+  return Number.isNaN(expiration.getTime()) ? null : expiration.toISOString();
 }
 
 export function toIsoOrNull(input) {
   if (input === null || input === undefined || input === "") return null;
 
   if (typeof input === "string") {
+    const calendarDate = dateOnlyToEndOfDayIso(input);
+    if (calendarDate) return calendarDate;
     const d = new Date(input);
     return Number.isNaN(d.getTime()) ? null : d.toISOString();
   }

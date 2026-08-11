@@ -1,5 +1,5 @@
 import { Ionicons } from "@expo/vector-icons";
-import React, { useMemo, useRef } from "react";
+import React, { memo, useMemo, useRef } from "react";
 import { StyleSheet, Text, TouchableOpacity, View } from "react-native";
 
 /**
@@ -16,7 +16,7 @@ import { StyleSheet, Text, TouchableOpacity, View } from "react-native";
  * - metaText
  * - rightTopText
  */
-export default function InventoryListItem({
+function InventoryListItem({
   item,
   theme,
   fontSize = 16,
@@ -126,12 +126,19 @@ export default function InventoryListItem({
         onLongPress={handleLongPress}
         onPress={handlePress}
         style={[styles.card, { backgroundColor: bg, borderColor: border }]}
+        accessibilityRole={editMode ? "checkbox" : "button"}
+        accessibilityLabel={`${item?.name || "Item"}. ${computedSubtitle}. Quantity ${computedRightBottom || "not specified"}.`}
+        accessibilityState={editMode ? { checked: selected } : undefined}
+        accessibilityHint={editMode ? "Toggles this item selection." : "Opens item actions."}
       >
         {editMode && (
           <TouchableOpacity
             onPress={() => onToggleSelect?.(item?.id)}
             activeOpacity={0.8}
             style={styles.checkboxHit}
+            accessibilityRole="checkbox"
+            accessibilityLabel={`Select ${item?.name || "item"}`}
+            accessibilityState={{ checked: selected }}
           >
             <Ionicons
               name={selected ? "checkbox" : "square-outline"}
@@ -226,3 +233,5 @@ const styles = StyleSheet.create({
   },
   rightBottom: { fontWeight: "900" },
 });
+
+export default memo(InventoryListItem);

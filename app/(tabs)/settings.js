@@ -47,15 +47,15 @@ import {
 import { API_BASE_URL } from "../../api/backendConfig";
 import { fetchWithTimeout } from "../../api/fetchWithTimeout";
 import { clearChatData } from "../../api/memoryManager";
+import { requestReminderPermissions } from "../../api/reminderScheduler";
 import {
-  clearUserDataPurgePending,
-  confirmUserDataPurge,
-  markUserDataPurgePending,
-} from "../../api/storageKeys";
+  getAccountDeletionReauthenticationMethod,
+  reauthenticateForAccountDeletion,
+} from "../../auth/accountReauthentication";
 import { useAuth } from "../../auth/useAuth";
 import { HeaderWithHiddenButton } from "../../components/Header";
 import { useAccountSession } from "../../context/AccountSessionContext";
-import { GlobalContext } from "../../context/GlobalContext";
+import { ChatActionsContext, GlobalContext } from "../../context/GlobalContext";
 import { useAppleSubscription } from "../../context/SubscriptionContext";
 import {
   getAppleIntelligenceAvailability,
@@ -201,23 +201,6 @@ function validateCustomAiBaseUrl(value) {
   return normalized;
 }
 
-function incompleteLocalDeletionError(result) {
-  const details = Array.isArray(result?.errors)
-    ? result.errors.map((item) => item?.message).filter(Boolean).join(" ")
-    : "";
-  const error = new Error(
-    [
-      "The account was deleted, but some data could not be removed from this device. Pantrio will retry the cleanup automatically.",
-      details,
-    ]
-      .filter(Boolean)
-      .join(" ")
-  );
-  error.code = "LOCAL_ACCOUNT_CLEANUP_PENDING";
-  error.cleanupResult = result || null;
-  return error;
-}
-
 export default function SettingsScreen() {
   const {
     settings,
@@ -226,15 +209,14 @@ export default function SettingsScreen() {
     updateSetting,
     theme,
     clearAllData,
-    setMessages,
-    setSummary,
 
     // Urgency thresholds from GlobalContext
     urgencyDays,
     setUrgencyDays,
   } = useContext(GlobalContext);
+  const { setMessages, setSummary } = useContext(ChatActionsContext);
 
-  const { user, signOut, loggedIn, queuePostAuthNotice } = useAuth();
+  const { user, signOut, loggedIn, deleteAccount } = useAuth();
   const {
     subscription,
     loading: subscriptionLoading,
@@ -277,6 +259,8 @@ export default function SettingsScreen() {
   const [remindDays, setRemindDays] = useState(
     settings?.expiration?.remindDays ?? 5
   );
+  const [fontSizeDraft, setFontSizeDraft] = useState(null);
+  const displayedFontSize = fontSizeDraft ?? settings?.ux?.fontSize ?? 16;
 
   const [modalVisible, setModalVisible] = useState(false);
   const [tempName, setTempName] = useState(
@@ -284,6 +268,9 @@ export default function SettingsScreen() {
   );
   const [savingName, setSavingName] = useState(false);
   const [deletingAccount, setDeletingAccount] = useState(false);
+  const [deletePasswordModalVisible, setDeletePasswordModalVisible] =
+    useState(false);
+  const [deletePassword, setDeletePassword] = useState("");
   const [aiApiKey, setAiApiKey] = useState("");
   const [aiProviderSettingsBaseUrl, setAiProviderSettingsBaseUrl] = useState(null);
   const configuredAiBaseUrl =
@@ -541,6 +528,43 @@ export default function SettingsScreen() {
     }
   };
 
+  const updateReminderToggle = async (section, key, enabled) => {
+    if (!enabled) {
+      updateSetting(section, key, false);
+      return;
+    }
+
+    try {
+      const granted = await requestReminderPermissions();
+      if (!mountedRef.current) return;
+      if (!granted) {
+        updateSetting(section, key, false);
+        Alert.alert(
+          "Notifications are off",
+          "Allow notifications in your device settings before enabling Pantrio reminders.",
+          [
+            { text: "Not now", style: "cancel" },
+            {
+              text: "Open Settings",
+              onPress: () => Linking.openSettings().catch(() => {}),
+            },
+          ]
+        );
+        return;
+      }
+
+      updateSetting("notifications", "reminderPermissionRequested", true);
+      updateSetting(section, key, true);
+    } catch (error) {
+      if (!mountedRef.current) return;
+      updateSetting(section, key, false);
+      Alert.alert(
+        "Could not enable reminders",
+        error?.message || "Notification permission could not be requested."
+      );
+    }
+  };
+
   const categories = [
     { key: "user", title: "Account", icon: "person-outline" },
     { key: "ux", title: "Appearance", icon: "color-palette-outline" },
@@ -615,8 +639,16 @@ export default function SettingsScreen() {
 
     try {
       // Update backend.
-      await updateUsernameOnBackend(next);
-      if (mountedRef.current) setModalVisible(false);
+      const updatedProfile = await updateUsernameOnBackend(next);
+      const confirmedName = updatedProfile?.username || next;
+      const firstRefresh = await refreshSession({ maxAgeMs: 0 }).catch(() => null);
+      if (firstRefresh?.user?.username !== confirmedName) {
+        await refreshSession({ maxAgeMs: 0 }).catch(() => null);
+      }
+      if (mountedRef.current) {
+        updateSetting("user", "name", confirmedName);
+        setModalVisible(false);
+      }
     } catch (e) {
       if (!mountedRef.current) return;
       // Roll back local username if backend update fails.
@@ -688,6 +720,24 @@ export default function SettingsScreen() {
           "Open your Apple Account subscriptions in the App Store."
       );
     }
+  };
+
+  const handleCancelAppleSubscription = () => {
+    Alert.alert(
+      "Cancel Apple subscription?",
+      "Apple manages subscription cancellations. Pantrio will open Apple Subscriptions, where you can select Pantrio and confirm the cancellation.",
+      [
+        {
+          text: "Keep Subscription",
+          style: "cancel",
+        },
+        {
+          text: "Open Apple Subscriptions",
+          style: "destructive",
+          onPress: openAppleSubscriptions,
+        },
+      ]
+    );
   };
 
   const openLegalDocument = async (url, title) => {
@@ -776,199 +826,83 @@ export default function SettingsScreen() {
     }
   };
 
-  /**
-   * Sends an authenticated request to the backend.
-   *
-   * The backend should:
-   * 1. Verify the Firebase bearer token.
-   * 2. Ensure the route UID matches the token UID.
-   * 3. Delete the user's database rows.
-   * 4. Delete the Firebase Authentication account.
-   */
-  const deleteAccountFromBackend = async (
-    deletionUser,
-    { beforeRequest } = {}
-  ) => {
-    if (!deletionUser) {
-      throw new Error(
-        "You must be logged in to delete your account."
-      );
-    }
+  const performAccountDeletion = async ({ password } = {}) => {
+    if (!user || deletingAccount) return;
 
-    // Force-refresh the ID token before making this destructive request.
-    const token = await deletionUser.getIdToken(true);
-    await beforeRequest?.();
+    let releaseAccountOperation = null;
+    let deletionCoordinatorStarted = false;
+    try {
+      setDeletingAccount(true);
+      releaseAccountOperation = beginAccountTeardown("delete-account");
 
-    const resp = await fetchWithTimeout(
-      `${API_BASE_URL}/api/users/${encodeURIComponent(deletionUser.uid)}`,
-      {
-        method: "DELETE",
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      },
-      {
-        timeoutMs: 30000,
-        timeoutMessage:
-          "Account deletion timed out. Check your connection and try again.",
+      if (
+        !storageHydrated ||
+        !user.uid ||
+        storageOwnerUid !== user.uid
+      ) {
+        throw new Error(
+          "Local account data is still loading. Wait a moment and try again."
+        );
       }
-    );
 
-    const data = await resp.json().catch(() => ({}));
-
-    if (!resp.ok) {
-      const error = new Error(
-        data?.error || `Failed to delete account (${resp.status})`
-      );
-      error.status = resp.status;
-      // A 4xx response (other than an already-absent account) is a definitive
-      // rejection, so the pre-delete local purge marker can be removed safely.
-      error.accountDeletionRejected =
-        resp.status >= 400 && resp.status < 500 && resp.status !== 404;
-      throw error;
+      // Firebase and the backend both require recent authentication for this
+      // destructive operation. Apple confirmation also gives the backend one
+      // final fresh authorization code if the original link was interrupted.
+      await reauthenticateForAccountDeletion(user, { password });
+      deletionCoordinatorStarted = true;
+      await deleteAccount();
+    } catch (error) {
+      // Once deleteAccount starts, AuthProvider owns errors because this screen
+      // is intentionally unmounted by the root teardown guard.
+      if (mountedRef.current && !deletionCoordinatorStarted) {
+        Alert.alert(
+          error?.code === "auth/wrong-password" ||
+            error?.code === "auth/invalid-credential"
+            ? "Password not accepted"
+            : "Could not confirm deletion",
+          error?.message || "Sign in again and retry account deletion."
+        );
+      }
+    } finally {
+      releaseAccountOperation?.();
+      if (mountedRef.current) {
+        setDeletingAccount(false);
+        setDeletePassword("");
+        setDeletePasswordModalVisible(false);
+      }
     }
-
-    return data;
   };
 
   const handleDeleteAccount = () => {
-    if (!user || deletingAccount) {
-      return;
-    }
+    if (!user || deletingAccount) return;
 
     Alert.alert(
       "Delete account?",
       "This permanently deletes your Pantrio account and clears your fridge items, shopping list, chat history, and settings from this device. This cannot be undone.\n\nDeleting your Pantrio account does not cancel an Apple subscription. Manage or cancel it separately in Apple Subscriptions.",
       [
+        { text: "Cancel", style: "cancel" },
         {
-          text: "Cancel",
-          style: "cancel",
-        },
-        {
-          text: "Delete Account",
+          text: "Continue",
           style: "destructive",
-          onPress: async () => {
-            const deletionUser = user;
-            const deletionUid = deletionUser?.uid || null;
-            let releaseAccountOperation = null;
-            let purgeIntentMarked = false;
-            let backendDeleted = false;
-            let signOutCompleted = false;
-            try {
-              releaseAccountOperation = beginAccountTeardown("delete-account");
-              setDeletingAccount(true);
-
-              if (
-                !storageHydrated ||
-                !deletionUid ||
-                storageOwnerUid !== deletionUid
-              ) {
-                throw new Error(
-                  "Local account data is still loading. Wait a moment and try again."
-                );
-              }
-
-              // Delete the server profile and Firebase Auth user first.
-              await deleteAccountFromBackend(deletionUser, {
-                beforeRequest: async () => {
-                  await markUserDataPurgePending(deletionUid, {
-                    reason: "account-delete",
-                  });
-                  purgeIntentMarked = true;
-                },
-              });
-              backendDeleted = true;
-              await confirmUserDataPurge(deletionUid);
-
-              // clearAllData retains the durable marker unless every scoped
-              // AsyncStorage, SecureStore, and chat cleanup succeeds.
-              const cleanupResult = await Promise.resolve(clearAllData?.());
-              if (!cleanupResult || cleanupResult.ok !== true) {
-                throw incompleteLocalDeletionError(cleanupResult);
-              }
-
-              /*
-               * The Firebase account was already deleted by the backend.
-               * Calling signOut clears any remaining local Firebase session.
-               */
-              const signOutResult = await signOut?.({
-                revokeProviderAccess: true,
-              });
-              signOutCompleted = true;
-              if (signOutResult?.providerCleanupError) {
-                console.warn(
-                  "[delete account] native provider cleanup warning",
-                  signOutResult.providerCleanupError
-                );
-              }
-            } catch (e) {
-              console.error("[delete account]", e);
-
-              if (
-                purgeIntentMarked &&
-                !backendDeleted &&
-                e?.accountDeletionRejected
-              ) {
-                await clearUserDataPurgePending(deletionUid).catch(
-                  (markerError) => {
-                    console.error(
-                      "[delete account] could not clear rejected-delete purge marker",
-                      markerError
-                    );
-                  }
-                );
-              }
-
-              // The backend account is already gone. Always complete local
-              // Firebase logout; an incomplete data purge remains marked for
-              // the startup retry path.
-              if (backendDeleted && !signOutCompleted) {
-                try {
-                  const signOutResult = await signOut?.({
-                    revokeProviderAccess: true,
-                  });
-                  signOutCompleted = true;
-                  if (signOutResult?.providerCleanupError) {
-                    console.warn(
-                      "[delete account] native provider cleanup warning",
-                      signOutResult.providerCleanupError
-                    );
-                  }
-                } catch (signOutError) {
-                  console.error(
-                    "[delete account] local sign-out failed",
-                    signOutError
+          onPress: () => {
+            void getAccountDeletionReauthenticationMethod(user)
+              .then((method) => {
+                if (!mountedRef.current) return;
+                if (method === "password") {
+                  setDeletePassword("");
+                  setDeletePasswordModalVisible(true);
+                  return;
+                }
+                void performAccountDeletion();
+              })
+              .catch((error) => {
+                if (mountedRef.current) {
+                  Alert.alert(
+                    "Could not confirm sign-in",
+                    error?.message || "Try signing in again."
                   );
                 }
-              }
-
-              const alertTitle = backendDeleted
-                ? "Account deleted"
-                : e?.code === "ACCOUNT_OPERATION_IN_PROGRESS"
-                  ? "Action in progress"
-                  : "Delete failed";
-              const alertMessage =
-                e?.message || "Could not delete your account.";
-
-              if (backendDeleted && signOutCompleted) {
-                // The root auth provider survives the protected-route switch
-                // and presents this only after the sign-in stack is stable.
-                queuePostAuthNotice({
-                  title: alertTitle,
-                  message: alertMessage,
-                });
-              } else if (mountedRef.current) {
-                Alert.alert(alertTitle, alertMessage);
-              } else if (backendDeleted) {
-                queuePostAuthNotice({
-                  title: alertTitle,
-                  message: alertMessage,
-                });
-              }
-            } finally {
-              if (mountedRef.current) setDeletingAccount(false);
-              releaseAccountOperation?.();
-            }
+              });
           },
         },
       ]
@@ -1712,6 +1646,14 @@ export default function SettingsScreen() {
                 fontSize={fontSize}
                 color={theme.accent}
               />
+              {subscription?.willAutoRenew ? (
+                <CustomButton
+                  title="Cancel Subscription"
+                  onPress={handleCancelAppleSubscription}
+                  fontSize={fontSize}
+                  color={theme.danger}
+                />
+              ) : null}
               <Text style={stylesWithFont.subscriptionFootnote}>
                 Purchases are linked with an anonymous account token. Pantrio
                 never receives your Apple Account email or password.
@@ -1885,6 +1827,77 @@ export default function SettingsScreen() {
                 </View>
               </View>
             </Modal>
+
+            <Modal
+              visible={deletePasswordModalVisible}
+              animationType="fade"
+              transparent
+              onRequestClose={() => {
+                if (!deletingAccount) {
+                  setDeletePasswordModalVisible(false);
+                  setDeletePassword("");
+                }
+              }}
+            >
+              <View style={stylesWithFont.modalBackground}>
+                <View style={stylesWithFont.modalContainer}>
+                  <Text style={stylesWithFont.accountCardTitle}>
+                    Confirm your password
+                  </Text>
+                  <Text style={stylesWithFont.accountCardSubtitle}>
+                    Re-enter your password before permanently deleting this
+                    account.
+                  </Text>
+                  <Text style={stylesWithFont.accountInputLabel}>Password</Text>
+                  <TextInput
+                    style={stylesWithFont.accountInput}
+                    value={deletePassword}
+                    onChangeText={setDeletePassword}
+                    placeholder="Password"
+                    placeholderTextColor={theme.textPlaceholder}
+                    secureTextEntry
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    returnKeyType="done"
+                    editable={!deletingAccount}
+                    onSubmitEditing={() => {
+                      if (deletePassword && !deletingAccount) {
+                        void performAccountDeletion({
+                          password: deletePassword,
+                        });
+                      }
+                    }}
+                    autoFocus
+                  />
+                  <CustomButton
+                    title={deletingAccount ? "Confirming..." : "Delete Account"}
+                    onPress={
+                      deletePassword && !deletingAccount
+                        ? () =>
+                            void performAccountDeletion({
+                              password: deletePassword,
+                            })
+                        : null
+                    }
+                    fontSize={fontSize}
+                    color={theme.danger}
+                  />
+                  <CustomButton
+                    title="Cancel"
+                    onPress={
+                      deletingAccount
+                        ? null
+                        : () => {
+                            setDeletePasswordModalVisible(false);
+                            setDeletePassword("");
+                          }
+                    }
+                    fontSize={fontSize}
+                    color={theme.textSecondary}
+                  />
+                </View>
+              </View>
+            </Modal>
           </View>
         );
 
@@ -1928,15 +1941,17 @@ export default function SettingsScreen() {
 
             <View style={stylesWithFont.settingRow}>
               <Text style={stylesWithFont.label}>
-                Font Size: {settings?.ux?.fontSize ?? 16}
+                Font Size: {displayedFontSize}
               </Text>
 
               <Slider
                 style={{ flex: 1 }}
-                value={settings?.ux?.fontSize ?? 16}
-                onValueChange={(val) =>
-                  updateSetting("ux", "fontSize", val)
-                }
+                value={displayedFontSize}
+                onValueChange={setFontSizeDraft}
+                onSlidingComplete={(val) => {
+                  updateSetting("ux", "fontSize", val);
+                  setFontSizeDraft(null);
+                }}
                 minimumValue={12}
                 maximumValue={24}
                 step={1}
@@ -1960,7 +1975,7 @@ export default function SettingsScreen() {
                   !!settings?.notifications?.dailyReminders
                 }
                 onValueChange={(val) =>
-                  updateSetting(
+                  void updateReminderToggle(
                     "notifications",
                     "dailyReminders",
                     val
@@ -1988,7 +2003,7 @@ export default function SettingsScreen() {
                   !!settings?.expiration?.expirationAlerts
                 }
                 onValueChange={(val) =>
-                  updateSetting(
+                  void updateReminderToggle(
                     "expiration",
                     "expirationAlerts",
                     val

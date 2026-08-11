@@ -1,10 +1,25 @@
 const DEFAULT_API_BASE_URL = "http://localhost:3000";
+const CONFIGURED_APP_ENV = String(
+  process.env.EXPO_PUBLIC_APP_ENV || ""
+).trim().toLowerCase();
+const IS_DEVELOPMENT_BUILD =
+  CONFIGURED_APP_ENV === "production"
+    ? false
+    : CONFIGURED_APP_ENV === "development" || CONFIGURED_APP_ENV === "test"
+      ? true
+      : typeof __DEV__ !== "undefined"
+        ? __DEV__
+        : process.env.NODE_ENV !== "production";
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
 function withoutTrailingSlash(value) {
   return value.replace(/\/+$/, "");
 }
 
-export function validateBackendUrl(value, { name, protocols }) {
+export function validateBackendUrl(
+  value,
+  { name, protocols, allowLoopback = true }
+) {
   const configuredValue = String(value || "").trim();
 
   if (!configuredValue) {
@@ -33,6 +48,10 @@ export function validateBackendUrl(value, { name, protocols }) {
     throw new Error(`${name} must not contain a query string or fragment.`);
   }
 
+  if (!allowLoopback && LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase())) {
+    throw new Error(`${name} must not use a loopback host in production.`);
+  }
+
   return withoutTrailingSlash(parsed.toString());
 }
 
@@ -44,10 +63,12 @@ export function websocketUrlFromApiBase(apiBaseUrl) {
 }
 
 export const API_BASE_URL = validateBackendUrl(
-  process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL,
+  process.env.EXPO_PUBLIC_API_BASE_URL ||
+    (IS_DEVELOPMENT_BUILD ? DEFAULT_API_BASE_URL : ""),
   {
     name: "EXPO_PUBLIC_API_BASE_URL",
-    protocols: ["http:", "https:"],
+    protocols: IS_DEVELOPMENT_BUILD ? ["http:", "https:"] : ["https:"],
+    allowLoopback: IS_DEVELOPMENT_BUILD,
   }
 );
 
@@ -55,6 +76,7 @@ export const BACKEND_WS_URL = validateBackendUrl(
   process.env.EXPO_PUBLIC_WS_URL || websocketUrlFromApiBase(API_BASE_URL),
   {
     name: "EXPO_PUBLIC_WS_URL",
-    protocols: ["ws:", "wss:"],
+    protocols: IS_DEVELOPMENT_BUILD ? ["ws:", "wss:"] : ["wss:"],
+    allowLoopback: IS_DEVELOPMENT_BUILD,
   }
 );

@@ -40,13 +40,22 @@ export default function SelectionActionBar({
               activeOpacity={0.8}
               style={[styles.pillBtn, !canSelectAll && { opacity: 0.4 }]}
               disabled={!canSelectAll}
+              accessibilityRole="button"
+              accessibilityLabel="Select all items"
+              accessibilityState={{ disabled: !canSelectAll }}
             >
               <Text style={{ color: theme?.textPrimary, fontSize: fontSize * 0.9, fontWeight: "800" }}>
                 Select all
               </Text>
             </TouchableOpacity>
           ) : (
-            <TouchableOpacity onPress={onClear} activeOpacity={0.8} style={styles.pillBtn}>
+            <TouchableOpacity
+              onPress={onClear}
+              activeOpacity={0.8}
+              style={styles.pillBtn}
+              accessibilityRole="button"
+              accessibilityLabel="Clear item selection"
+            >
               <Text style={{ color: theme?.textPrimary, fontSize: fontSize * 0.9, fontWeight: "800" }}>
                 Clear
               </Text>

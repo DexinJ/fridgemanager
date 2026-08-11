@@ -7,9 +7,24 @@ export function startOfDayLocal(d) {
   return Number.isNaN(local.getTime()) ? null : local;
 }
 
-// store as ISO at local midnight
+export function endOfDayLocal(d) {
+  if (!(d instanceof Date) || Number.isNaN(d.getTime())) return null;
+
+  const local = new Date(
+    d.getFullYear(),
+    d.getMonth(),
+    d.getDate(),
+    23,
+    59,
+    59,
+    999
+  );
+  return Number.isNaN(local.getTime()) ? null : local;
+}
+
+// Calendar expiration dates remain usable through the end of the selected day.
 export function isoFromLocalDateOnly(d) {
-  const local = startOfDayLocal(d);
+  const local = endOfDayLocal(d);
   return local ? local.toISOString() : null;
 }
 
@@ -61,7 +76,7 @@ export function addLocalDaysIso(days) {
   if (!d || !Number.isFinite(normalizedDays)) return null;
 
   d.setDate(d.getDate() + Math.round(normalizedDays));
-  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  return Number.isNaN(d.getTime()) ? null : isoFromLocalDateOnly(d);
 }
 
 export { MS_PER_DAY };

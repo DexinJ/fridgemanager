@@ -7,6 +7,32 @@
 import { useContext } from "react";
 import { GlobalContext } from "../context/GlobalContext";
 
+// Compatibility guard for gateways that predate explicit client ownership and
+// published the full mixed tool batch. New gateways send only client calls.
+const SERVER_OWNED_TOOL_NAMES = new Set(["webSearch"]);
+
+export function isServerOwnedGPTTool(name) {
+  return SERVER_OWNED_TOOL_NAMES.has(String(name || ""));
+}
+
+export function claimClientOwnedGPTToolCalls(
+  toolCalls,
+  { toolOwner = null, round = "legacy", claimedIds = new Set() } = {}
+) {
+  if (toolOwner && toolOwner !== "client") return [];
+  return (Array.isArray(toolCalls) ? toolCalls : []).filter(
+    (toolCall, index) => {
+      const name = toolCall?.function?.name || toolCall?.name || "";
+      if (isServerOwnedGPTTool(name)) return false;
+      const id = toolCall?.id || toolCall?.tool_call_id || null;
+      const claimKey = id || `${round}:${index}:${name}`;
+      if (claimedIds.has(claimKey)) return false;
+      claimedIds.add(claimKey);
+      return true;
+    }
+  );
+}
+
 export function useGPTTools() {
   const {
     fridgeItems,

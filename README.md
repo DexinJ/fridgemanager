@@ -372,6 +372,7 @@ Common API routes include:
 GET    /health
 GET    /me
 POST   /api/users
+POST   /api/auth/apple/link
 GET    /api/users/:uid
 PATCH  /api/users/me
 DELETE /api/users/:uid
@@ -395,6 +396,17 @@ await fetch(`${API_BASE_URL}/api/users`, {
   }),
 });
 ```
+
+After Firebase accepts a native Sign in with Apple credential, the client sends
+Apple's short-lived, single-use authorization code to
+`POST /api/auth/apple/link` with the Firebase ID token as its bearer token. The
+backend exchanges and validates that code and retains the server-side credential
+needed to revoke Sign in with Apple access during account deletion. The client
+does not persist or log the Apple authorization code. Settings requires a fresh
+provider confirmation before deletion; for Apple accounts this also attempts to
+repair a missing server credential with a new authorization code. If automatic
+revocation is still unavailable or pending, the app gives Apple's manual
+**Stop Using Sign in with Apple** steps instead of blocking account deletion.
 
 ### Load User Profile
 
@@ -446,7 +458,11 @@ The backend is responsible for deleting:
 
 * The user profile
 * Associated server-side data
+* Any linked Sign in with Apple authorization grant
 * The Firebase Authentication account
+
+Revoking Sign in with Apple access does not cancel an App Store subscription;
+the app links users to Apple Subscriptions for subscription management.
 
 ## Local Data Storage
 

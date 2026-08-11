@@ -1,5 +1,6 @@
 import { GoogleSignin } from "@react-native-google-signin/google-signin";
 import { GoogleAuthProvider, signInWithCredential } from "firebase/auth";
+import { extractGoogleIdTokenFromSignInResponse } from "./googleSignInResponse";
 
 let configured = false;
 
@@ -50,15 +51,10 @@ export async function signInWithGoogleNative(auth) {
 
   await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
 
-  const userInfo = await GoogleSignin.signIn();
-  let idToken = userInfo?.idToken;
-
-  if (!idToken) {
-    const tokens = await GoogleSignin.getTokens();
-    idToken = tokens?.idToken;
-  }
-
-  if (!idToken) throw new Error("No Google idToken returned");
+  const response = await GoogleSignin.signIn();
+  const idToken = await extractGoogleIdTokenFromSignInResponse(response, {
+    getTokens: () => GoogleSignin.getTokens(),
+  });
 
   const credential = GoogleAuthProvider.credential(idToken);
   return signInWithCredential(auth, credential);

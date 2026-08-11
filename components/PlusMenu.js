@@ -3,16 +3,17 @@ import * as ImageManipulator from "expo-image-manipulator";
 import * as ImagePicker from "expo-image-picker";
 import React, { useContext, useEffect, useRef, useState } from "react";
 import { Alert, StyleSheet, Text, TouchableOpacity, View } from "react-native";
+import { persistChatAttachment } from "../api/chatAttachments";
 import { GlobalContext } from "../context/GlobalContext";
 
 const MAX_IMAGE_DIMENSION = 1_600;
-const MAX_IMAGE_DATA_URL_LENGTH = 6 * 1024 * 1024;
+const MAX_IMAGE_DATA_URL_LENGTH = 4 * 1024 * 1024;
 const MAX_SOURCE_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_SOURCE_IMAGE_EDGE = 30_000;
 const MAX_SOURCE_IMAGE_PIXELS = 100_000_000;
 
 export default function PlusMenu({ onSend }) {
-  const { settings, theme } = useContext(GlobalContext);
+  const { settings, storageOwnerUid, theme } = useContext(GlobalContext);
   const fontSize = settings?.ux?.fontSize || 16;
   const [menuOpen, setMenuOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -26,7 +27,7 @@ export default function PlusMenu({ onSend }) {
     };
   }, []);
 
-  async function toJpegBase64(asset) {
+  async function prepareJpegAttachment(asset) {
     if (!asset || typeof asset.uri !== "string" || !asset.uri.trim()) {
       throw new Error("The selected image is missing its file location.");
     }
@@ -78,7 +79,10 @@ export default function PlusMenu({ onSend }) {
     if (dataUrl.length > MAX_IMAGE_DATA_URL_LENGTH) {
       throw new Error("The selected image is too large to send.");
     }
-    return dataUrl;
+    const displayUri = settings?.privacy?.incognito
+      ? result.uri
+      : await persistChatAttachment(storageOwnerUid, result.uri);
+    return { displayUri, requestUri: dataUrl };
   }
 
   const takePhoto = async () => {
@@ -104,10 +108,15 @@ export default function PlusMenu({ onSend }) {
       if (!mountedRef.current) return;
       if (!result.canceled) {
         const asset = result.assets[0];
-        const dataUrl = await toJpegBase64(asset);
+        const attachment = await prepareJpegAttachment(asset);
         if (!mountedRef.current) return;
         await Promise.resolve(
-          onSend?.({ text: null, imageUri: dataUrl, isUser: true })
+          onSend?.({
+            text: null,
+            imageUri: attachment.displayUri,
+            imageRequestUri: attachment.requestUri,
+            isUser: true,
+          })
         );
       }
     } catch (error) {
@@ -149,10 +158,15 @@ export default function PlusMenu({ onSend }) {
       if (!mountedRef.current) return;
       if (!result.canceled) {
         const asset = result.assets[0];
-        const dataUrl = await toJpegBase64(asset);
+        const attachment = await prepareJpegAttachment(asset);
         if (!mountedRef.current) return;
         await Promise.resolve(
-          onSend?.({ text: null, imageUri: dataUrl, isUser: true })
+          onSend?.({
+            text: null,
+            imageUri: attachment.displayUri,
+            imageRequestUri: attachment.requestUri,
+            isUser: true,
+          })
         );
       }
     } catch (error) {
@@ -181,6 +195,9 @@ export default function PlusMenu({ onSend }) {
         ]}
         onPress={() => setMenuOpen((open) => !open)}
         disabled={busy}
+        accessibilityRole="button"
+        accessibilityLabel={menuOpen ? "Close attachment menu" : "Add a photo"}
+        accessibilityState={{ disabled: busy, expanded: menuOpen }}
         >
         <Ionicons
             name="add"
@@ -208,6 +225,9 @@ export default function PlusMenu({ onSend }) {
             ]}
             onPress={takePhoto}
             disabled={busy}
+            accessibilityRole="button"
+            accessibilityLabel="Take a photo"
+            accessibilityState={{ disabled: busy }}
           >
             <Ionicons name="camera" size={fontSize} color={theme.textPrimary} />
             <Text style={[styles.menuText, { fontSize, color: theme.textPrimary }]} numberOfLines={1}>
@@ -226,6 +246,9 @@ export default function PlusMenu({ onSend }) {
             ]}
             onPress={pickPhoto}
             disabled={busy}
+            accessibilityRole="button"
+            accessibilityLabel="Choose a photo from the gallery"
+            accessibilityState={{ disabled: busy }}
           >
             <Ionicons name="image" size={fontSize} color={theme.textPrimary} />
             <Text style={[styles.menuText, { fontSize, color: theme.textPrimary }]} numberOfLines={1}>

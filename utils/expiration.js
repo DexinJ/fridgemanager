@@ -11,6 +11,21 @@ function toDateOrNull(input) {
   if (!input) return null;
 
   if (typeof input === "string") {
+    const dateOnly = input.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (dateOnly) {
+      const year = Number(dateOnly[1]);
+      const month = Number(dateOnly[2]) - 1;
+      const day = Number(dateOnly[3]);
+      const localEndOfDay = new Date(year, month, day, 23, 59, 59, 999);
+      if (
+        localEndOfDay.getFullYear() !== year ||
+        localEndOfDay.getMonth() !== month ||
+        localEndOfDay.getDate() !== day
+      ) {
+        return null;
+      }
+      return localEndOfDay;
+    }
     const d = new Date(input);
     return Number.isNaN(d.getTime()) ? null : d;
   }
@@ -30,8 +45,17 @@ function toDateOrNull(input) {
 // We treat "daysUntil" as whole days remaining, rounded up.
 // Example: expires in 0.2 days => 1 dayUntil (still "almost" if threshold allows).
 function computeDaysUntil(expiresAtDate, nowDate) {
-  const diffMs = expiresAtDate.getTime() - nowDate.getTime();
-  return Math.ceil(diffMs / MS_PER_DAY);
+  const expirationDay = Date.UTC(
+    expiresAtDate.getFullYear(),
+    expiresAtDate.getMonth(),
+    expiresAtDate.getDate()
+  );
+  const currentDay = Date.UTC(
+    nowDate.getFullYear(),
+    nowDate.getMonth(),
+    nowDate.getDate()
+  );
+  return Math.round((expirationDay - currentDay) / MS_PER_DAY);
 }
 
 /**
@@ -54,9 +78,10 @@ export function getExpiryMeta(
     use_soon: 7,
     lasts_a_while: 30,
     long_keeper: 180,
-  }
+  },
+  nowInput = new Date()
 ) {
-  const now = new Date();
+  const now = toDateOrNull(nowInput) || new Date();
   const exp = toDateOrNull(expiresAtIso);
 
   if (!exp) {
@@ -66,6 +91,8 @@ export function getExpiryMeta(
       expired: false,
       almostExpired: false,
       daysUntil: null,
+      daysUntilExpire: null,
+      expiresAtMs: null,
       urgencyKey: null,
     };
   }
@@ -99,6 +126,8 @@ export function getExpiryMeta(
     expired,
     almostExpired,
     daysUntil,
+    daysUntilExpire: daysUntil,
+    expiresAtMs: exp.getTime(),
     urgencyKey, // ✅ "expired" | "eat_first" | "use_soon" | "lasts_a_while" | "long_keeper"
   };
 }

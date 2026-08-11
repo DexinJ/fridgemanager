@@ -27,6 +27,10 @@ export default function ActionTile({
       style={[styles.tile, style, disabled && { opacity: 0.35 }]}
       activeOpacity={0.8}
       onPress={disabled ? undefined : onPress}
+      disabled={disabled}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      accessibilityState={{ disabled }}
     >
       <Ionicons name={icon} size={size} color={color} />
       <Text style={[styles.label, { color }, labelStyle]} numberOfLines={2}>

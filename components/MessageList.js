@@ -14,7 +14,7 @@ import {
   Easing,
 } from "react-native";
 import MessageBubble from "./MessageBubble";
-import { GlobalContext } from "../context/GlobalContext";
+import { ChatContext, GlobalContext } from "../context/GlobalContext";
 import DropDownPicker from "react-native-dropdown-picker";
 
 function toDisplayText(value) {
@@ -713,7 +713,8 @@ function TypingIndicator({ theme }) {
 export default function MessageList({ messages, onUiAction }) {
   const listRef = useRef(null);
   const scrollTimerRef = useRef(null);
-  const { theme, waiting } = useContext(GlobalContext);
+  const { theme } = useContext(GlobalContext);
+  const { waiting } = useContext(ChatContext);
   const [modalVisible, setModalVisible] = useState(false);
   const [pendingAction, setPendingAction] = useState(null);
 

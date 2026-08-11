@@ -13,6 +13,7 @@ export default function FloatingAddButton({
   size = 28,
   style,
   testID,
+  accessibilityLabel = "Add item",
 }) {
   return (
     <TouchableOpacity
@@ -27,6 +28,9 @@ export default function FloatingAddButton({
       ]}
       onPress={disabled ? undefined : onPress}
       activeOpacity={0.85}
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel}
+      accessibilityState={{ disabled }}
     >
       <Ionicons name={icon} size={size} color="#fff" />
     </TouchableOpacity>

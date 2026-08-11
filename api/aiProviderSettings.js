@@ -4,6 +4,8 @@ import {
   getUserSecureStorageKey,
 } from "./storageKeys";
 
+const { shouldClearLegacyOwnedData } = require("./legacyPurgePolicy.cjs");
+
 const LEGACY_AI_API_KEY_STORAGE_KEY = "pantrio.customAiApiKey";
 // This was the first per-provider key, but it was shared by every account on
 // the device. It is now used only as a one-time migration source.
@@ -88,43 +90,11 @@ async function migrateLegacyProviderSettingsUnlocked(
 
   if (!legacyOwnerUid) {
     // A global SecureStore value without an ownership marker is ambiguous.
-    // Quarantine it instead of assigning a previous user's API key to
-    // whichever account happens to sign in first.
-    if (legacyProviderValue === null && legacyApiKey === null) return false;
-
-    const storedQuarantine = await SecureStore.getItemAsync(
-      LEGACY_AI_SETTINGS_QUARANTINE_KEY
-    );
-    let quarantineEntries = [];
-    if (storedQuarantine) {
-      try {
-        const parsedQuarantine = JSON.parse(storedQuarantine);
-        quarantineEntries = Array.isArray(parsedQuarantine?.entries)
-          ? parsedQuarantine.entries
-          : [{ quarantinedAt: null, rawValue: storedQuarantine }];
-      } catch {
-        quarantineEntries = [{ quarantinedAt: null, rawValue: storedQuarantine }];
-      }
-    }
-    const alreadyQuarantined = quarantineEntries.some(
-      (entry) =>
-        entry?.providerSettings === legacyProviderValue &&
-        entry?.apiKey === legacyApiKey
-    );
-    if (!alreadyQuarantined) {
-      quarantineEntries.push({
-        quarantinedAt: new Date().toISOString(),
-        providerSettings: legacyProviderValue,
-        apiKey: legacyApiKey,
-      });
-    }
-    await SecureStore.setItemAsync(
-      LEGACY_AI_SETTINGS_QUARANTINE_KEY,
-      JSON.stringify({ version: 1, entries: quarantineEntries })
-    );
+    // Do not assign it to the next account or retain an unrecoverable secret.
     await Promise.all([
       SecureStore.deleteItemAsync(LEGACY_AI_PROVIDER_SETTINGS_STORAGE_KEY),
       SecureStore.deleteItemAsync(LEGACY_AI_API_KEY_STORAGE_KEY),
+      SecureStore.deleteItemAsync(LEGACY_AI_SETTINGS_QUARANTINE_KEY),
     ]);
     return false;
   }
@@ -174,6 +144,7 @@ async function migrateLegacyProviderSettingsUnlocked(
   await Promise.all([
     SecureStore.deleteItemAsync(LEGACY_AI_PROVIDER_SETTINGS_STORAGE_KEY),
     SecureStore.deleteItemAsync(LEGACY_AI_API_KEY_STORAGE_KEY),
+    SecureStore.deleteItemAsync(LEGACY_AI_SETTINGS_QUARANTINE_KEY),
   ]);
 
   return true;
@@ -253,4 +224,30 @@ export async function clearCustomAiProviderSettings(uid) {
   return withSecureStoreLock(() =>
     SecureStore.deleteItemAsync(getSettingsStorageKey(uid))
   );
+}
+
+export async function clearLegacyCustomAiProviderQuarantine() {
+  return withSecureStoreLock(() =>
+    SecureStore.deleteItemAsync(LEGACY_AI_SETTINGS_QUARANTINE_KEY)
+  );
+}
+
+export async function clearLegacyCustomAiProviderSettingsForUser(uid) {
+  const normalizedUid = String(uid || "").trim();
+  if (!normalizedUid) throw new Error("An authenticated user is required.");
+
+  return withSecureStoreLock(async () => {
+    const ownerUid = await getLegacyStorageOwner();
+    const keysToRemove = [LEGACY_AI_SETTINGS_QUARANTINE_KEY];
+    if (shouldClearLegacyOwnedData(ownerUid, normalizedUid)) {
+      keysToRemove.push(
+        LEGACY_AI_PROVIDER_SETTINGS_STORAGE_KEY,
+        LEGACY_AI_API_KEY_STORAGE_KEY
+      );
+    }
+    await Promise.all(
+      keysToRemove.map((key) => SecureStore.deleteItemAsync(key))
+    );
+    return keysToRemove.length;
+  });
 }

@@ -1,4 +1,4 @@
-import { useContext, useEffect, useRef, useState } from "react";
+import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import {
   Keyboard,
   KeyboardAvoidingView,
@@ -7,10 +7,11 @@ import {
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useFocusEffect } from "expo-router";
 import { useGpt } from "../../api/gpt";
 import MessageInput from "../../components/MessageInput";
 import MessageList from "../../components/MessageList";
-import { GlobalContext } from "../../context/GlobalContext";
+import { ChatContext, GlobalContext } from "../../context/GlobalContext";
 
 function getChatErrorMessage(error) {
   const messagesByCode = {
@@ -39,35 +40,42 @@ export default function ChatScreen() {
   const [keyboardVisible, setKeyboardVisible] = useState(false);
 
   const { streamMessage } = useGpt();
-  const { theme, messages, setMessages, setReceiving, setWaiting, addToFridge } =
-    useContext(GlobalContext);
+  const { theme, addManyToFridge } = useContext(GlobalContext);
+  const { messages, setMessages, setWaiting } =
+    useContext(ChatContext);
   const mountedRef = useRef(false);
   const sendGenerationRef = useRef(0);
 
   useEffect(() => {
     mountedRef.current = true;
-    const showSub = Keyboard.addListener(
-      Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow",
-      () => setKeyboardVisible(true)
-    );
-    const hideSub = Keyboard.addListener(
-      Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide",
-      () => setKeyboardVisible(false)
-    );
-
     return () => {
       mountedRef.current = false;
       sendGenerationRef.current += 1;
-      showSub.remove();
-      hideSub.remove();
     };
   }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      const showSub = Keyboard.addListener(
+        Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow",
+        () => setKeyboardVisible(true)
+      );
+      const hideSub = Keyboard.addListener(
+        Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide",
+        () => setKeyboardVisible(false)
+      );
+      return () => {
+        showSub.remove();
+        hideSub.remove();
+        setKeyboardVisible(false);
+      };
+    }, [])
+  );
 
   const handleSend = async (message) => {
     const generation = sendGenerationRef.current + 1;
     sendGenerationRef.current = generation;
     setInput("");
-    setReceiving(true);
     setWaiting(true);
 
     if (message.text || message.imageUri) {
@@ -75,6 +83,7 @@ export default function ChatScreen() {
         await streamMessage({
           text: message.text || "",
           imageUri: message.imageUri || "",
+          imageRequestUri: message.imageRequestUri || "",
         });
       } catch (error) {
         if (
@@ -96,13 +105,11 @@ export default function ChatScreen() {
         ]);
       } finally {
         if (mountedRef.current && sendGenerationRef.current === generation) {
-          setReceiving(false);
           setWaiting(false);
         }
       }
     } else {
       if (mountedRef.current && sendGenerationRef.current === generation) {
-        setReceiving(false);
         setWaiting(false);
       }
     }
@@ -152,6 +159,7 @@ export default function ChatScreen() {
   
     let added = 0;
     const failed = [];
+    const additions = [];
   
     for (const it of items) {
       const name = clean(it?.name);
@@ -161,7 +169,7 @@ export default function ChatScreen() {
   
       const categories = coerceCategories(it?.categories);
   
-      // ✅ pass through; addToFridge decides if valid, predictor fills if missing
+      // Pass through; the context normalizes tags and predicts missing expiry.
       const expiresAt =
         it?.expiresAt ??
         it?.expires_at ??
@@ -169,20 +177,15 @@ export default function ChatScreen() {
         it?.expiration_date ??
         undefined;
   
-      try {
-        // ✅ your new signature:
-        // addToFridge(name, quantity, categories, expiresAt)
-        if (__DEV__) {
-          console.log("Adding proposed fridge item", { name });
-        }
-        addToFridge(name, quantity, categories, expiresAt);
-        added += 1;
-      } catch (e) {
-        failed.push({ name, reason: String(e?.message || e) });
-        if (__DEV__) {
-          console.log({ name, reason: String(e?.message || e) });
-        }
-      }
+      additions.push({ name, quantity, categories, expiresAt });
+    }
+
+    try {
+      added = addManyToFridge(additions).length;
+    } catch (error) {
+      const reason = String(error?.message || error);
+      failed.push(...additions.map(({ name }) => ({ name, reason })));
+      if (__DEV__) console.log({ names: additions.map(({ name }) => name), reason });
     }
   
     // Optional summary message

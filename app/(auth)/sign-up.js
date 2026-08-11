@@ -18,7 +18,10 @@ import {
   signOut as firebaseSignOut,
 } from "firebase/auth";
 
-import { signInWithApple } from "../../auth/appleAuth"; // ✅ CHANGED: Apple login helper
+import {
+  signInWithApple,
+  tryLinkAppleAuthorizationToBackend,
+} from "../../auth/appleAuth"; // ✅ CHANGED: Apple login helper
 import {
   bindAuthProvisioningUser,
   clearAuthProvisioningIntent,
@@ -385,6 +388,10 @@ export default function SignUpScreen() {
         }
       }
       backendProfileSaved = true;
+      await tryLinkAppleAuthorizationToBackend({
+        user: result.user,
+        authorizationCode: result.authorizationCode,
+      });
       await clearAuthProvisioningIntent().catch(() => {});
       ensureProvisioningIsActive(generation);
 

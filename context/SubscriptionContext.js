@@ -7,6 +7,7 @@ import React, {
   useRef,
   useState,
 } from "react";
+import { Platform } from "react-native";
 import {
   addAppleSubscriptionStatusListener,
   addAppleTransactionListener,
@@ -18,6 +19,10 @@ import {
   purchaseAppleSubscription,
   restoreAppleSubscriptions,
 } from "../modules/apple-subscriptions/src";
+import {
+  orderedStringListKey,
+  productCatalogCoversIds,
+} from "./refreshPolicy";
 
 const LOADING_SUBSCRIPTION = Object.freeze({
   ...EMPTY_APPLE_SUBSCRIPTION,
@@ -71,57 +76,102 @@ export function AppleSubscriptionProvider({
   const [latestTransactionEvent, setLatestTransactionEvent] = useState(null);
   const mountedRef = useRef(false);
   const configuredProductIdsRef = useRef([]);
+  const productsRef = useRef([]);
+  const successfulProductCatalogKeyRef = useRef(null);
+  const productCatalogRequestRef = useRef(null);
   const productRequestGenerationRef = useRef(0);
+  const subscriptionRefreshPromiseRef = useRef(null);
+  const subscriptionRequestGenerationRef = useRef(0);
   const transactionSequenceRef = useRef(0);
 
-  const refreshSubscription = useCallback(async () => {
+  const applySubscriptionSnapshot = useCallback((nextSubscription) => {
+    if (!mountedRef.current || !nextSubscription) return;
+    setSubscription(nextSubscription);
+    setError(nextSubscription.error || null);
+    setLoading(false);
+  }, []);
+
+  const refreshSubscription = useCallback(() => {
     if (!enabled) {
       setSubscription(EMPTY_APPLE_SUBSCRIPTION);
       setLoading(false);
       setError(null);
-      return EMPTY_APPLE_SUBSCRIPTION;
+      return Promise.resolve(EMPTY_APPLE_SUBSCRIPTION);
     }
 
+    const inFlight = subscriptionRefreshPromiseRef.current;
+    if (inFlight) return inFlight;
+
+    const requestGeneration = subscriptionRequestGenerationRef.current + 1;
+    subscriptionRequestGenerationRef.current = requestGeneration;
     setLoading(true);
-    try {
-      const nextSubscription = await getAppleSubscriptionStatus(
-        configuredProductIdsRef.current
-      );
-      if (mountedRef.current) {
-        setSubscription(nextSubscription);
-        setError(nextSubscription.error || null);
-      }
-      return nextSubscription;
-    } catch (nextError) {
-      if (mountedRef.current) {
-        setError(
-          nextError?.message || "Could not check the Apple subscription."
+    const request = (async () => {
+      try {
+        const nextSubscription = await getAppleSubscriptionStatus(
+          configuredProductIdsRef.current
         );
-        setSubscription((current) => ({
-          ...current,
-          status: "unknown",
-          checkedAt: new Date().toISOString(),
-        }));
+        if (subscriptionRequestGenerationRef.current === requestGeneration) {
+          applySubscriptionSnapshot(nextSubscription);
+        }
+        return nextSubscription;
+      } catch (nextError) {
+        if (
+          mountedRef.current &&
+          subscriptionRequestGenerationRef.current === requestGeneration
+        ) {
+          setError(
+            nextError?.message || "Could not check the Apple subscription."
+          );
+          setSubscription((current) => ({
+            ...current,
+            status: "unknown",
+            checkedAt: new Date().toISOString(),
+          }));
+        }
+        throw nextError;
+      } finally {
+        if (subscriptionRefreshPromiseRef.current === request) {
+          subscriptionRefreshPromiseRef.current = null;
+        }
+        if (
+          mountedRef.current &&
+          subscriptionRequestGenerationRef.current === requestGeneration
+        ) {
+          setLoading(false);
+        }
       }
-      throw nextError;
-    } finally {
-      if (mountedRef.current) setLoading(false);
-    }
-  }, [enabled]);
+    })();
+
+    subscriptionRefreshPromiseRef.current = request;
+    return request;
+  }, [applySubscriptionSnapshot, enabled]);
 
   const configureProductCatalog = useCallback(
-    async (catalog) => {
+    (catalog) => {
       const productIds = productIdsFromCatalog(catalog);
+      const catalogKey = orderedStringListKey([
+        String(accountId || ""),
+        ...productIds,
+      ]);
 
       configuredProductIdsRef.current = productIds;
       if (!enabled || productIds.length === 0) {
         productRequestGenerationRef.current += 1;
+        productCatalogRequestRef.current = null;
+        successfulProductCatalogKeyRef.current = null;
+        productsRef.current = [];
         if (mountedRef.current) {
           setProducts([]);
           setProductsLoading(false);
           setProductsError(null);
         }
-        return [];
+        return Promise.resolve([]);
+      }
+
+      const inFlight = productCatalogRequestRef.current;
+      if (inFlight?.catalogKey === catalogKey) return inFlight.request;
+      if (!inFlight && successfulProductCatalogKeyRef.current === catalogKey) {
+        return Promise.resolve(productsRef.current);
       }
 
       const requestGeneration = productRequestGenerationRef.current + 1;
@@ -131,40 +181,52 @@ export function AppleSubscriptionProvider({
         setProductsError(null);
       }
 
-      try {
-        const nextProducts = await getAppleSubscriptionProducts(productIds);
-        if (
-          mountedRef.current &&
-          productRequestGenerationRef.current === requestGeneration
-        ) {
+      const request = (async () => {
+        try {
+          const nextProducts = await getAppleSubscriptionProducts(productIds);
           const normalizedProducts = Array.isArray(nextProducts)
             ? nextProducts
             : [];
-          setProducts(normalizedProducts);
+          if (productRequestGenerationRef.current === requestGeneration) {
+            productsRef.current = normalizedProducts;
+            successfulProductCatalogKeyRef.current = productCatalogCoversIds(
+              normalizedProducts,
+              productIds
+            )
+              ? catalogKey
+              : null;
+            if (mountedRef.current) setProducts(normalizedProducts);
+          }
+          return normalizedProducts;
+        } catch (nextError) {
+          if (productRequestGenerationRef.current === requestGeneration) {
+            productsRef.current = [];
+            successfulProductCatalogKeyRef.current = null;
+            if (mountedRef.current) {
+              setProducts([]);
+              setProductsError(
+                nextError?.message || "Could not load Apple subscription plans."
+              );
+            }
+          }
+          throw nextError;
+        } finally {
+          if (productCatalogRequestRef.current?.request === request) {
+            productCatalogRequestRef.current = null;
+          }
+          if (
+            mountedRef.current &&
+            productRequestGenerationRef.current === requestGeneration
+          ) {
+            setProductsLoading(false);
+          }
         }
-        await refreshSubscription();
-        return Array.isArray(nextProducts) ? nextProducts : [];
-      } catch (nextError) {
-        if (
-          mountedRef.current &&
-          productRequestGenerationRef.current === requestGeneration
-        ) {
-          setProducts([]);
-          setProductsError(
-            nextError?.message || "Could not load Apple subscription plans."
-          );
-        }
-        throw nextError;
-      } finally {
-        if (
-          mountedRef.current &&
-          productRequestGenerationRef.current === requestGeneration
-        ) {
-          setProductsLoading(false);
-        }
-      }
+      })();
+
+      productCatalogRequestRef.current = { catalogKey, request };
+      return request;
     },
-    [enabled, refreshSubscription]
+    [accountId, enabled]
   );
 
   const purchaseProduct = useCallback(
@@ -172,17 +234,23 @@ export function AppleSubscriptionProvider({
       if (!enabled) {
         throw new Error("Apple subscriptions are available only on iOS.");
       }
-      return purchaseAppleSubscription(productId, appAccountToken);
+      const result = await purchaseAppleSubscription(productId, appAccountToken);
+      applySubscriptionSnapshot(result?.snapshot);
+      return result;
     },
-    [enabled]
+    [applySubscriptionSnapshot, enabled]
   );
 
   const restorePurchases = useCallback(async () => {
     if (!enabled) {
       throw new Error("Apple subscriptions are available only on iOS.");
     }
-    return restoreAppleSubscriptions(configuredProductIdsRef.current);
-  }, [enabled]);
+    const result = await restoreAppleSubscriptions(
+      configuredProductIdsRef.current
+    );
+    applySubscriptionSnapshot(result?.snapshot);
+    return result;
+  }, [applySubscriptionSnapshot, enabled]);
 
   const getUnfinishedTransactions = useCallback(async () => {
     if (!enabled) return null;
@@ -194,9 +262,11 @@ export function AppleSubscriptionProvider({
       if (!enabled || !Array.isArray(transactionIds) || !transactionIds.length) {
         return null;
       }
-      return finishAppleTransactions(transactionIds);
+      const result = await finishAppleTransactions(transactionIds);
+      applySubscriptionSnapshot(result?.snapshot);
+      return result;
     },
-    [enabled]
+    [applySubscriptionSnapshot, enabled]
   );
 
   useEffect(() => {
@@ -210,10 +280,7 @@ export function AppleSubscriptionProvider({
 
     // Subscribe before the initial read so an update cannot slip between them.
     const statusListener = addAppleSubscriptionStatusListener((next) => {
-      if (!mountedRef.current) return;
-      setSubscription(next);
-      setError(next.error || null);
-      setLoading(false);
+      applySubscriptionSnapshot(next);
     });
     const transactionListener = addAppleTransactionListener((envelope) => {
       if (!mountedRef.current) return;
@@ -224,28 +291,36 @@ export function AppleSubscriptionProvider({
         envelope,
       });
       if (envelope?.snapshot) {
-        setSubscription(envelope.snapshot);
-        setError(envelope.snapshot.error || null);
-        setLoading(false);
+        applySubscriptionSnapshot(envelope.snapshot);
       }
     });
 
-    const initialRefreshTimer = setTimeout(() => {
-      refreshSubscription().catch(() => {});
-    }, 0);
+    // The iOS module publishes a listener_started snapshot. Other platforms do
+    // not have a native listener, so they still need one unsupported-state read.
+    const initialRefreshTimer =
+      Platform.OS === "ios"
+        ? null
+        : setTimeout(() => {
+            refreshSubscription().catch(() => {});
+          }, 0);
 
     return () => {
       mountedRef.current = false;
-      clearTimeout(initialRefreshTimer);
+      if (initialRefreshTimer !== null) clearTimeout(initialRefreshTimer);
       statusListener.remove();
       transactionListener.remove();
     };
-  }, [accountId, enabled, refreshSubscription]);
+  }, [accountId, applySubscriptionSnapshot, enabled, refreshSubscription]);
 
   useEffect(() => {
     transactionSequenceRef.current = 0;
     configuredProductIdsRef.current = [];
+    productsRef.current = [];
+    successfulProductCatalogKeyRef.current = null;
+    productCatalogRequestRef.current = null;
     productRequestGenerationRef.current += 1;
+    subscriptionRefreshPromiseRef.current = null;
+    subscriptionRequestGenerationRef.current += 1;
     const resetTimer = setTimeout(() => {
       setLatestTransactionEvent(null);
       setProducts([]);

@@ -15,7 +15,10 @@ import {
 import { auth } from "../../auth/firebaseClient";
 import { GlobalContext } from "../../context/GlobalContext";
 
-import { signInWithApple } from "../../auth/appleAuth"; // ✅ CHANGED: Apple login helper
+import {
+  signInWithApple,
+  tryLinkAppleAuthorizationToBackend,
+} from "../../auth/appleAuth"; // ✅ CHANGED: Apple login helper
 import { signInWithGoogleNative } from "../../auth/googleAuth";
 
 export default function SignInScreen() {
@@ -90,6 +93,10 @@ export default function SignInScreen() {
     try {
       const result = await signInWithApple();
       if (!result?.user) return;
+      await tryLinkAppleAuthorizationToBackend({
+        user: result.user,
+        authorizationCode: result.authorizationCode,
+      });
     } catch (err) {
       if (err?.code === "ERR_REQUEST_CANCELED") return;
       if (mountedRef.current) {

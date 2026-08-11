@@ -20,19 +20,44 @@ export default function SortSheetModal({
   title = "Sort by",
 }) {
   return (
-    <Modal transparent animationType="none" visible={!!visible} onRequestClose={onClose}>
-      <Pressable style={styles.overlay} onPress={onClose}>
-        <Pressable style={[styles.sheet, { backgroundColor: theme?.card }]} onPress={() => {}}>
+    <Modal
+      transparent
+      animationType="none"
+      visible={!!visible}
+      onRequestClose={onClose}
+      accessibilityViewIsModal
+    >
+      <Pressable style={styles.overlay} onPress={onClose} accessible={false}>
+        <Pressable
+          style={[styles.sheet, { backgroundColor: theme?.card }]}
+          onPress={() => {}}
+          accessibilityViewIsModal
+          accessibilityRole="menu"
+          accessibilityLabel={title}
+        >
           <View style={styles.header}>
-            <TouchableOpacity onPress={onClose} style={styles.headerBtn}>
+            <TouchableOpacity
+              onPress={onClose}
+              style={styles.headerBtn}
+              accessibilityRole="button"
+              accessibilityLabel="Back"
+            >
               <Ionicons name="chevron-back" size={fontSize * 1.2} color={theme?.textPrimary} />
             </TouchableOpacity>
 
-            <Text style={{ fontSize: fontSize * 1.05, fontWeight: "800", color: theme?.textPrimary }}>
+            <Text
+              accessibilityRole="header"
+              style={{ fontSize: fontSize * 1.05, fontWeight: "800", color: theme?.textPrimary }}
+            >
               {title}
             </Text>
 
-            <TouchableOpacity onPress={onClose} style={styles.headerBtn}>
+            <TouchableOpacity
+              onPress={onClose}
+              style={styles.headerBtn}
+              accessibilityRole="button"
+              accessibilityLabel="Close sort options"
+            >
               <Ionicons name="close" size={fontSize * 1.2} color={theme?.textPrimary} />
             </TouchableOpacity>
           </View>
@@ -50,6 +75,9 @@ export default function SortSheetModal({
                   setSortKey?.(opt.value);
                   onClose?.();
                 }}
+                accessibilityRole="radio"
+                accessibilityLabel={`Sort by ${opt.label}`}
+                accessibilityState={{ selected, checked: selected }}
               >
                 <Text
                   style={{
@@ -76,6 +104,9 @@ export default function SortSheetModal({
             style={styles.row}
             activeOpacity={0.75}
             onPress={() => setSortDir?.((d) => (d === "asc" ? "desc" : "asc"))}
+            accessibilityRole="button"
+            accessibilityLabel={`Sort direction: ${sortDir === "asc" ? "Ascending" : "Descending"}`}
+            accessibilityHint="Toggles between ascending and descending."
           >
             <Text style={{ fontSize, color: theme?.textPrimary, fontWeight: "700" }}>
               Direction: {sortDir === "asc" ? "Ascending" : "Descending"}

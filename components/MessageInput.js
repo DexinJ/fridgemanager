@@ -23,7 +23,7 @@ import {
   createBackendResponseError,
   parseBackendResponseText,
 } from "../api/backendErrors";
-import { GlobalContext } from "../context/GlobalContext";
+import { ChatContext, GlobalContext } from "../context/GlobalContext";
 import { useAccountSession } from "../context/AccountSessionContext";
 import PlusMenu from "./PlusMenu";
 
@@ -43,7 +43,8 @@ const VOICE_RECORDING_PRESET = {
 };
 
 export default function MessageInput({ value, onChangeText, onSend }) {
-  const { settings, theme, receiving } = useContext(GlobalContext);
+  const { settings, theme } = useContext(GlobalContext);
+  const { receiving } = useContext(ChatContext);
   const { updateQuota } = useAccountSession();
 
   const fontSize = settings?.ux?.fontSize || 16;
@@ -469,6 +470,8 @@ export default function MessageInput({ value, onChangeText, onSend }) {
             placeholderTextColor={theme.textPlaceholder}
             returnKeyType="send"
             onSubmitEditing={handleSendText}
+            accessibilityLabel="Chat message"
+            accessibilityHint="Type a message, then use the keyboard send action."
           />
 
           <TouchableOpacity
@@ -481,6 +484,9 @@ export default function MessageInput({ value, onChangeText, onSend }) {
             ]}
             onPress={() => setVoiceMode(true)}
             disabled={receiving || transcribing}
+            accessibilityRole="button"
+            accessibilityLabel="Use voice input"
+            accessibilityState={{ disabled: receiving || transcribing }}
           >
             <Ionicons
               name="mic"
@@ -505,6 +511,13 @@ export default function MessageInput({ value, onChangeText, onSend }) {
             onPressIn={handlePressIn}
             onPressOut={handlePressOut}
             disabled={receiving || transcribing}
+            accessibilityRole="button"
+            accessibilityLabel={voiceButtonText}
+            accessibilityHint="Press and hold to record, then release to transcribe and send."
+            accessibilityState={{
+              disabled: receiving || transcribing,
+              busy: transcribing,
+            }}
           >
             {transcribing ? (
               <ActivityIndicator />
@@ -535,6 +548,9 @@ export default function MessageInput({ value, onChangeText, onSend }) {
             ]}
             onPress={leaveVoiceMode}
             disabled={isBusy}
+            accessibilityRole="button"
+            accessibilityLabel="Close voice input"
+            accessibilityState={{ disabled: isBusy, busy: transcribing }}
           >
             {transcribing ? (
               <ActivityIndicator color={theme.inputBackground} />

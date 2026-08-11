@@ -34,7 +34,7 @@ const PAGES = [
   },
   {
     emoji: "🛒",
-    title: "Shopping list, synced",
+    title: "Shopping list, organized",
     body: "Move items from shopping → fridge in one tap.",
   },
   {
@@ -45,7 +45,7 @@ const PAGES = [
   {
     emoji: "🔐",
     title: "Create your account",
-    body: "Sync your lists and settings across devices.",
+    body: "Keep your lists and settings private to this device and account.",
     isAuth: true,
   },
 ];

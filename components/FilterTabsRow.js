@@ -35,6 +35,9 @@ export default function FilterTabsRow({
             ]}
             onPress={() => onChange?.(t.key)}
             activeOpacity={0.85}
+            accessibilityRole="tab"
+            accessibilityLabel={`${t.label}${typeof t.count === "number" ? `, ${t.count} items` : ""}`}
+            accessibilityState={{ selected }}
           >
             <Text
               style={{

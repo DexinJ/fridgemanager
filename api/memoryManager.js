@@ -5,7 +5,13 @@ import {
   createBackendResponseError,
   parseBackendResponseText,
 } from "./backendErrors";
+import { deleteChatAttachments, pruneChatAttachments } from "./chatAttachments";
+import { cancelActiveChatWork } from "./chatLifecycle";
 import { getUserStorageKeys } from "./storageKeys";
+import {
+  collectChatAttachmentUris,
+  prepareChatMessagesForPersistence,
+} from "../utils/chatStoragePolicy";
 
 export const MAX_HISTORY = 20;
 export const KEEP_RECENT = 6;
@@ -14,22 +20,8 @@ const MAX_SUMMARY_HISTORY_CHARACTERS = 9_000;
 const MAX_PREVIOUS_SUMMARY_CHARACTERS = 3_000;
 const SUMMARY_TIMEOUT_MS = 8_000;
 const SUMMARY_RETRY_DELAY_MS = 60_000;
-const MAX_PERSISTED_CHAT_MESSAGES = 500;
 const summaryRetryAtByUser = new Map();
 const chatGenerationByUser = new Map();
-
-function isPlainRecord(value) {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value));
-}
-
-function sanitizeChatContent(content) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return null;
-
-  return content
-    .filter((part) => typeof part === "string" || isPlainRecord(part))
-    .map((part) => (isPlainRecord(part) ? { ...part } : part));
-}
 
 export function sanitizePersistedChatMessages(value) {
   if (!Array.isArray(value)) {
@@ -38,40 +30,7 @@ export function sanitizePersistedChatMessages(value) {
     throw error;
   }
 
-  const sanitizedMessages = [];
-  const retainedMessages = value.slice(-MAX_PERSISTED_CHAT_MESSAGES);
-
-  for (const message of retainedMessages) {
-    if (!isPlainRecord(message)) continue;
-
-    if (message.type === "ui_action") {
-      if (!isPlainRecord(message.action)) continue;
-      sanitizedMessages.push({
-        ...message,
-        type: "ui_action",
-        action: { ...message.action },
-      });
-      continue;
-    }
-
-    if (typeof message.role !== "string" || !message.role.trim()) continue;
-
-    const content = sanitizeChatContent(message.content);
-    const hasLegacyText = typeof message.text === "string";
-    const hasLegacyImage = typeof message.imageUri === "string";
-    if (content === null && !hasLegacyText && !hasLegacyImage) continue;
-
-    const sanitizedMessage = {
-      ...message,
-      role: message.role.trim(),
-    };
-    if (content !== null) sanitizedMessage.content = content;
-    if (hasLegacyText) sanitizedMessage.text = message.text;
-    if (hasLegacyImage) sanitizedMessage.imageUri = message.imageUri;
-    sanitizedMessages.push(sanitizedMessage);
-  }
-
-  return sanitizedMessages;
+  return prepareChatMessagesForPersistence(value);
 }
 
 // --- Add message (text + optional image) ---
@@ -155,7 +114,7 @@ export async function loadChatData(uid, setMessages, setSummary) {
   return {
     messages,
     summary,
-    sanitized: messages.length !== parsedMessages.length,
+    sanitized: JSON.stringify(messages) !== JSON.stringify(parsedMessages),
   };
 }
 
@@ -173,7 +132,11 @@ export async function clearChatData(uid, setMessages, setSummary) {
   }
 
   try {
-    await AsyncStorage.multiRemove([chatMessages, chatSummary]);
+    await cancelActiveChatWork();
+    await Promise.all([
+      AsyncStorage.multiRemove([chatMessages, chatSummary]),
+      deleteChatAttachments(uid),
+    ]);
     setMessages?.([]);
     setSummary?.("");
     return { ok: true, error: null };
@@ -280,18 +243,23 @@ async function persistCompactedChat(
   isCurrentUser
 ) {
   const { chatMessages, chatSummary } = getUserStorageKeys(uid);
+  const persistedMessages = prepareChatMessagesForPersistence(messages);
 
   if (!isCurrentUser()) throw createSummaryAbortError();
 
   await AsyncStorage.multiSet([
     [chatSummary, summary],
-    [chatMessages, JSON.stringify(messages)],
+    [chatMessages, JSON.stringify(persistedMessages)],
   ]);
+  await pruneChatAttachments(
+    uid,
+    collectChatAttachmentUris(persistedMessages)
+  );
 
   if (!isCurrentUser()) throw createSummaryAbortError();
 
   setSummary?.(summary);
-  setMessages?.(messages);
+  setMessages?.(persistedMessages);
 }
 
 export async function summarizeHistory({
@@ -438,6 +406,16 @@ export async function checkAndSummarize(
     : messagesOrOptions || {};
   const messages = Array.isArray(options.messages) ? options.messages : [];
   const summary = String(options.summary || "").trim();
+
+  if (options.incognito) {
+    return {
+      messages: messages.slice(-MAX_HISTORY),
+      summary: "",
+      summarized: false,
+      error: null,
+      quota: null,
+    };
+  }
 
   if (messages.length <= MAX_HISTORY) {
     return {

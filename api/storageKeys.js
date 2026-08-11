@@ -1,5 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
+const { shouldClearLegacyOwnedData } = require("./legacyPurgePolicy.cjs");
+
 const USER_STORAGE_PREFIX = "@pantrio:user";
 const LEGACY_STORAGE_OWNER_KEY = "@pantrio:legacyStorageOwner:v1";
 const LEGACY_STORAGE_QUARANTINE_PREFIX = "@pantrio:legacyQuarantine:v1";
@@ -249,10 +251,49 @@ export async function clearUserDataPurgePending(uid) {
   await AsyncStorage.removeItem(purgeIntent);
 }
 
+export async function clearLegacyStorageQuarantine() {
+  const allKeys = await AsyncStorage.getAllKeys();
+  const quarantineKeys = allKeys.filter((key) =>
+    key.startsWith(`${LEGACY_STORAGE_QUARANTINE_PREFIX}:`)
+  );
+  if (quarantineKeys.length > 0) {
+    await AsyncStorage.multiRemove(quarantineKeys);
+  }
+  return quarantineKeys.length;
+}
+
+export async function clearLegacyStorageForUser(uid) {
+  const normalizedUid = normalizeUid(uid);
+
+  return withLegacyMigrationLock(async () => {
+    const [ownerUid, allKeys] = await Promise.all([
+      getLegacyStorageOwner(),
+      AsyncStorage.getAllKeys(),
+    ]);
+    const keysToRemove = allKeys.filter((key) =>
+      key.startsWith(`${LEGACY_STORAGE_QUARANTINE_PREFIX}:`)
+    );
+
+    if (shouldClearLegacyOwnedData(ownerUid, normalizedUid)) {
+      keysToRemove.push(
+        ...Object.values(LEGACY_ASYNC_STORAGE_KEYS),
+        LEGACY_STORAGE_OWNER_KEY
+      );
+    }
+
+    const uniqueKeys = [...new Set(keysToRemove)];
+    if (uniqueKeys.length > 0) {
+      await AsyncStorage.multiRemove(uniqueKeys);
+    }
+    return uniqueKeys.length;
+  });
+}
+
 export async function migrateLegacyAsyncStorageForUser(uid) {
   const normalizedUid = normalizeUid(uid);
 
   return withLegacyMigrationLock(async () => {
+    await clearLegacyStorageQuarantine();
     const ownerUid = await getLegacyStorageOwner();
 
     if (!ownerUid) {
@@ -262,30 +303,11 @@ export async function migrateLegacyAsyncStorageForUser(uid) {
       const ambiguousEntries = legacyEntries.filter(
         ([, value]) => value !== null
       );
-      const quarantineKeys = [];
 
       if (ambiguousEntries.length > 0) {
         // Unscoped values have no trustworthy owner. Assigning them to the
-        // first user who signs in can disclose a previous user's data. Keep a
-        // non-user-addressable recovery copy before removing the live keys.
-        const quarantineId = `${Date.now()}:${Math.random()
-          .toString(16)
-          .slice(2)}`;
-        const quarantineEntries = ambiguousEntries.map(
-          ([sourceKey, value], index) => {
-            const quarantineKey = `${LEGACY_STORAGE_QUARANTINE_PREFIX}:${quarantineId}:${index}`;
-            quarantineKeys.push(quarantineKey);
-            return [
-              quarantineKey,
-              JSON.stringify({
-                sourceKey,
-                quarantinedAt: new Date().toISOString(),
-                value,
-              }),
-            ];
-          }
-        );
-        await AsyncStorage.multiSet(quarantineEntries);
+        // first user who signs in can disclose a previous user's data. With no
+        // recovery UI or trustworthy owner, deletion is the privacy-safe path.
         await AsyncStorage.multiRemove(
           ambiguousEntries.map(([key]) => key)
         );
@@ -294,8 +316,7 @@ export async function migrateLegacyAsyncStorageForUser(uid) {
       return {
         claimed: false,
         migratedKeys: [],
-        quarantinedAmbiguousKeys: ambiguousEntries.map(([key]) => key),
-        quarantineKeys,
+        discardedAmbiguousKeys: ambiguousEntries.map(([key]) => key),
       };
     }
 

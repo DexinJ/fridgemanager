@@ -30,6 +30,7 @@ export default function SearchAndSortBar({
           placeholderTextColor={theme?.textPlaceholder}
           style={[styles.input, { fontSize, color: theme?.inputText }]}
           returnKeyType="search"
+          accessibilityLabel={placeholder}
         />
       </View>
 
@@ -40,6 +41,8 @@ export default function SearchAndSortBar({
         ]}
         onPress={onPressSort}
         activeOpacity={0.85}
+        accessibilityRole="button"
+        accessibilityLabel="Change sort order"
       >
         <Ionicons name={sortIcon} size={fontSize * 1.2} color={theme?.textPrimary} />
       </TouchableOpacity>

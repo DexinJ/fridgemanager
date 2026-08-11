@@ -29,8 +29,8 @@ export default function FridgeScreen() {
   const {
     fridgeItems,
     addToFridge,
-    addToShoppingList,
-    removeFromFridge,
+    addManyToShoppingList,
+    removeManyFromFridge,
     editFridgeItem,
     theme,
     settings,
@@ -342,10 +342,10 @@ For each recipe:
   const addItemsToShopList = useCallback(
     (items) => {
       if (!items || items.length === 0) return;
-      for (const it of items) addToShoppingList(it.name, it.quantity, it.tagIds || []);
+      addManyToShoppingList(items);
       Alert.alert("Shop list", `Added ${items.length} item(s) to shopping list.`);
     },
-    [addToShoppingList]
+    [addManyToShoppingList]
   );
 
   const confirmDeleteItems = useCallback(
@@ -358,7 +358,7 @@ For each recipe:
           text: "Delete",
           style: "destructive",
           onPress: () => {
-            for (const it of items) removeFromFridge(it.id);
+            removeManyFromFridge(items.map((item) => item.id));
             setSelectedIds(new Set());
             setContextMenuVisible(false);
             setContextFromRect(null);
@@ -367,7 +367,7 @@ For each recipe:
         },
       ]);
     },
-    [removeFromFridge]
+    [removeManyFromFridge]
   );
 
   const openEditForItem = useCallback((item) => {
@@ -456,6 +456,13 @@ For each recipe:
     [selectedItems, openRecipesForItems, addItemsToShopList, openEditForItem, confirmDeleteItems]
   );
 
+  const handleMeasuredLongPress = useCallback((rect, item) => {
+    if (editMode) return;
+    setContextItem(item);
+    setContextFromRect(rect);
+    setContextMenuVisible(true);
+  }, [editMode]);
+
   // render item with extracted component
   const renderItem = useCallback(
     ({ item }) => (
@@ -466,15 +473,17 @@ For each recipe:
         editMode={editMode}
         selected={selectedIds.has(item.id)}
         onToggleSelect={toggleSelect}
-        onMeasuredLongPress={(rect, it) => {
-          if (editMode) return;
-          setContextItem(it);
-          setContextFromRect(rect);
-          setContextMenuVisible(true);
-        }}
+        onMeasuredLongPress={handleMeasuredLongPress}
       />
     ),
-    [theme, fontSize, editMode, selectedIds, toggleSelect]
+    [
+      theme,
+      fontSize,
+      editMode,
+      selectedIds,
+      toggleSelect,
+      handleMeasuredLongPress,
+    ]
   );
 
   const emptyText =

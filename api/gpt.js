@@ -2,24 +2,33 @@
 // NOTE: Streams via your backend WS (/chat).
 // Tools are executed on the frontend (this file + gptTools.js).
 
-import { useContext, useEffect, useRef } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef } from "react";
+import { AppState } from "react-native";
 import { auth } from "../auth/firebaseClient";
 import { useAccountSession } from "../context/AccountSessionContext";
-import { GlobalContext } from "../context/GlobalContext";
+import { ChatActionsContext, GlobalContext } from "../context/GlobalContext";
 import { BACKEND_WS_URL } from "./backendConfig";
 import { createBackendResponseError } from "./backendErrors";
 import { buildSystemMessage } from "./buildSystemMessage";
-import { useGPTTools } from "./gptTools";
+import {
+  claimClientOwnedGPTToolCalls,
+  useGPTTools,
+} from "./gptTools";
 import {
   addMessage,
   checkAndSummarize,
   formatConversationMemory,
 } from "./memoryManager";
 import { getCustomAiProviderSettings } from "./aiProviderSettings";
+import { registerChatCancellation } from "./chatLifecycle";
 import { generateAppleIntelligenceToolTurn } from "../modules/apple-intelligence/src";
 
 const DEFAULT_MODEL = "gpt-5";
 const REQUEST_TIMEOUT_MS = 180_000;
+const STREAM_RENDER_INTERVAL_MS = 50;
+const WS_IDLE_CLOSE_MS = 30_000;
+const MAX_IMAGE_REQUEST_URI_LENGTH = 4 * 1024 * 1024;
+const GptContext = createContext(null);
 
 const objectSchema = (properties, required = []) => ({
   type: "object",
@@ -65,7 +74,11 @@ function assistantText(content) {
 
 // ✅ Convert your app messages into Chat Completions format
 // If a message has an image AND it is NOT the last message, replace image with "[image]"
-function toChatCompletionsMessages(appMessages, systemText) {
+function toChatCompletionsMessages(
+  appMessages,
+  systemText,
+  lastImageRequestUri = ""
+) {
     const out = [];
     const msgs = Array.isArray(appMessages) ? appMessages : [];
     const lastIdx = msgs.length - 1;
@@ -117,9 +130,13 @@ function toChatCompletionsMessages(appMessages, systemText) {
           contentParts.push({ type: "text", text });
         }
         if (hasImage) {
+          const requestImageUri =
+            isLast && lastImageRequestUri
+              ? lastImageRequestUri
+              : imageUri;
           contentParts.push({
             type: "image_url",
-            image_url: { url: imageUri },
+            image_url: { url: requestImageUri },
           });
         }
         if (contentParts.length === 0) {
@@ -223,84 +240,175 @@ async function fetchWithLifecycleTimeout(
   }
 }
 
-export const useGpt = () => {
+const useGptRuntime = () => {
   const {
     settings,
-    storageHydrated,
     storageOwnerUid,
     fridgeItems,
     shoppingListItems,
-    setMessages,
-    summary,
-    setSummary,
-    setWaiting,
   } = useContext(GlobalContext);
+  const {
+    setMessages,
+    setSummary,
+    setReceiving,
+    setWaiting,
+    getChatSnapshot,
+  } = useContext(ChatActionsContext);
   const { applyRealtimeState } = useAccountSession();
 
   const toolHandlers = useGPTTools();
+  const toolHandlersRef = useRef(toolHandlers);
+  useEffect(() => {
+    toolHandlersRef.current = toolHandlers;
+  }, [toolHandlers]);
 
   const wsRef = useRef(null);
   const wsReadyRef = useRef(false);
+  const wsIdleTimerRef = useRef(null);
 
-  // requestId -> { resolve, reject, text, currentAssistantMessage }
+  // requestId -> streamed response job
   const inflightRef = useRef(new Map());
+  const activeStreamsRef = useRef(new Set());
   const lifecycleGenerationRef = useRef(1);
   const lifecycleAbortControllerRef = useRef(new AbortController());
 
-  useEffect(() => {
-    if (lifecycleAbortControllerRef.current.signal.aborted) {
-      lifecycleAbortControllerRef.current = new AbortController();
+  const clearWsIdleTimer = useCallback(() => {
+    clearTimeout(wsIdleTimerRef.current);
+    wsIdleTimerRef.current = null;
+  }, []);
+
+  const closeOwnedSocket = useCallback((ws = wsRef.current) => {
+    if (!ws) {
+      clearWsIdleTimer();
+      return;
     }
-    const lifecycleController = lifecycleAbortControllerRef.current;
-    const inflight = inflightRef.current;
+    if (wsRef.current !== ws) return;
+    clearWsIdleTimer();
+    wsRef.current = null;
+    wsReadyRef.current = false;
+    ws.onopen = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onmessage = null;
+    if (
+      ws.readyState === WebSocket.OPEN ||
+      ws.readyState === WebSocket.CONNECTING
+    ) {
+      try {
+        ws.close();
+      } catch {
+        // Native WebSocket may already be transitioning to CLOSED.
+      }
+    }
+  }, [clearWsIdleTimer]);
 
-    return () => {
+  const scheduleIdleSocketClose = useCallback((ws = wsRef.current) => {
+    clearWsIdleTimer();
+    if (!ws || inflightRef.current.size > 0) return;
+    wsIdleTimerRef.current = setTimeout(() => {
+      if (wsRef.current === ws && inflightRef.current.size === 0) {
+        closeOwnedSocket(ws);
+      }
+    }, WS_IDLE_CLOSE_MS);
+  }, [clearWsIdleTimer, closeOwnedSocket]);
+
+  const cancelAllActiveRequests = useCallback(
+    (reason = "The chat request was cancelled.") => {
       lifecycleGenerationRef.current += 1;
-      lifecycleController.abort();
-      const ws = wsRef.current;
-      const requestIds = [...inflight.keys()];
+      lifecycleAbortControllerRef.current.abort();
+      lifecycleAbortControllerRef.current = new AbortController();
 
+      const ws = wsRef.current;
+      const inflight = inflightRef.current;
       if (ws?.readyState === WebSocket.OPEN) {
-        for (const requestId of requestIds) {
+        for (const requestId of inflight.keys()) {
           try {
             ws.send(JSON.stringify({ type: "cancel", requestId }));
           } catch {
-            // Closing the socket below also aborts active backend work.
+            // Local cancellation below still prevents late state updates.
           }
         }
       }
 
       for (const job of inflight.values()) {
         clearTimeout(job.timeoutId);
+        clearTimeout(job.deltaTimerId);
         job.reject?.(
-          backendErrorFromMessage(
-            { message: "The chat request was cancelled because the session ended." },
-            "REQUEST_CANCELLED"
-          )
+          backendErrorFromMessage({ message: reason }, "REQUEST_CANCELLED")
         );
       }
       inflight.clear();
+      activeStreamsRef.current.clear();
+      setReceiving(false);
+      setWaiting(false);
+      scheduleIdleSocketClose(ws);
+    },
+    [scheduleIdleSocketClose, setReceiving, setWaiting]
+  );
 
-      wsRef.current = null;
-      wsReadyRef.current = false;
-      if (ws) {
-        ws.onopen = null;
-        ws.onclose = null;
-        ws.onerror = null;
-        ws.onmessage = null;
-        if (
-          ws.readyState === WebSocket.OPEN ||
-          ws.readyState === WebSocket.CONNECTING
-        ) {
-          try {
-            ws.close();
-          } catch {
-            // The connection may already be closing on the native side.
-          }
-        }
-      }
+  useEffect(
+    () => registerChatCancellation(cancelAllActiveRequests),
+    [cancelAllActiveRequests]
+  );
+
+  useEffect(() => {
+    if (lifecycleAbortControllerRef.current.signal.aborted) {
+      lifecycleAbortControllerRef.current = new AbortController();
+    }
+    return () => {
+      cancelAllActiveRequests(
+        "The chat request was cancelled because the session ended."
+      );
+      closeOwnedSocket();
     };
-  }, []);
+  }, [cancelAllActiveRequests, closeOwnedSocket]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (nextState) => {
+      if (nextState === "active") return;
+      cancelAllActiveRequests(
+        "The chat request was cancelled because the app moved to the background."
+      );
+      closeOwnedSocket();
+    });
+    return () => subscription.remove();
+  }, [cancelAllActiveRequests, closeOwnedSocket]);
+
+  function flushAssistantDelta(job) {
+    clearTimeout(job.deltaTimerId);
+    job.deltaTimerId = null;
+    const pendingDelta = job.pendingDelta;
+    job.pendingDelta = "";
+    if (!pendingDelta || lifecycleGenerationRef.current !== job.lifecycleGeneration) {
+      return;
+    }
+
+    setMessages((previous) => {
+      const prev = Array.isArray(previous) ? previous : [];
+      const index = prev.findIndex((message) => message?.id === job.messageId);
+      if (index < 0) {
+        return [
+          ...prev,
+          {
+            id: job.messageId,
+            role: "assistant",
+            content: [{ type: "output_text", text: pendingDelta }],
+          },
+        ];
+      }
+
+      const current = prev[index];
+      const currentText = assistantText(current?.content);
+      const updated = [...prev];
+      updated[index] = {
+        ...current,
+        content: [
+          { type: "output_text", text: `${currentText}${pendingDelta}` },
+        ],
+      };
+      return updated;
+    });
+  }
 
   function assertCurrentLifecycle(generation) {
     if (lifecycleGenerationRef.current === generation) return;
@@ -311,12 +419,14 @@ export const useGpt = () => {
   }
 
   function ensureWs() {
+    clearWsIdleTimer();
     const existing = wsRef.current;
     if (
       existing &&
       (existing.readyState === WebSocket.OPEN ||
         existing.readyState === WebSocket.CONNECTING)
     ) {
+      scheduleIdleSocketClose(existing);
       return existing;
     }
 
@@ -325,12 +435,18 @@ export const useGpt = () => {
     wsReadyRef.current = false;
 
     ws.onopen = () => {
+      if (wsRef.current !== ws) return;
       wsReadyRef.current = true;
+      scheduleIdleSocketClose(ws);
     };
 
     ws.onclose = () => {
+      if (wsRef.current !== ws) return;
+      clearWsIdleTimer();
+      wsRef.current = null;
       wsReadyRef.current = false;
       for (const [requestId, job] of inflightRef.current.entries()) {
+        flushAssistantDelta(job);
         clearTimeout(job.timeoutId);
         job.reject?.(
           backendErrorFromMessage(
@@ -340,13 +456,17 @@ export const useGpt = () => {
         );
         inflightRef.current.delete(requestId);
       }
+      setReceiving(false);
+      setWaiting(false);
     };
 
     ws.onerror = (e) => {
+      if (wsRef.current !== ws) return;
       console.warn("WS error:", e?.message || e);
     };
 
     ws.onmessage = async (evt) => {
+      if (wsRef.current !== ws) return;
       let msg;
       try {
         msg = JSON.parse(evt.data);
@@ -391,6 +511,7 @@ export const useGpt = () => {
         clearTimeout(job.timeoutId);
         job.reject?.(backendErrorFromMessage(msg, "RATE_LIMITED"));
         inflightRef.current.delete(requestId);
+        scheduleIdleSocketClose(ws);
         return;
       }
 
@@ -405,33 +526,33 @@ export const useGpt = () => {
               : "";
         if (!delta) return;
         job.text += delta;
-
-        setMessages((prev) => {
-          const updated = [...prev];
-
-          if (!job.currentAssistantMessage) {
-            job.currentAssistantMessage = {
-              role: "assistant",
-              content: [{ type: "output_text", text: delta }],
-            };
-            updated.push(job.currentAssistantMessage);
-          } else {
-            job.currentAssistantMessage.content[0].text += delta;
-          }
-
-          return updated;
-        });
+        job.pendingDelta += delta;
+        if (!job.deltaTimerId) {
+          job.deltaTimerId = setTimeout(
+            () => flushAssistantDelta(job),
+            STREAM_RENDER_INTERVAL_MS
+          );
+        }
 
         return;
       }
 
       // 2) Tool call(s) from backend → execute locally → send tool_results back
-      if (type === "tool_calls") {
+      if (type === "tool_calls" || type === "awaiting_tool_results") {
         setWaiting(false);
         const toolCalls = Array.isArray(msg.toolCalls) ? msg.toolCalls : [];
+        const claimedIds =
+          job.claimedClientToolCallIds ||
+          (job.claimedClientToolCallIds = new Set());
+        const clientToolCalls = claimClientOwnedGPTToolCalls(toolCalls, {
+          toolOwner: msg.toolOwner,
+          round: msg.round || "legacy",
+          claimedIds,
+        });
+        if (clientToolCalls.length === 0) return;
         const results = [];
 
-        for (const tc of toolCalls) {
+        for (const tc of clientToolCalls) {
           if (inflightRef.current.get(requestId) !== job) return;
           const tool_call_id = tc?.id || tc?.tool_call_id || null;
           const name = tc?.function?.name || tc?.name || "";
@@ -451,7 +572,7 @@ export const useGpt = () => {
             args = parsed.value;
           }
 
-          const handler = toolHandlers?.[name];
+          const handler = toolHandlersRef.current?.[name];
           if (!handler) {
             results.push({
               tool_call_id,
@@ -494,17 +615,23 @@ export const useGpt = () => {
 
         // Send results back to backend so it can continue the model run
         try {
-          wsRef.current?.send(
-            JSON.stringify({
-              type: "tool_results",
-              requestId,
-              results,
-            })
-          );
+          if (
+            wsRef.current !== ws ||
+            ws.readyState !== WebSocket.OPEN
+          ) {
+            throw new Error("The chat connection changed during tool execution.");
+          }
+          ws.send(JSON.stringify({
+            type: "tool_results",
+            requestId,
+            results,
+          }));
         } catch (e) {
+          flushAssistantDelta(job);
           clearTimeout(job.timeoutId);
           job.reject?.(e);
           inflightRef.current.delete(requestId);
+          scheduleIdleSocketClose(ws);
         }
 
         return;
@@ -513,17 +640,21 @@ export const useGpt = () => {
       // 3) Errors / Done
       if (type === "error") {
         setWaiting(false);
+        flushAssistantDelta(job);
         clearTimeout(job.timeoutId);
         job.reject?.(backendErrorFromMessage(msg));
         inflightRef.current.delete(requestId);
+        scheduleIdleSocketClose(ws);
         return;
       }
 
       if (type === "done") {
         setWaiting(false);
+        flushAssistantDelta(job);
         clearTimeout(job.timeoutId);
         job.resolve?.(job.text);
         inflightRef.current.delete(requestId);
+        scheduleIdleSocketClose(ws);
         return;
       }
     };
@@ -578,7 +709,10 @@ export const useGpt = () => {
       storageOwnerUid,
       baseUrl,
       {
-        migrateLegacy: storageHydrated,
+        // GlobalContext completes (or fail-closes) the one-time migration
+        // before the authenticated UI can issue custom-provider requests.
+        // Re-running it here added several SecureStore reads to every prompt.
+        migrateLegacy: false,
         fallbackModel: configuredModel,
       }
     );
@@ -700,9 +834,10 @@ ${toolDescriptions}`;
     throw new Error("Apple Intelligence exceeded the tool-call limit.");
   }
 
-  const streamMessage = async ({
+  const runStreamMessage = async ({
     text,
     imageUri,
+    imageRequestUri,
     language = "en",
   }) => {
     const lifecycleGeneration = lifecycleGenerationRef.current;
@@ -713,6 +848,13 @@ ${toolDescriptions}`;
           ? String(text)
           : "";
     const normalizedImageUri = typeof imageUri === "string" ? imageUri : "";
+    const normalizedImageRequestUri =
+      typeof imageRequestUri === "string" && imageRequestUri.trim()
+        ? imageRequestUri.trim()
+        : normalizedImageUri;
+    if (normalizedImageRequestUri.length > MAX_IMAGE_REQUEST_URI_LENGTH) {
+      throw new Error("The selected image is too large to send.");
+    }
     if (!normalizedText.trim() && !normalizedImageUri.trim()) {
       throw new Error("A chat message must include text or an image.");
     }
@@ -726,14 +868,16 @@ ${toolDescriptions}`;
     // Custom and on-device providers never route summarization through our backend.
     const selectedProvider = settings?.advanced?.aiProvider ||
       (settings?.advanced?.useCustomAi ? "custom" : "pantrio");
+    const incognito = Boolean(settings?.privacy?.incognito);
+    const currentSummary = getChatSnapshot?.().summary || "";
     let requestMessages = updatedMessages.slice(-20);
-    let requestSummary = summary;
+    let requestSummary = incognito ? "" : currentSummary;
 
-    if (selectedProvider === "pantrio") {
+    if (selectedProvider === "pantrio" && !incognito) {
       const memory = await checkAndSummarize({
         uid: storageOwnerUid,
         messages: updatedMessages,
-        summary,
+        summary: currentSummary,
         setSummary,
         setMessages,
         language,
@@ -763,7 +907,11 @@ ${toolDescriptions}`;
     if (__DEV__ && img) {
       console.log("Attaching an image to the chat request");
     }
-    const ccMessages = toChatCompletionsMessages(requestMessages, systemText);
+    const ccMessages = toChatCompletionsMessages(
+      requestMessages,
+      systemText,
+      normalizedImageRequestUri
+    );
 
     if (selectedProvider === "custom") {
       const fullText = await runCustomAi(ccMessages, {
@@ -827,18 +975,23 @@ ${toolDescriptions}`;
         resolve,  
         reject,
         text: "",
-        currentAssistantMessage: null,
+        messageId: `assistant-${requestId}`,
+        pendingDelta: "",
+        deltaTimerId: null,
+        claimedClientToolCallIds: new Set(),
         timeoutId: null,
         lifecycleGeneration,
       };
       job.timeoutId = setTimeout(() => {
         if (inflightRef.current.get(requestId) !== job) return;
+        flushAssistantDelta(job);
         try {
           ws.send(JSON.stringify({ type: "cancel", requestId }));
         } catch {
           // The timeout still rejects locally if the connection already closed.
         }
         inflightRef.current.delete(requestId);
+        scheduleIdleSocketClose(ws);
         reject(
           backendErrorFromMessage(
             { message: "The chat request timed out. Please try again." },
@@ -853,6 +1006,7 @@ ${toolDescriptions}`;
       } catch (e) {
         clearTimeout(job.timeoutId);
         inflightRef.current.delete(requestId);
+        scheduleIdleSocketClose(ws);
         reject(e);
       }
     });
@@ -860,12 +1014,30 @@ ${toolDescriptions}`;
     return fullText;
   };
 
+  const streamMessage = async (request) => {
+    const activityToken = Symbol("chat-stream");
+    activeStreamsRef.current.add(activityToken);
+    setReceiving(true);
+    try {
+      return await runStreamMessage(request);
+    } finally {
+      activeStreamsRef.current.delete(activityToken);
+      if (activeStreamsRef.current.size === 0) setReceiving(false);
+    }
+  };
+
   const sendMessage = async ({
     text,
     imageUri,
+    imageRequestUri,
     language = "en",
   }) => {
-    const replyText = await streamMessage({ text, imageUri, language });
+    const replyText = await streamMessage({
+      text,
+      imageUri,
+      imageRequestUri,
+      language,
+    });
 
     return {
       response: { output_text: replyText },
@@ -873,10 +1045,27 @@ ${toolDescriptions}`;
   };
 
   const cancel = (requestId) => {
+    if (!requestId) {
+      cancelAllActiveRequests();
+      return;
+    }
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(JSON.stringify({ type: "cancel", requestId }));
   };
 
-  return { streamMessage, sendMessage, cancel };
+  return { streamMessage, sendMessage, cancel, cancelAll: cancelAllActiveRequests };
 };
+
+export function GptProvider({ children }) {
+  const runtime = useGptRuntime();
+  return <GptContext.Provider value={runtime}>{children}</GptContext.Provider>;
+}
+
+export function useGpt() {
+  const runtime = useContext(GptContext);
+  if (!runtime) {
+    throw new Error("useGpt must be used within GptProvider.");
+  }
+  return runtime;
+}

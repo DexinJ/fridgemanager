@@ -1,4 +1,4 @@
-import { useContext, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Image,
@@ -8,9 +8,13 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import ImageViewing from "react-native-image-viewing";
+import ImageViewing from "./ImageViewer";
 import { getLinkPreview } from "link-preview-js";
 import { GlobalContext } from "../context/GlobalContext";
+import {
+  canFetchLinkPreview,
+  shouldAutoLoadLinkPreview,
+} from "../utils/linkPreviewPolicy";
 
 const MAX_LINK_PREVIEWS = 3;
 
@@ -30,67 +34,11 @@ function getDomain(url) {
   }
 }
 
-function canFetchPreview(rawUrl) {
-  try {
-    const parsed = new URL(rawUrl);
-    if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
-      return false;
-    }
-
-    const hostname = parsed.hostname
-      .toLowerCase()
-      .replace(/^\[|\]$/g, "")
-      .replace(/\.$/, "");
-    if (
-      !hostname ||
-      hostname === "localhost" ||
-      hostname.endsWith(".localhost") ||
-      hostname.endsWith(".local") ||
-      (!hostname.includes(".") && !hostname.includes(":"))
-    ) {
-      return false;
-    }
-
-    const ipv4 = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-    if (ipv4) {
-      const octets = ipv4.slice(1).map(Number);
-      if (octets.some((octet) => octet > 255)) return false;
-      const [a, b] = octets;
-      return !(
-        a === 0 ||
-        a === 10 ||
-        a === 127 ||
-        (a === 100 && b >= 64 && b <= 127) ||
-        (a === 169 && b === 254) ||
-        (a === 172 && b >= 16 && b <= 31) ||
-        (a === 192 && b === 168) ||
-        a >= 224
-      );
-    }
-
-    if (hostname.includes(":")) {
-      if (
-        hostname === "::" ||
-        hostname === "::1" ||
-        /^fe[89ab]/.test(hostname) ||
-        /^f[cd]/.test(hostname)
-      ) {
-        return false;
-      }
-
-      const mappedIpv4 = hostname.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-      if (mappedIpv4) return canFetchPreview(`https://${mappedIpv4[1]}`);
-    }
-
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export default function MessageBubble({ text, imageUri, isUser }) {
+function MessageBubble({ text, imageUri, isUser }) {
   const { settings, theme } = useContext(GlobalContext);
   const fontSize = settings?.ux?.fontSize || 16;
+  const incognito = Boolean(settings?.privacy?.incognito);
+  const autoLoadPreview = shouldAutoLoadLinkPreview({ incognito });
 
   const [previewVisible, setPreviewVisible] = useState(false);
   const mountedRef = useRef(false);
@@ -130,59 +78,51 @@ export default function MessageBubble({ text, imageUri, isUser }) {
     return deduped;
   }, [displayText]);
 
-  // --- Fetch previews for all URLs ---
-  useEffect(() => {
-    let cancelled = false;
+  const metaByUrl = new Map(
+    linkMetas.filter((meta) => urls.includes(meta.url)).map((meta) => [meta.url, meta])
+  );
 
-    if (!urls.length) {
+  const loadPreview = async (url) => {
+    if (!canFetchLinkPreview(url)) {
+      setLinkMetas((previous) => [
+        ...previous.filter((meta) => meta.url !== url),
+        { url, status: "blocked", title: null, description: null },
+      ]);
       return;
     }
 
-    (async () => {
-      try {
-        const results = await Promise.all(
-          urls.map(async (url) => {
-            if (!canFetchPreview(url)) {
-              return { url, title: null, description: null, images: [] };
-            }
+    setLinkMetas((previous) => [
+      ...previous.filter((meta) => meta.url !== url),
+      { url, status: "loading", title: null, description: null },
+    ]);
 
-            try {
-              const data = await getLinkPreview(url, {
-                headers: {
-                  "user-agent": "Twitterbot/1.0",
-                  "accept-language": "en-US",
-                },
-                timeout: 4000,
-                imagesPropertyType: "og",
-              });
-
-              return {
-                url,
-                title: toDisplayText(data?.title) || null,
-                description: toDisplayText(data?.description) || null,
-                images: Array.isArray(data?.images) ? data.images : [],
-              };
-            } catch {
-              return null;
-            }
-          })
-        );
-
-        if (cancelled) return;
-
-        // keep only successful previews, preserve order
-        setLinkMetas(results.filter(Boolean));
-      } catch {
-        if (!cancelled) setLinkMetas([]);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [urls]);
-
-  const visibleLinkMetas = linkMetas.filter((meta) => urls.includes(meta.url));
+    try {
+      const data = await getLinkPreview(url, {
+        headers: {
+          "user-agent": "Twitterbot/1.0",
+          "accept-language": "en-US",
+        },
+        timeout: 4000,
+        imagesPropertyType: "og",
+      });
+      if (!mountedRef.current) return;
+      setLinkMetas((previous) => [
+        ...previous.filter((meta) => meta.url !== url),
+        {
+          url,
+          status: "loaded",
+          title: toDisplayText(data?.title) || null,
+          description: toDisplayText(data?.description) || null,
+        },
+      ]);
+    } catch {
+      if (!mountedRef.current) return;
+      setLinkMetas((previous) => [
+        ...previous.filter((meta) => meta.url !== url),
+        { url, status: "failed", title: null, description: null },
+      ]);
+    }
+  };
 
   const openLink = async (url) => {
     try {
@@ -206,7 +146,11 @@ export default function MessageBubble({ text, imageUri, isUser }) {
           isUser ? styles.userAlign : styles.aiAlign,
         ]}
       >
-        <TouchableOpacity onPress={openPreview}>
+        <TouchableOpacity
+          onPress={openPreview}
+          accessibilityRole="imagebutton"
+          accessibilityLabel="Open attached image"
+        >
           <Image
             source={{ uri: safeImageUri }}
             style={styles.thumbnail}
@@ -244,11 +188,15 @@ export default function MessageBubble({ text, imageUri, isUser }) {
       </View>
 
       {/* --- Link preview cards OUTSIDE the bubble --- */}
-      {!!visibleLinkMetas.length && (
+      {!!urls.length && (
         <View style={[styles.linkList, isUser ? styles.userAlign : styles.aiAlign]}>
-          {visibleLinkMetas.map((m) => (
-            <TouchableOpacity
-              key={m.url}
+          {urls.map((url) => {
+            const meta = metaByUrl.get(url);
+            const loading = meta?.status === "loading";
+            const loaded = meta?.status === "loaded";
+            return (
+            <View
+              key={url}
               style={[
                 styles.linkCard,
                 {
@@ -256,34 +204,25 @@ export default function MessageBubble({ text, imageUri, isUser }) {
                   borderColor: theme.border ?? "rgba(0,0,0,0.12)",
                 },
               ]}
-              onPress={() => openLink(m.url)}
-              activeOpacity={0.9}
             >
-                <View
-                  style={[
-                    styles.linkHero,
-                    { backgroundColor: theme.modalBackground ?? "#eee" },
-                  ]}
-                />
-
               <View style={styles.linkBody}>
-                {!!m.title && (
+                {!!meta?.title && (
                   <Text
                     selectable
                     style={[styles.linkTitle, { color: theme.textPrimary }]}
                     numberOfLines={2}
                   >
-                    {m.title}
+                    {meta.title}
                   </Text>
                 )}
 
-                {!!m.description && (
+                {!!meta?.description && (
                   <Text
                     selectable
                     style={[styles.linkDesc, { color: theme.textSecondary }]}
                     numberOfLines={3}
                   >
-                    {m.description}
+                    {meta.description}
                   </Text>
                 )}
 
@@ -292,11 +231,49 @@ export default function MessageBubble({ text, imageUri, isUser }) {
                   style={[styles.linkDomain, { color: theme.textSecondary }]}
                   numberOfLines={1}
                 >
-                  {getDomain(m.url)}
+                  {getDomain(url)}
                 </Text>
+                {!loaded && (
+                  <Text style={[styles.linkHint, { color: theme.textSecondary }]}>
+                    {loading
+                      ? "Loading preview…"
+                      : meta?.status === "blocked"
+                        ? "Preview blocked for safety."
+                        : meta?.status === "failed"
+                          ? "Preview unavailable."
+                          : incognito
+                            ? "Preview is off in incognito until you choose to load it."
+                            : autoLoadPreview
+                              ? "Loading preview…"
+                              : "Preview loads only when requested."}
+                  </Text>
+                )}
+                <View style={styles.linkActions}>
+                  {!loaded && meta?.status !== "blocked" && (
+                    <TouchableOpacity
+                      onPress={() => loadPreview(url)}
+                      disabled={loading}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Load preview for ${getDomain(url)}`}
+                      accessibilityHint="This contacts the linked website."
+                      accessibilityState={{ disabled: loading, busy: loading }}
+                    >
+                      <Text style={[styles.linkAction, { color: theme.accent }]}>
+                        {loading ? "Loading…" : "Load preview"}
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                  <TouchableOpacity
+                    onPress={() => openLink(url)}
+                    accessibilityRole="link"
+                    accessibilityLabel={`Open ${getDomain(url)}`}
+                  >
+                    <Text style={[styles.linkAction, { color: theme.accent }]}>Open link</Text>
+                  </TouchableOpacity>
+                </View>
               </View>
-            </TouchableOpacity>
-          ))}
+            </View>
+          );})}
         </View>
       )}
     </View>
@@ -359,10 +336,6 @@ const styles = StyleSheet.create({
     elevation: 3, 
   },
 
-  linkHero: {
-    width: "100%",
-  },
-
   linkBody: {
     padding: 12,
   },
@@ -384,4 +357,20 @@ const styles = StyleSheet.create({
     fontSize: 12,
     opacity: 0.85,
   },
+  linkHint: {
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 6,
+  },
+  linkActions: {
+    flexDirection: "row",
+    gap: 18,
+    marginTop: 10,
+  },
+  linkAction: {
+    fontSize: 13,
+    fontWeight: "700",
+  },
 });
+
+export default memo(MessageBubble);

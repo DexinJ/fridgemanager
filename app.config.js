@@ -102,7 +102,7 @@ function validateProductionUrl(name, protocol, { allowPathQuery = false } = {}) 
   }
 }
 
-function validateEasEnvironment(productionBuild) {
+function validateBuildEnvironment(productionBuild) {
   const requiredNames = productionBuild
     ? [
         ...REQUIRED_EAS_ENV,
@@ -113,7 +113,7 @@ function validateEasEnvironment(productionBuild) {
   const missing = requiredNames.filter((name) => !envValue(name));
   if (missing.length) {
     throw new Error(
-      `Missing required variables in the selected EAS environment: ${missing.join(", ")}.`
+      `Missing required variables in the selected build environment: ${missing.join(", ")}.`
     );
   }
 
@@ -152,12 +152,28 @@ function hardenBuildProperties(plugins, productionBuild) {
 
 module.exports = ({ config }) => {
   const easBuild = process.env.EAS_BUILD === "true";
-  const productionBuild =
-    easBuild && process.env.EAS_BUILD_PROFILE === "production";
+  const buildProfile = String(process.env.EAS_BUILD_PROFILE || "")
+    .trim()
+    .toLowerCase();
+  const appEnvironment = envValue("EXPO_PUBLIC_APP_ENV").toLowerCase();
+  if (
+    appEnvironment &&
+    !["production", "development", "test"].includes(appEnvironment)
+  ) {
+    throw new Error(
+      "EXPO_PUBLIC_APP_ENV must be production, development, or test."
+    );
+  }
+  const productionBuild = appEnvironment
+    ? appEnvironment === "production"
+    : buildProfile
+      ? buildProfile === "production"
+      : process.env.NODE_ENV === "production";
+  const configuredBuild = easBuild || productionBuild;
   const googleIosClientId = envValue("EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID");
 
   validateExpoProject(config);
-  if (easBuild) validateEasEnvironment(productionBuild);
+  if (configuredBuild) validateBuildEnvironment(productionBuild);
 
   let plugins = (config.plugins || []).filter(
     (plugin) => pluginName(plugin) !== GOOGLE_SIGN_IN_PLUGIN
@@ -170,9 +186,9 @@ module.exports = ({ config }) => {
       GOOGLE_SIGN_IN_PLUGIN,
       { iosUrlScheme: googleIosUrlScheme(googleIosClientId) },
     ]);
-  } else if (easBuild) {
+  } else if (configuredBuild) {
     throw new Error(
-      "EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID is required for EAS builds. Configure it in the selected EAS environment."
+      "EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID is required for app builds. Configure it in the selected build environment."
     );
   }
   plugins = hardenBuildProperties(plugins, productionBuild);
