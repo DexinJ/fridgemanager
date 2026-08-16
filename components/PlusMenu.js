@@ -7,7 +7,7 @@ import { persistChatAttachment } from "../api/chatAttachments";
 import { GlobalContext } from "../context/GlobalContext";
 
 const MAX_IMAGE_DIMENSION = 1_600;
-const MAX_IMAGE_DATA_URL_LENGTH = 4 * 1024 * 1024;
+// const MAX_IMAGE_DATA_URL_LENGTH = 4 * 1024 * 1024;
 const MAX_SOURCE_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_SOURCE_IMAGE_EDGE = 30_000;
 const MAX_SOURCE_IMAGE_PIXELS = 100_000_000;
@@ -76,9 +76,9 @@ export default function PlusMenu({ onSend }) {
     });
     if (!result.base64) throw new Error("Failed to create base64 image");
     const dataUrl = `data:image/jpeg;base64,${result.base64}`;
-    if (dataUrl.length > MAX_IMAGE_DATA_URL_LENGTH) {
-      throw new Error("The selected image is too large to send.");
-    }
+    // if (dataUrl.length > MAX_IMAGE_DATA_URL_LENGTH) {
+    //   throw new Error("The selected image is too large to send.");
+    // }
     const displayUri = settings?.privacy?.incognito
       ? result.uri
       : await persistChatAttachment(storageOwnerUid, result.uri);

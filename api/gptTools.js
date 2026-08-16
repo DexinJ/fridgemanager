@@ -6,10 +6,16 @@
 
 import { useContext } from "react";
 import { GlobalContext } from "../context/GlobalContext";
+import {
+  createFridgeProposalActionId,
+  normalizeFridgeProposalCategories,
+  normalizeFridgeProposalQuantity,
+} from "../utils/fridgeProposal";
+import { normalizeRecipePreferencePatch } from "../utils/recipePreferences";
 
 // Compatibility guard for gateways that predate explicit client ownership and
 // published the full mixed tool batch. New gateways send only client calls.
-const SERVER_OWNED_TOOL_NAMES = new Set(["webSearch"]);
+const SERVER_OWNED_TOOL_NAMES = new Set(["webSearch", "recommendRecipes"]);
 
 export function isServerOwnedGPTTool(name) {
   return SERVER_OWNED_TOOL_NAMES.has(String(name || ""));
@@ -356,36 +362,59 @@ export function useGPTTools() {
     getFridgeContents: async () => ({ __context: true, items: fridgeItems }),
     getShoppingListContents: async () => ({ __context: true, items: shoppingListItems }),
 
+    proposeRecipePreferenceUpdate: async ({ patch, summary, operation }) => {
+      const safePatch = normalizeRecipePreferencePatch(patch);
+      const fields = Object.keys(safePatch);
+      const safeOperation = ["merge", "remove", "replace"].includes(operation)
+        ? operation
+        : "merge";
+      if (fields.length === 0) {
+        return {
+          ok: false,
+          proposalShown: false,
+          error: "No valid recipe preference changes were provided.",
+        };
+      }
+
+      setMessages?.((previous) => [
+        ...(Array.isArray(previous) ? previous : []),
+        {
+          role: "assistant",
+          type: "ui_action",
+          action: {
+            kind: "recipe_preference_update",
+            title: "Confirm preference changes",
+            summary:
+              typeof summary === "string" ? summary.trim().slice(0, 160) : "",
+            operation: safeOperation,
+            patch: safePatch,
+          },
+        },
+      ]);
+
+      return {
+        ok: true,
+        proposalShown: true,
+        operation: safeOperation,
+        fields,
+        message: "A confirmation card was shown to the user.",
+      };
+    },
+
     proposeAddAllToFridge: async ({ items, title }) => {
       const clean = (v) => String(v ?? "").trim();
       const safeTitle = typeof title === "string" ? title.trim() : "";
-    
-      const categoriesObjToArray = (cats) => {
-        if (!cats || typeof cats !== "object" || Array.isArray(cats)) return undefined;
-    
-        // Order is intentional but not required
-        const out = [
-          clean(cats.storage),
-          clean(cats.urgency),
-          clean(cats.food_type),
-          clean(cats.state),
-        ].filter(Boolean);
-    
-        return out.length ? out : undefined;
-      };
-    
+
       const safeItems = (Array.isArray(items) ? items : [])
         .map((it) => {
           const name = clean(it?.name);
           if (!name) return null;
-    
+
           return {
             name,
-            quantity: clean(it?.quantity) || "1",
-    
-            // ✅ EXACTLY what addToFridge expects
-            categories: categoriesObjToArray(it?.categories),
-    
+            quantity: normalizeFridgeProposalQuantity(it?.quantity),
+            categories: normalizeFridgeProposalCategories(it?.categories),
+
             // ✅ pass through; addToFridge decides precedence & prediction
             expiresAt:
               it?.expiresAt ??
@@ -397,13 +426,26 @@ export function useGPTTools() {
         })
         .filter(Boolean);
     
+      if (safeItems.length === 0) {
+        return {
+          ok: false,
+          proposalShown: false,
+          error: "No valid fridge items were provided.",
+        };
+      }
+
+      const actionId = createFridgeProposalActionId();
+
       setMessages?.((prev) => [
         ...(Array.isArray(prev) ? prev : []),
         {
+          id: actionId,
           role: "assistant",
           type: "ui_action",
           action: {
             kind: "add_all_to_fridge",
+            actionId,
+            status: "pending",
             title: safeTitle || "Add all to fridge",
             items: safeItems,
     
@@ -412,6 +454,12 @@ export function useGPTTools() {
           },
         },
       ]);
+      return {
+        ok: true,
+        proposalShown: true,
+        itemCount: safeItems.length,
+        message: "A single add-to-fridge confirmation card was shown.",
+      };
     },
     
   };

@@ -16,7 +16,7 @@ import {
   shouldAutoLoadLinkPreview,
 } from "../utils/linkPreviewPolicy";
 
-const MAX_LINK_PREVIEWS = 3;
+const MAX_LINK_PREVIEWS = 6;
 
 function toDisplayText(value) {
   if (typeof value === "string") return value;

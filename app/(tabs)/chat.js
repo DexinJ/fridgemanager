@@ -12,6 +12,18 @@ import { useGpt } from "../../api/gpt";
 import MessageInput from "../../components/MessageInput";
 import MessageList from "../../components/MessageList";
 import { ChatContext, GlobalContext } from "../../context/GlobalContext";
+import {
+  claimFridgeProposalAction,
+  fridgeProposalCategoryLabels,
+  markFridgeProposalActionConsumed,
+  normalizeFridgeProposalQuantity,
+  releaseFridgeProposalAction,
+} from "../../utils/fridgeProposal";
+import {
+  applyRecipePreferenceProposal,
+  formatRecipePreferencePatch,
+  normalizeRecipePreferencePatch,
+} from "../../utils/recipePreferences";
 
 function getChatErrorMessage(error) {
   const messagesByCode = {
@@ -40,11 +52,14 @@ export default function ChatScreen() {
   const [keyboardVisible, setKeyboardVisible] = useState(false);
 
   const { streamMessage } = useGpt();
-  const { theme, addManyToFridge } = useContext(GlobalContext);
+  const { theme, settings, addManyToFridge, updateRecipePreferences } =
+    useContext(GlobalContext);
   const { messages, setMessages, setWaiting } =
     useContext(ChatContext);
   const mountedRef = useRef(false);
   const sendGenerationRef = useRef(0);
+  const appliedUiActionsRef = useRef(new Set());
+  const claimedFridgeProposalActionsRef = useRef(new Set());
 
   useEffect(() => {
     mountedRef.current = true;
@@ -120,6 +135,41 @@ export default function ChatScreen() {
     if (!mountedRef.current) return;
     // Some components pass {kind,...}, others pass {action:{kind,...}}
     const action = maybeAction?.kind ? maybeAction : maybeAction?.action;
+    if (action?.kind === "recipe_preference_update") {
+      const patch = normalizeRecipePreferencePatch(action.patch);
+      if (Object.keys(patch).length === 0) return;
+      const operation = ["merge", "remove", "replace"].includes(
+        action.operation
+      )
+        ? action.operation
+        : "merge";
+      const actionKey = JSON.stringify({ operation, patch });
+      if (appliedUiActionsRef.current.has(actionKey)) return;
+      appliedUiActionsRef.current.add(actionKey);
+      const appliedPatch = applyRecipePreferenceProposal(
+        settings?.recipePreferences?.explicit,
+        patch,
+        operation
+      );
+      updateRecipePreferences({ explicit: appliedPatch });
+      if (!mountedRef.current) return;
+      const summary = formatRecipePreferencePatch(appliedPatch);
+      setMessages((previous) => [
+        ...(Array.isArray(previous) ? previous : []),
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: summary
+                ? `Saved your recipe preferences:\n${summary}`
+                : "Saved your recipe preferences.",
+            },
+          ],
+        },
+      ]);
+      return;
+    }
     if (action?.kind !== "add_all_to_fridge") return;
   
     const items = Array.isArray(action.items) ? action.items : [];
@@ -128,34 +178,7 @@ export default function ChatScreen() {
     // For your current pipeline, categories should be an array like:
     // ["Fridge","Use soon","Dairy","Unopened"]
     // But we’ll still accept object form defensively.
-    const DEFAULT_CATEGORIES_ARRAY = ["Fridge", "Use soon", "Prepared"];
-  
     const clean = (v) => String(v ?? "").trim();
-  
-    const categoriesObjToArray = (catsObj) => {
-      if (!catsObj || typeof catsObj !== "object" || Array.isArray(catsObj)) return null;
-  
-      const out = [
-        clean(catsObj.storage),
-        clean(catsObj.urgency),
-        clean(catsObj.food_type),
-        clean(catsObj.state),
-      ].filter(Boolean);
-  
-      return out.length ? out : null;
-    };
-  
-    const coerceCategories = (cats) => {
-      // already-correct shape
-      if (Array.isArray(cats)) {
-        const out = cats.map(clean).filter(Boolean);
-        return out.length ? out : DEFAULT_CATEGORIES_ARRAY;
-      }
-  
-      // older shape: {storage, urgency, food_type, state}
-      const fromObj = categoriesObjToArray(cats);
-      return fromObj || DEFAULT_CATEGORIES_ARRAY;
-    };
   
     let added = 0;
     const failed = [];
@@ -165,9 +188,8 @@ export default function ChatScreen() {
       const name = clean(it?.name);
       if (!name) continue;
   
-      const quantity = clean(it?.quantity) || "1";
-  
-      const categories = coerceCategories(it?.categories);
+      const quantity = normalizeFridgeProposalQuantity(it?.quantity);
+      const categories = fridgeProposalCategoryLabels(it?.categories);
   
       // Pass through; the context normalizes tags and predicts missing expiry.
       const expiresAt =
@@ -180,9 +202,23 @@ export default function ChatScreen() {
       additions.push({ name, quantity, categories, expiresAt });
     }
 
+    if (additions.length === 0) return;
+    if (
+      !claimFridgeProposalAction(
+        claimedFridgeProposalActionsRef.current,
+        action
+      )
+    ) {
+      return;
+    }
+
     try {
       added = addManyToFridge(additions).length;
     } catch (error) {
+      releaseFridgeProposalAction(
+        claimedFridgeProposalActionsRef.current,
+        action
+      );
       const reason = String(error?.message || error);
       failed.push(...additions.map(({ name }) => ({ name, reason })));
       if (__DEV__) console.log({ names: additions.map(({ name }) => name), reason });
@@ -191,7 +227,11 @@ export default function ChatScreen() {
     // Optional summary message
     if (!mountedRef.current) return;
     setMessages((prev) => [
-      ...(Array.isArray(prev) ? prev : []),
+      ...(failed.length === 0
+        ? markFridgeProposalActionConsumed(prev, action)
+        : Array.isArray(prev)
+          ? prev
+          : []),
       {
         role: "assistant",
         content: [

@@ -16,6 +16,12 @@ import {
 import MessageBubble from "./MessageBubble";
 import { ChatContext, GlobalContext } from "../context/GlobalContext";
 import DropDownPicker from "react-native-dropdown-picker";
+import {
+  fridgeProposalActionKey,
+  isFridgeProposalActionConsumed,
+  normalizeFridgeProposalCategories,
+  normalizeFridgeProposalQuantity,
+} from "../utils/fridgeProposal";
 
 function toDisplayText(value) {
   if (typeof value === "string") return value;
@@ -43,6 +49,7 @@ function ActionCard({ action, onPress }) {
       ? normalizedAction.items
       : [];
     const title = toDisplayText(normalizedAction.title) || "Add all to fridge";
+    const consumed = isFridgeProposalActionConsumed(normalizedAction);
 
     return (
       <View
@@ -73,6 +80,82 @@ function ActionCard({ action, onPress }) {
         ) : null}
 
         <TouchableOpacity
+          onPress={consumed ? undefined : onPress}
+          disabled={consumed}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: consumed }}
+          style={{
+            marginTop: 10,
+            paddingVertical: 10,
+            borderRadius: 10,
+            alignItems: "center",
+            borderWidth: 1,
+            borderColor: "#333",
+            opacity: consumed ? 0.55 : 1,
+          }}
+        >
+          <Text style={{ fontWeight: "700" }}>
+            {consumed ? "Added to fridge" : title}
+          </Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  if (normalizedAction.kind === "recipe_preference_update") {
+    const patch = safeAction(normalizedAction.patch) || {};
+    const operation = ["merge", "remove", "replace"].includes(
+      normalizedAction.operation
+    )
+      ? normalizedAction.operation
+      : "merge";
+    const labels = {
+      preferredCuisines: "Prefer cuisines",
+      dislikedCuisines: "Avoid cuisines",
+      allergens: "Allergens",
+      dietaryPatterns: "Diet",
+      excludedIngredients: "Never include",
+      dislikedIngredients: "Dislike",
+      preferredEnergy: "Meal style",
+      maxCaloriesPerServing: "Calories per serving",
+      maxPrepMinutes: "Maximum time",
+      defaultServings: "Default servings",
+    };
+    const changes = Object.entries(patch).map(([key, value]) => {
+      const displayValue = Array.isArray(value)
+        ? value.join(", ") || "none"
+        : value === null
+          ? "no limit"
+          : key === "maxPrepMinutes"
+            ? `${value} min`
+            : String(value);
+      return `${labels[key] || key}: ${displayValue}`;
+    });
+
+    return (
+      <View
+        style={{
+          padding: 12,
+          borderRadius: 12,
+          borderWidth: 1,
+          borderColor: "#ccc",
+          marginVertical: 6,
+        }}
+      >
+        <Text style={{ fontWeight: "600", marginBottom: 6 }}>
+          {toDisplayText(normalizedAction.summary) ||
+            (operation === "remove"
+              ? "Remove these saved recipe preferences?"
+              : operation === "replace"
+                ? "Replace these recipe preferences?"
+                : "Save these recipe preferences?")}
+        </Text>
+        {changes.slice(0, 8).map((change) => (
+          <Text key={change} style={{ marginBottom: 2 }}>
+            • {change}
+          </Text>
+        ))}
+        <TouchableOpacity
           onPress={onPress}
           style={{
             marginTop: 10,
@@ -83,7 +166,9 @@ function ActionCard({ action, onPress }) {
             borderColor: "#333",
           }}
         >
-          <Text style={{ fontWeight: "700" }}>{title}</Text>
+          <Text style={{ fontWeight: "700" }}>
+            {toDisplayText(normalizedAction.title) || "Save preferences"}
+          </Text>
         </TouchableOpacity>
       </View>
     );
@@ -183,22 +268,8 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
     []
   );
 
-  const coerceCategories = (cats) => {
-    if (!cats || typeof cats !== "object" || Array.isArray(cats))
-      return DEFAULT_CATEGORIES;
-
-    const storage =
-      String(cats.storage || "").trim() || DEFAULT_CATEGORIES.storage;
-    const urgency =
-      String(cats.urgency || "").trim() || DEFAULT_CATEGORIES.urgency;
-    const food_type =
-      String(cats.food_type || "").trim() || DEFAULT_CATEGORIES.food_type;
-    const state = String(cats.state || "").trim();
-
-    return state
-      ? { storage, urgency, food_type, state }
-      : { storage, urgency, food_type };
-  };
+  const coerceCategories = (categories) =>
+    normalizeFridgeProposalCategories(categories);
 
   const STORAGE_ITEMS = useMemo(
     () => [
@@ -285,7 +356,7 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
       ...(it && typeof it === "object" && !Array.isArray(it) ? it : {}),
       name: toDisplayText(it?.name),
       selected: true,
-      quantity: it?.quantity === 0 || it?.quantity ? String(it.quantity) : "1",
+      quantity: normalizeFridgeProposalQuantity(it?.quantity),
       categories: coerceCategories(it?.categories),
     }));
 
@@ -306,9 +377,9 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
   };
 
   const updateQty = (idx, text) => {
-    const cleaned = String(text).replace(/[^0-9.]/g, "");
+    const quantity = String(text ?? "").slice(0, 80);
     setDraftItems((prev) =>
-      prev.map((it, i) => (i === idx ? { ...it, quantity: cleaned } : it))
+      prev.map((it, i) => (i === idx ? { ...it, quantity } : it))
     );
   };
 
@@ -332,11 +403,10 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
     const selectedItems = draftItems
       .filter((it) => it.selected)
       .map((it) => {
-        const q = parseFloat(String(it.quantity));
         const categories = coerceCategories(it.categories);
         return {
           ...it,
-          quantity: Number.isFinite(q) && q > 0 ? q : 1,
+          quantity: normalizeFridgeProposalQuantity(it.quantity),
           categories,
         };
       });
@@ -516,7 +586,6 @@ function ItemsConfirmModal({ visible, action, onClose, onConfirm }) {
                         <TextInput
                           value={String(it?.quantity ?? "1")}
                           onChangeText={(t) => updateQty(idx, t)}
-                          keyboardType={Platform.OS === "ios" ? "decimal-pad" : "numeric"}
                           placeholder="1"
                           editable={it.selected}
                           style={[
@@ -719,6 +788,7 @@ export default function MessageList({ messages, onUiAction }) {
   const [pendingAction, setPendingAction] = useState(null);
 
   const openActionModal = (action) => {
+    if (isFridgeProposalActionConsumed(action)) return;
     setPendingAction(action);
     setModalVisible(true);
   };
@@ -758,7 +828,15 @@ export default function MessageList({ messages, onUiAction }) {
           `message-${index}-${toDisplayText(msg?.role)}-${toDisplayText(msg?.type)}`;
 
         if (msg?.type === "ui_action" && msg?.action) {
-          return { kind: "ui_action", action: safeAction(msg.action), key };
+          const action = safeAction(msg.action);
+          return {
+            kind: "ui_action",
+            action:
+              action?.kind === "add_all_to_fridge"
+                ? { ...action, actionKey: fridgeProposalActionKey(action) }
+                : action,
+            key,
+          };
         }
 
         const contentText = Array.isArray(msg?.content)
@@ -794,7 +872,11 @@ export default function MessageList({ messages, onUiAction }) {
         keyExtractor={(item) => item.key}
         renderItem={({ item }) => {
           if (item.kind === "ui_action") {
-            return <ActionCard action={item.action} onPress={() => openActionModal(item.action)} />;
+            const actionPress =
+              item.action?.kind === "recipe_preference_update"
+                ? () => onUiAction?.(item.action)
+                : () => openActionModal(item.action);
+            return <ActionCard action={item.action} onPress={actionPress} />;
           }
           if (item.kind === "typing") return <TypingIndicator theme={theme} />;
           return <MessageBubble text={item.text} imageUri={item.imageUri} isUser={item.isUser} />;

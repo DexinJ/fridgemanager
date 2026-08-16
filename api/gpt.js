@@ -7,7 +7,7 @@ import { AppState } from "react-native";
 import { auth } from "../auth/firebaseClient";
 import { useAccountSession } from "../context/AccountSessionContext";
 import { ChatActionsContext, GlobalContext } from "../context/GlobalContext";
-import { BACKEND_WS_URL } from "./backendConfig";
+import { API_BASE_URL, BACKEND_WS_URL } from "./backendConfig";
 import { createBackendResponseError } from "./backendErrors";
 import { buildSystemMessage } from "./buildSystemMessage";
 import {
@@ -20,20 +20,34 @@ import {
   formatConversationMemory,
 } from "./memoryManager";
 import { getCustomAiProviderSettings } from "./aiProviderSettings";
+import { resolveAiProvider } from "./aiProviderPolicy";
 import { registerChatCancellation } from "./chatLifecycle";
+import {
+  buildRecipeContext,
+  customRecipeToolPolicy,
+  inferChatIntent,
+  PROPOSE_RECIPE_PREFERENCE_UPDATE_TOOL,
+  RECOMMEND_RECIPES_TOOL,
+} from "./recipeAssistant";
 import { generateAppleIntelligenceToolTurn } from "../modules/apple-intelligence/src";
 
 const DEFAULT_MODEL = "gpt-5";
 const REQUEST_TIMEOUT_MS = 180_000;
 const STREAM_RENDER_INTERVAL_MS = 50;
 const WS_IDLE_CLOSE_MS = 30_000;
-const MAX_IMAGE_REQUEST_URI_LENGTH = 4 * 1024 * 1024;
+const APPLE_AI_ISOLATED_TOOL_NAMES = new Set([
+  "recommendRecipes",
+  "proposeRecipePreferenceUpdate",
+  "proposeAddAllToFridge",
+]);
+// const MAX_IMAGE_REQUEST_URI_LENGTH = 4 * 1024 * 1024;
 const GptContext = createContext(null);
 
 const objectSchema = (properties, required = []) => ({
   type: "object",
   properties,
   ...(required.length ? { required } : {}),
+  additionalProperties: false,
 });
 
 const stringField = { type: "string" };
@@ -46,9 +60,20 @@ const categoriesField = {
     state: stringField,
   },
   required: ["storage", "urgency", "food_type"],
+  additionalProperties: false,
 };
 
-const DIRECT_AI_TOOLS = [
+const proposedFridgeItemField = objectSchema(
+  {
+    name: stringField,
+    quantity: stringField,
+    categories: categoriesField,
+    expiresAt: stringField,
+  },
+  ["name", "categories", "expiresAt"]
+);
+
+export const DIRECT_AI_TOOLS = [
   ["addFridgeItem", "Add an item to the fridge.", objectSchema({ name: stringField, quantity: stringField, categories: categoriesField, expiresAt: stringField }, ["name", "categories", "expiresAt"])],
   ["addShoppingItem", "Add an item to the shopping list.", objectSchema({ name: stringField, quantity: stringField, categories: categoriesField }, ["name", "categories"])],
   ["removeFridgeItem", "Remove a named fridge item.", objectSchema({ name: stringField }, ["name"])],
@@ -58,11 +83,14 @@ const DIRECT_AI_TOOLS = [
   ["getFridgeContents", "Get all fridge items.", objectSchema({})],
   ["getShoppingListContents", "Get all shopping-list items.", objectSchema({})],
   ["streamlineLists", "Normalize and optionally retag list items.", objectSchema({ scope: { type: "string", enum: ["shopping", "fridge", "both"] }, retag: { type: "boolean" }, dryRun: { type: "boolean" } })],
-  ["proposeAddAllToFridge", "Show a proposal for adding several items to the fridge.", objectSchema({ items: { type: "array", items: { type: "object" } }, title: stringField }, ["items"])],
+  ["proposeAddAllToFridge", "After the user attaches a fridge image, or explicitly asks to add a listed batch, show one confirmation card. Never use for recipes, recipe ingredients, meal ideas, or ordinary bullet lists.", objectSchema({ items: { type: "array", minItems: 1, items: proposedFridgeItemField }, title: stringField }, ["items"])],
 ].map(([name, description, parameters]) => ({
   type: "function",
   function: { name, description, parameters },
-}));
+})).concat([
+  RECOMMEND_RECIPES_TOOL,
+  PROPOSE_RECIPE_PREFERENCE_UPDATE_TOOL,
+]);
 
 function assistantText(content) {
   if (typeof content === "string") return content;
@@ -702,7 +730,45 @@ const useGptRuntime = () => {
     });
   }
 
-  async function runCustomAi(messages, { signal, lifecycleGeneration }) {
+  async function requestRecipeRecommendations(
+    overrides,
+    { signal, lifecycleGeneration, recipeContext }
+  ) {
+    const currentUser = auth.currentUser;
+    if (!currentUser) {
+      throw backendErrorFromMessage(
+        {
+          code: "AUTH_REQUIRED",
+          message: "Sign in is required to get recipe recommendations.",
+        },
+        "AUTH_REQUIRED"
+      );
+    }
+    const token = await currentUser.getIdToken();
+    assertCurrentLifecycle(lifecycleGeneration);
+    const { response, data } = await fetchWithLifecycleTimeout(
+      `${API_BASE_URL}/api/recipes/recommend`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ overrides, recipeContext }),
+      },
+      { signal }
+    );
+    assertCurrentLifecycle(lifecycleGeneration);
+    if (!response.ok) {
+      throw backendErrorFromMessage(data, "RECIPE_RECOMMENDATION_FAILED");
+    }
+    return data;
+  }
+
+  async function runCustomAi(
+    messages,
+    { signal, lifecycleGeneration, intent, recipeContext }
+  ) {
     const baseUrl = String(settings?.advanced?.aiBaseUrl || "").trim().replace(/\/+$/, "");
     const configuredModel = String(settings?.advanced?.aiModel || "").trim();
     const { apiKey, model } = await getCustomAiProviderSettings(
@@ -722,9 +788,24 @@ const useGptRuntime = () => {
     if (!model) throw new Error("Add a model name in Settings > Advanced.");
 
     const conversation = [...messages];
+    let recipeRecommendationCompleted = false;
+    let toolsLockedAfterIsolatedAction = false;
 
     for (let step = 0; step < 6; step += 1) {
       assertCurrentLifecycle(lifecycleGeneration);
+      const recipeToolPolicy = toolsLockedAfterIsolatedAction
+        ? {}
+        : customRecipeToolPolicy(
+            intent === "recipe_recommendation" || recipeRecommendationCompleted
+              ? "recipe_recommendation"
+              : intent,
+            step
+          );
+      const toolPolicy = recipeToolPolicy || {
+        tools: DIRECT_AI_TOOLS,
+        tool_choice: "auto",
+        parallel_tool_calls: false,
+      };
       const { response, data } = await fetchWithLifecycleTimeout(
         `${baseUrl}/chat/completions`,
         {
@@ -733,7 +814,11 @@ const useGptRuntime = () => {
             "Content-Type": "application/json",
             Authorization: `Bearer ${apiKey}`,
           },
-          body: JSON.stringify({ model, messages: conversation, tools: DIRECT_AI_TOOLS }),
+          body: JSON.stringify({
+            model,
+            messages: conversation,
+            ...toolPolicy,
+          }),
         },
         { signal }
       );
@@ -748,17 +833,50 @@ const useGptRuntime = () => {
 
       const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
       if (!calls.length) return assistantText(message.content);
+      const recipeRecommendationCall = calls.find(
+        (call) => call?.function?.name === "recommendRecipes"
+      );
+      const preferenceProposalCall = calls.find(
+        (call) => call?.function?.name === "proposeRecipePreferenceUpdate"
+      );
+      const fridgeProposalCall = calls.find(
+        (call) => call?.function?.name === "proposeAddAllToFridge"
+      );
+      const isolatedToolCall =
+        recipeRecommendationCall || preferenceProposalCall || fridgeProposalCall;
+      if (isolatedToolCall) {
+        toolsLockedAfterIsolatedAction = true;
+      }
 
       for (const call of calls) {
         const name = call?.function?.name || "";
+        if (name === "recommendRecipes") {
+          recipeRecommendationCompleted = true;
+        }
         const parsed = safeJsonParse(call?.function?.arguments || "{}");
-        const handler = toolHandlers?.[name];
+        const handler =
+          name === "recommendRecipes"
+            ? (args) =>
+                requestRecipeRecommendations(args, {
+                  signal,
+                  lifecycleGeneration,
+                  recipeContext,
+                })
+            : toolHandlers?.[name];
         let result;
         try {
           assertCurrentLifecycle(lifecycleGeneration);
-          result = handler
-            ? await handler(parsed.ok ? parsed.value : {})
-            : { error: `No handler for tool: ${name}` };
+          result =
+            isolatedToolCall && call !== isolatedToolCall
+              ? {
+                  ok: false,
+                  skipped: true,
+                  reason:
+                    "Recipe and preference actions are isolated from other tool actions.",
+                }
+              : handler
+                ? await handler(parsed.ok ? parsed.value : {})
+                : { error: `No handler for tool: ${name}` };
           assertCurrentLifecycle(lifecycleGeneration);
         } catch (error) {
           if (error?.code === "REQUEST_CANCELLED") throw error;
@@ -775,14 +893,19 @@ const useGptRuntime = () => {
     throw new Error("The AI provider exceeded the tool-call limit.");
   }
 
-  async function runAppleAi(messages, systemText, lifecycleGeneration) {
+  async function runAppleAi(
+    messages,
+    systemText,
+    { signal, lifecycleGeneration, intent, recipeContext }
+  ) {
     const conversation = messages
       .filter((message) => message.role !== "system")
       .map((message) => ({
         role: message.role,
-        content: typeof message.content === "string"
-          ? message.content
-          : assistantText(message.content),
+        content:
+          typeof message.content === "string"
+            ? message.content
+            : assistantText(message.content),
       }));
     const toolDescriptions = DIRECT_AI_TOOLS.map(({ function: tool }) =>
       `${tool.name}: ${tool.description} Arguments JSON Schema: ${JSON.stringify(tool.parameters)}`
@@ -792,35 +915,81 @@ const useGptRuntime = () => {
 You can use the app tools listed below. Choose type "tool" whenever you need to read or change app data. Choose type "final" only when you can answer the user without another tool. Never claim that an action succeeded until its tool result says it succeeded. Use only an exact tool name from this list.
 
 ${toolDescriptions}`;
+    let recipeRecommendationCompleted = false;
+    let toolsLockedAfterIsolatedAction = false;
 
     for (let step = 0; step < 6; step += 1) {
       assertCurrentLifecycle(lifecycleGeneration);
+      const recipeToolRequired =
+        intent === "recipe_recommendation" && !recipeRecommendationCompleted;
+      const turnInstructions = recipeToolRequired
+        ? `${instructions}\n\nFor this recipe request, your next step must be the recommendRecipes tool.`
+        : toolsLockedAfterIsolatedAction
+          ? `${instructions}\n\nThe requested isolated action is complete. Return a final answer now without calling another tool.`
+          : instructions;
       const prompt = conversation
         .map((message) => `${message.role}: ${message.content}`)
         .join("\n\n");
-      const turn = await generateAppleIntelligenceToolTurn(instructions, prompt);
+      const turn = await generateAppleIntelligenceToolTurn(
+        turnInstructions,
+        prompt
+      );
       assertCurrentLifecycle(lifecycleGeneration);
       const type = String(turn?.type || "").trim().toLowerCase();
 
-      if (type !== "tool") return String(turn?.text || "").trim();
+      if (type === "final") {
+        if (recipeToolRequired) {
+          conversation.push({
+            role: "assistant",
+            content: "I must use recommendRecipes before answering this recipe request.",
+          });
+          continue;
+        }
+        return String(turn?.text || "").trim();
+      }
+      if (type !== "tool") {
+        throw new Error("Apple Intelligence returned an invalid response.");
+      }
 
       const name = String(turn?.name || "").trim();
-      const handler = toolHandlers?.[name];
       const parsed = safeJsonParse(turn?.arguments || "{}");
+      const handler =
+        name === "recommendRecipes"
+          ? (args) =>
+              requestRecipeRecommendations(args, {
+                signal,
+                lifecycleGeneration,
+                recipeContext,
+              })
+          : toolHandlersRef.current?.[name];
+      const isolatedTool = APPLE_AI_ISOLATED_TOOL_NAMES.has(name);
       let result;
 
       try {
-        result = handler
-          ? await handler(parsed.ok && parsed.value && typeof parsed.value === "object"
-              ? parsed.value
-              : {})
-          : { error: `No handler for tool: ${name}` };
+        assertCurrentLifecycle(lifecycleGeneration);
+        result = toolsLockedAfterIsolatedAction
+          ? {
+              ok: false,
+              skipped: true,
+              reason: "The prior isolated action must be followed by a final answer.",
+            }
+          : handler
+            ? await handler(
+                parsed.ok &&
+                  parsed.value &&
+                  typeof parsed.value === "object"
+                  ? parsed.value
+                  : {}
+              )
+            : { error: `No handler for tool: ${name}` };
         assertCurrentLifecycle(lifecycleGeneration);
       } catch (error) {
         if (error?.code === "REQUEST_CANCELLED") throw error;
         result = { error: error?.message || "Tool failed" };
       }
 
+      if (name === "recommendRecipes") recipeRecommendationCompleted = true;
+      if (isolatedTool) toolsLockedAfterIsolatedAction = true;
       conversation.push({
         role: "assistant",
         content: `Tool call: ${name}(${turn?.arguments || "{}"})`,
@@ -839,6 +1008,8 @@ ${toolDescriptions}`;
     imageUri,
     imageRequestUri,
     language = "en",
+    intent,
+    selectedIngredients = [],
   }) => {
     const lifecycleGeneration = lifecycleGenerationRef.current;
     const normalizedText =
@@ -852,12 +1023,22 @@ ${toolDescriptions}`;
       typeof imageRequestUri === "string" && imageRequestUri.trim()
         ? imageRequestUri.trim()
         : normalizedImageUri;
-    if (normalizedImageRequestUri.length > MAX_IMAGE_REQUEST_URI_LENGTH) {
-      throw new Error("The selected image is too large to send.");
-    }
+    // if (normalizedImageRequestUri.length > MAX_IMAGE_REQUEST_URI_LENGTH) {
+    //   throw new Error("The selected image is too large to send.");
+    // }
     if (!normalizedText.trim() && !normalizedImageUri.trim()) {
       throw new Error("A chat message must include text or an image.");
     }
+    const requestIntent = inferChatIntent({
+      text: normalizedText,
+      imageUri: normalizedImageUri,
+      intent,
+    });
+    const recipeContext = buildRecipeContext({
+      fridgeItems,
+      settings,
+      selectedIngredients,
+    });
 
     // 1) Add user message locally
     const updatedMessages = await addMessage(setMessages, {
@@ -865,9 +1046,10 @@ ${toolDescriptions}`;
       text: normalizedText,
       imageUri: normalizedImageUri,
     });
-    // Custom and on-device providers never route summarization through our backend.
-    const selectedProvider = settings?.advanced?.aiProvider ||
-      (settings?.advanced?.useCustomAi ? "custom" : "pantrio");
+    const selectedProvider = resolveAiProvider(
+      settings?.advanced?.aiProvider,
+      settings?.advanced?.useCustomAi
+    );
     const incognito = Boolean(settings?.privacy?.incognito);
     const currentSummary = getChatSnapshot?.().summary || "";
     let requestMessages = updatedMessages.slice(-20);
@@ -917,6 +1099,8 @@ ${toolDescriptions}`;
       const fullText = await runCustomAi(ccMessages, {
         signal: lifecycleAbortControllerRef.current.signal,
         lifecycleGeneration,
+        intent: requestIntent,
+        recipeContext,
       });
       setWaiting(false);
       if (fullText) {
@@ -929,16 +1113,20 @@ ${toolDescriptions}`;
     }
 
     if (selectedProvider === "apple") {
-      const fullText = await runAppleAi(
-        ccMessages,
-        systemText,
-        lifecycleGeneration
-      );
+      const fullText = await runAppleAi(ccMessages, systemText, {
+        signal: lifecycleAbortControllerRef.current.signal,
+        lifecycleGeneration,
+        intent: requestIntent,
+        recipeContext,
+      });
       setWaiting(false);
       if (fullText) {
         setMessages((prev) => [
           ...prev,
-          { role: "assistant", content: [{ type: "output_text", text: fullText }] },
+          {
+            role: "assistant",
+            content: [{ type: "output_text", text: fullText }],
+          },
         ]);
       }
       return fullText;
@@ -967,6 +1155,8 @@ ${toolDescriptions}`;
       language,
       token,
       messages: ccMessages,
+      intent: requestIntent,
+      recipeContext,
     };
 
 

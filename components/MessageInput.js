@@ -6,6 +6,7 @@ import {
   useAudioRecorder,
   useAudioRecorderState,
 } from "expo-audio";
+import * as FileSystem from "expo-file-system/legacy";
 import { useContext, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -15,6 +16,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from "react-native";
 import { auth } from "../auth/firebaseClient";
@@ -25,6 +27,17 @@ import {
 } from "../api/backendErrors";
 import { ChatContext, GlobalContext } from "../context/GlobalContext";
 import { useAccountSession } from "../context/AccountSessionContext";
+import {
+  COMPOSER_BORDER_WIDTH,
+  calculateComposerLayout,
+  measureWebComposerContentHeight,
+} from "../utils/composerLayout";
+import {
+  buildVoiceUploadFormData,
+  mergeTranscriptIntoComposer,
+  normalizeComposerText,
+  shouldShowSendButton,
+} from "../utils/voiceInput";
 import PlusMenu from "./PlusMenu";
 
 const MAX_RECORDING_SECONDS = 60;
@@ -42,17 +55,40 @@ const VOICE_RECORDING_PRESET = {
   },
 };
 
+async function releaseRecordingFile(uri) {
+  const normalizedUri = typeof uri === "string" ? uri.trim() : "";
+  if (!normalizedUri) return;
+
+  if (Platform.OS === "web") {
+    if (normalizedUri.startsWith("blob:") && globalThis.URL?.revokeObjectURL) {
+      globalThis.URL.revokeObjectURL(normalizedUri);
+    }
+    return;
+  }
+
+  await FileSystem.deleteAsync(normalizedUri, { idempotent: true }).catch(
+    () => {}
+  );
+}
+
 export default function MessageInput({ value, onChangeText, onSend }) {
   const { settings, theme } = useContext(GlobalContext);
   const { receiving } = useContext(ChatContext);
   const { updateQuota } = useAccountSession();
+  const { height: viewportHeight } = useWindowDimensions();
 
   const fontSize = settings?.ux?.fontSize || 16;
 
+  const [composerContentHeight, setComposerContentHeight] = useState(0);
   const [voiceMode, setVoiceMode] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
+  const [recordingStarting, setRecordingStarting] = useState(false);
+  const [recordingActive, setRecordingActive] = useState(false);
+  const composerInputRef = useRef(null);
   const recordingSessionRef = useRef(false);
   const recordingPressIntentRef = useRef(false);
+  const recordingStartPendingRef = useRef(false);
+  const recordingLimitTimeoutRef = useRef(null);
   const transcriptionControllerRef = useRef(null);
   const mountedRef = useRef(false);
   const lifecycleGenerationRef = useRef(0);
@@ -60,6 +96,14 @@ export default function MessageInput({ value, onChangeText, onSend }) {
 
   const audioRecorder = useAudioRecorder(VOICE_RECORDING_PRESET);
   const recorderState = useAudioRecorderState(audioRecorder);
+  const composerLayout = calculateComposerLayout({
+    contentHeight:
+      typeof value === "string" && value.length > 0
+        ? composerContentHeight
+        : 0,
+    fontSize,
+    viewportHeight,
+  });
 
   useEffect(() => {
     mountedRef.current = true;
@@ -69,6 +113,9 @@ export default function MessageInput({ value, onChangeText, onSend }) {
       mountedRef.current = false;
       lifecycleGenerationRef.current += 1;
       recordingAttemptRef.current += 1;
+      recordingStartPendingRef.current = false;
+      clearTimeout(recordingLimitTimeoutRef.current);
+      recordingLimitTimeoutRef.current = null;
       transcriptionControllerRef.current?.abort();
     };
   }, []);
@@ -81,6 +128,7 @@ export default function MessageInput({ value, onChangeText, onSend }) {
         if (audioRecorder.isRecording) {
           await audioRecorder.stop().catch(() => {});
         }
+        await releaseRecordingFile(audioRecorder.uri);
         await setAudioModeAsync({
           allowsRecording: false,
           playsInSilentMode: true,
@@ -93,6 +141,8 @@ export default function MessageInput({ value, onChangeText, onSend }) {
   const isBusy =
     receiving ||
     transcribing ||
+    recordingStarting ||
+    recordingActive ||
     recorderState.isRecording;
 
   const isCurrentLifecycle = (generation) =>
@@ -101,7 +151,10 @@ export default function MessageInput({ value, onChangeText, onSend }) {
   const isCurrentRecordingAttempt = (generation, attempt) =>
     isCurrentLifecycle(generation) && recordingAttemptRef.current === attempt;
 
-  const sendMessageSafely = (payload, generation = lifecycleGenerationRef.current) => {
+  const sendMessageSafely = (
+    payload,
+    generation = lifecycleGenerationRef.current
+  ) => {
     if (!isCurrentLifecycle(generation)) return false;
 
     try {
@@ -121,7 +174,7 @@ export default function MessageInput({ value, onChangeText, onSend }) {
   const handleSendText = () => {
     if (receiving || transcribing) return;
 
-    const trimmedValue = typeof value === "string" ? value.trim() : "";
+    const trimmedValue = normalizeComposerText(value);
 
     if (!trimmedValue) return;
 
@@ -134,17 +187,39 @@ export default function MessageInput({ value, onChangeText, onSend }) {
     if (sent) onChangeText?.("");
   };
 
+  const handleComposerTextChange = (nextValue) => {
+    if (Platform.OS === "web") {
+      const measuredHeight = measureWebComposerContentHeight(
+        composerInputRef.current
+      );
+      if (measuredHeight !== null) {
+        setComposerContentHeight(measuredHeight);
+      }
+    } else if (!nextValue) {
+      setComposerContentHeight(0);
+    }
+
+    onChangeText?.(nextValue);
+  };
+
   const handleSendImage = (imageData) => {
     if (receiving || transcribing) return;
     sendMessageSafely(imageData);
   };
 
   const startRecording = async (attempt) => {
-    if (receiving || transcribing || recorderState.isRecording) {
+    if (
+      receiving ||
+      transcribing ||
+      recorderState.isRecording ||
+      recordingStartPendingRef.current
+    ) {
       return;
     }
 
     const generation = lifecycleGenerationRef.current;
+    recordingStartPendingRef.current = true;
+    setRecordingStarting(true);
 
     try {
       const permission =
@@ -192,11 +267,21 @@ export default function MessageInput({ value, onChangeText, onSend }) {
         return;
       }
       recordingSessionRef.current = true;
-      audioRecorder.record({ forDuration: MAX_RECORDING_SECONDS });
+      setRecordingActive(true);
+      audioRecorder.record();
+      clearTimeout(recordingLimitTimeoutRef.current);
+      recordingLimitTimeoutRef.current = setTimeout(() => {
+        recordingLimitTimeoutRef.current = null;
+        if (isCurrentLifecycle(generation) && recordingSessionRef.current) {
+          recordingAttemptRef.current += 1;
+          void stopRecordingAndTranscribe();
+        }
+      }, MAX_RECORDING_SECONDS * 1_000);
     } catch (error) {
       if (isCurrentRecordingAttempt(generation, attempt)) {
         recordingPressIntentRef.current = false;
         recordingSessionRef.current = false;
+        setRecordingActive(false);
         await setAudioModeAsync({
           allowsRecording: false,
           playsInSilentMode: true,
@@ -210,17 +295,26 @@ export default function MessageInput({ value, onChangeText, onSend }) {
           "Pantrio could not start recording. Please try again."
         );
       }
+    } finally {
+      recordingStartPendingRef.current = false;
+      if (isCurrentLifecycle(generation)) {
+        setRecordingStarting(false);
+      }
     }
   };
 
   const stopRecordingAndTranscribe = async () => {
     const generation = lifecycleGenerationRef.current;
+    clearTimeout(recordingLimitTimeoutRef.current);
+    recordingLimitTimeoutRef.current = null;
     recordingPressIntentRef.current = false;
     if (!recordingSessionRef.current && !audioRecorder.isRecording) {
       return;
     }
 
     recordingSessionRef.current = false;
+    setRecordingActive(false);
+    let recordingUri = null;
 
     try {
       if (audioRecorder.isRecording) {
@@ -229,7 +323,7 @@ export default function MessageInput({ value, onChangeText, onSend }) {
 
       if (!isCurrentLifecycle(generation)) return;
 
-      const uri = audioRecorder.uri;
+      recordingUri = audioRecorder.uri;
 
       await setAudioModeAsync({
         allowsRecording: false,
@@ -238,11 +332,11 @@ export default function MessageInput({ value, onChangeText, onSend }) {
 
       if (!isCurrentLifecycle(generation)) return;
 
-      if (!uri) {
+      if (!recordingUri) {
         throw new Error("The recording did not produce a file.");
       }
 
-      await transcribeAudio(uri, generation);
+      await transcribeAudio(recordingUri, generation);
     } catch (error) {
       if (isCurrentLifecycle(generation)) {
         await setAudioModeAsync({
@@ -260,6 +354,8 @@ export default function MessageInput({ value, onChangeText, onSend }) {
             : "The recording could not be processed."
         );
       }
+    } finally {
+      await releaseRecordingFile(recordingUri || audioRecorder.uri);
     }
   };
 
@@ -282,16 +378,7 @@ export default function MessageInput({ value, onChangeText, onSend }) {
     );
 
     try {
-      const formData = new FormData();
-  
-      formData.append("file", {
-        uri,
-        type: Platform.OS === "web" ? "audio/webm" : "audio/m4a",
-        name:
-          Platform.OS === "web"
-            ? "recording.webm"
-            : "recording.m4a",
-      });
+      const formData = await buildVoiceUploadFormData(uri, Platform.OS);
   
       // Get the current Firebase user
       const user = auth.currentUser;
@@ -353,11 +440,8 @@ export default function MessageInput({ value, onChangeText, onSend }) {
         );
       }
   
-      sendMessageSafely({
-        text: transcript,
-        imageUri: null,
-        isUser: true,
-      }, generation);
+      onChangeText?.(mergeTranscriptIntoComposer(value, transcript));
+      setVoiceMode(false);
     } catch (error) {
       const isCurrentRequest =
         isCurrentLifecycle(generation) &&
@@ -390,31 +474,48 @@ export default function MessageInput({ value, onChangeText, onSend }) {
     }
   };
 
-  const handlePressIn = async () => {
+  const beginRecording = async () => {
     const attempt = recordingAttemptRef.current + 1;
     recordingAttemptRef.current = attempt;
     recordingPressIntentRef.current = true;
     await startRecording(attempt);
   };
 
-  const handlePressOut = async () => {
-    recordingAttemptRef.current += 1;
-    await stopRecordingAndTranscribe();
+  const toggleVoiceRecording = async () => {
+    if (recordingSessionRef.current || audioRecorder.isRecording) {
+      recordingAttemptRef.current += 1;
+      await stopRecordingAndTranscribe();
+      return;
+    }
+
+    await beginRecording();
+  };
+
+  const enterVoiceMode = () => {
+    setVoiceMode(true);
+    void beginRecording();
   };
 
   const leaveVoiceMode = async () => {
     const generation = lifecycleGenerationRef.current;
     recordingAttemptRef.current += 1;
+    recordingStartPendingRef.current = false;
     recordingPressIntentRef.current = false;
     recordingSessionRef.current = false;
+    setRecordingActive(false);
+    clearTimeout(recordingLimitTimeoutRef.current);
+    recordingLimitTimeoutRef.current = null;
+    let recordingUri = audioRecorder.uri;
 
     try {
       if (audioRecorder.isRecording) {
         await audioRecorder.stop();
       }
+      recordingUri = audioRecorder.uri || recordingUri;
     } catch (error) {
       console.error("Failed to cancel recording:", error);
     } finally {
+      await releaseRecordingFile(recordingUri || audioRecorder.uri);
       await setAudioModeAsync({
         allowsRecording: false,
         playsInSilentMode: true,
@@ -426,11 +527,14 @@ export default function MessageInput({ value, onChangeText, onSend }) {
 
   const voiceButtonText = transcribing
     ? "Transcribing..."
-    : recorderState.isRecording
-      ? "Release to Send"
-      : receiving
-        ? "Waiting..."
-        : "Hold to Talk";
+    : recordingStarting
+      ? "Starting..."
+      : recorderState.isRecording || recordingActive
+        ? "Tap to Transcribe"
+        : receiving
+          ? "Waiting..."
+          : "Tap to Record";
+  const showSendButton = shouldShowSendButton(value);
 
   return (
     <View
@@ -447,19 +551,29 @@ export default function MessageInput({ value, onChangeText, onSend }) {
       {!voiceMode ? (
         <>
           <TextInput
+            ref={composerInputRef}
             editable={!receiving && !transcribing}
+            multiline
+            scrollEnabled={composerLayout.scrollEnabled}
             style={[
               styles.input,
               {
                 fontSize,
-                paddingVertical: fontSize * 0.5,
+                height: composerLayout.height,
+                lineHeight: composerLayout.lineHeight,
+                maxHeight: composerLayout.maximumHeight,
+                minHeight: composerLayout.minimumHeight,
+                paddingVertical: composerLayout.paddingVertical,
                 color: theme.inputText,
                 backgroundColor: theme.inputBackground,
                 borderColor: theme.border,
               },
             ]}
             value={value}
-            onChangeText={onChangeText}
+            onChangeText={handleComposerTextChange}
+            onContentSizeChange={({ nativeEvent }) => {
+              setComposerContentHeight(nativeEvent.contentSize.height);
+            }}
             placeholder={
               receiving
                 ? "Waiting for response..."
@@ -468,10 +582,10 @@ export default function MessageInput({ value, onChangeText, onSend }) {
                   : "Type a message..."
             }
             placeholderTextColor={theme.textPlaceholder}
-            returnKeyType="send"
-            onSubmitEditing={handleSendText}
+            submitBehavior="newline"
+            textAlignVertical="top"
             accessibilityLabel="Chat message"
-            accessibilityHint="Type a message, then use the keyboard send action."
+            accessibilityHint="Type a message, then tap Send. Press Enter for a new line."
           />
 
           <TouchableOpacity
@@ -482,14 +596,21 @@ export default function MessageInput({ value, onChangeText, onSend }) {
                 opacity: receiving || transcribing ? 0.5 : 1,
               },
             ]}
-            onPress={() => setVoiceMode(true)}
+            onPress={showSendButton ? handleSendText : enterVoiceMode}
             disabled={receiving || transcribing}
             accessibilityRole="button"
-            accessibilityLabel="Use voice input"
+            accessibilityLabel={
+              showSendButton ? "Send message" : "Use voice input"
+            }
+            accessibilityHint={
+              showSendButton
+                ? "Send the text in the chat message field."
+                : "Open voice transcription controls."
+            }
             accessibilityState={{ disabled: receiving || transcribing }}
           >
             <Ionicons
-              name="mic"
+              name={showSendButton ? "send" : "mic"}
               size={fontSize * 1.2}
               color={theme.inputBackground}
             />
@@ -502,21 +623,21 @@ export default function MessageInput({ value, onChangeText, onSend }) {
               styles.voiceButton,
               {
                 backgroundColor: theme.inputBackground,
-                borderColor: recorderState.isRecording
-                  ? theme.actionButton
-                  : theme.border,
-                opacity: receiving ? 0.5 : 1,
+                borderColor:
+                  recorderState.isRecording || recordingActive
+                    ? theme.actionButton
+                    : theme.border,
+                opacity: receiving || recordingStarting ? 0.5 : 1,
               },
             ]}
-            onPressIn={handlePressIn}
-            onPressOut={handlePressOut}
-            disabled={receiving || transcribing}
+            onPress={toggleVoiceRecording}
+            disabled={receiving || transcribing || recordingStarting}
             accessibilityRole="button"
             accessibilityLabel={voiceButtonText}
-            accessibilityHint="Press and hold to record, then release to transcribe and send."
+            accessibilityHint="Tap once to start recording, then tap again to place the transcript in the message field."
             accessibilityState={{
-              disabled: receiving || transcribing,
-              busy: transcribing,
+              disabled: receiving || transcribing || recordingStarting,
+              busy: transcribing || recordingStarting,
             }}
           >
             {transcribing ? (
@@ -572,12 +693,12 @@ const styles = StyleSheet.create({
   container: {
     flexDirection: "row",
     padding: 10,
-    alignItems: "center",
+    alignItems: "flex-end",
     borderTopWidth: 1,
   },
   input: {
     flex: 1,
-    borderWidth: 1,
+    borderWidth: COMPOSER_BORDER_WIDTH,
     borderRadius: 20,
     paddingHorizontal: 15,
     marginHorizontal: 5,

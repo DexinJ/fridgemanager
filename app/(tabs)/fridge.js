@@ -310,18 +310,26 @@ export default function FridgeScreen() {
         .join("\n");
 
       const prompt = `
-Suggest 5 quick recipe ideas using these items:
+Recommend 5 quick recipes using as many of these selected fridge items as practical:
 ${ingredientLines}
 
 For each recipe:
-- Title
+- Linked title
+- Why it fits these ingredients and saved preferences
+- Verified time and calories per serving when available
+- Missing ingredients
 - 2–4 short steps
 - 1–2 optional add-ins (common staples)
 `.trim();
 
       try {
         router.push("/chat");
-        await streamMessage({ text: prompt, language: "en" });
+        await streamMessage({
+          text: prompt,
+          language: "en",
+          intent: "recipe_recommendation",
+          selectedIngredients: items,
+        });
       } catch (e) {
         if (
           e?.code !== "REQUEST_CANCELLED" &&

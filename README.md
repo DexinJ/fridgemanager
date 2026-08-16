@@ -479,7 +479,9 @@ The application’s `GlobalContext` centralizes most shared state and persistenc
 
 ## WebSocket Chat
 
-The AI chat can communicate with the backend through WebSocket.
+Pantrio Cloud AI communicates with the authenticated backend through WebSocket.
+Apple Intelligence runs through the local Foundation Models module on supported
+devices when it is selected in Settings.
 
 Example connection:
 

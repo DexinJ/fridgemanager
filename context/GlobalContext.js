@@ -15,6 +15,7 @@ import React, {
 import { AppState, useColorScheme } from "react-native";
 import { v4 as uuidv4 } from "uuid";
 import { API_BASE_URL } from "../api/backendConfig";
+import { resolveAiProvider } from "../api/aiProviderPolicy";
 import { fetchWithTimeout } from "../api/fetchWithTimeout";
 import { loadChatData } from "../api/memoryManager";
 import { pruneChatAttachments } from "../api/chatAttachments";
@@ -76,8 +77,13 @@ import {
   buildReminderSyncSignature,
   canSynchronizeReminders,
 } from "../utils/reminderPolicy";
+import {
+  createDefaultRecipePreferences,
+  normalizeRecipePreferences,
+  patchRecipePreferences,
+  resetRecipePreferences as createResetRecipePreferences,
+} from "../utils/recipePreferences";
 
-const AI_PROVIDER_VALUES = new Set(["pantrio", "apple", "custom"]);
 const STORAGE_SLICE_NAMES = ["fridge", "shopping", "settings", "chat"];
 const DEFAULT_URGENCY_DAYS = Object.freeze({
   expired: 0,
@@ -185,11 +191,10 @@ function mergeStoredSettings(previousSettings, parsedSettings) {
   const storedUser = isPlainRecord(parsedSettings.user)
     ? parsedSettings.user
     : {};
-  const restoredAiProvider = AI_PROVIDER_VALUES.has(storedAdvanced.aiProvider)
-    ? storedAdvanced.aiProvider
-    : storedAdvanced.useCustomAi
-      ? "custom"
-      : "pantrio";
+  const restoredAiProvider = resolveAiProvider(
+    storedAdvanced.aiProvider,
+    storedAdvanced.useCustomAi
+  );
   const reminderPermissionRequested =
     storedNotifications.reminderPermissionRequested === true;
 
@@ -225,6 +230,9 @@ function mergeStoredSettings(previousSettings, parsedSettings) {
           : {}),
       },
     },
+    recipePreferences: normalizeRecipePreferences(
+      parsedSettings.recipePreferences ?? previousSettings.recipePreferences
+    ),
     user: { ...previousSettings.user, ...storedUser },
   };
 }
@@ -270,6 +278,7 @@ export const GlobalProvider = ({
         remindDays: 5,
         urgencyDays: DEFAULT_URGENCY_DAYS,
       },
+      recipePreferences: createDefaultRecipePreferences(),
       user: {
         uid: null,
         name: "freeUser",
@@ -1236,6 +1245,23 @@ export const GlobalProvider = ({
     }));
   };
 
+  const updateRecipePreferences = (patchOrUpdater) => {
+    setSettings((previous) => ({
+      ...previous,
+      recipePreferences: patchRecipePreferences(
+        previous.recipePreferences,
+        patchOrUpdater
+      ),
+    }));
+  };
+
+  const resetRecipePreferences = () => {
+    setSettings((previous) => ({
+      ...previous,
+      recipePreferences: createResetRecipePreferences(),
+    }));
+  };
+
   const setUsername = (name) => {
     setSettings((prev) => ({
       ...prev,
@@ -2085,6 +2111,8 @@ export const GlobalProvider = ({
     addPresetTagToItem,
     removePresetTagFromItem,
     updateSetting,
+    updateRecipePreferences,
+    resetRecipePreferences,
     setUsername,
     clearAllData,
   };
@@ -2106,6 +2134,8 @@ export const GlobalProvider = ({
       addPresetTagToItem: call("addPresetTagToItem"),
       removePresetTagFromItem: call("removePresetTagFromItem"),
       updateSetting: call("updateSetting"),
+      updateRecipePreferences: call("updateRecipePreferences"),
+      resetRecipePreferences: call("resetRecipePreferences"),
       setUsername: call("setUsername"),
       clearAllData: call("clearAllData"),
     };
@@ -2151,6 +2181,8 @@ export const GlobalProvider = ({
       addPresetTagToItem: actions.addPresetTagToItem,
       removePresetTagFromItem: actions.removePresetTagFromItem,
       updateSetting: actions.updateSetting,
+      updateRecipePreferences: actions.updateRecipePreferences,
+      resetRecipePreferences: actions.resetRecipePreferences,
       setUsername: actions.setUsername,
       theme,
       clearAllData: actions.clearAllData,
