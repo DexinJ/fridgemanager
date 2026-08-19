@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
   COMPOSER_BORDER_WIDTH,
   MAX_COMPOSER_LINES,
   calculateComposerLayout,
-  measureWebComposerContentHeight,
 } from "../utils/composerLayout.js";
 
 test("composer grows with measured content through six visible lines", () => {
@@ -62,16 +62,13 @@ test("cleared or invalid content returns to a safe one-line height", () => {
   assert.equal(cleared.lineHeight, 22);
 });
 
-test("web measurement ignores the capped outer height so deleted text shrinks", () => {
-  const textarea = {
-    intrinsicHeight: 40,
-    style: { height: "150px" },
-    get scrollHeight() {
-      return this.style.height === "0px" ? this.intrinsicHeight : 150;
-    },
-  };
+test("composer input never pins an explicit height; native growth uses min/max", () => {
+  const source = readFileSync(
+    new URL("../components/MessageInput.js", import.meta.url),
+    "utf8"
+  );
 
-  assert.equal(measureWebComposerContentHeight(textarea), 40);
-  assert.equal(textarea.style.height, "150px");
-  assert.equal(measureWebComposerContentHeight(null), null);
+  assert.doesNotMatch(source, /height: composerLayout\.height/);
+  assert.match(source, /minHeight: composerLayout\.minimumHeight/);
+  assert.match(source, /maxHeight: composerLayout\.maximumHeight/);
 });

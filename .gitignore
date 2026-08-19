@@ -6,19 +6,15 @@ node_modules/
 # Expo
 .expo/
 dist/
-web-build/
 expo-env.d.ts
 
 # Native
-.kotlin/
 *.orig.*
-*.jks
 *.p8
 *.p12
 *.key
 *.mobileprovision
 GoogleService-Info.plist
-google-services.json
 # Metro
 .metro-health-check*
 
@@ -41,7 +37,6 @@ yarn-error.*
 app-example
 
 /ios
-/android
 .env.local
 
 .env.local

@@ -18,7 +18,6 @@ import {
   Keyboard,
   KeyboardAvoidingView,
   Modal,
-  Platform,
   SectionList,
   StyleSheet,
   Text,
@@ -202,11 +201,11 @@ export default function ShoppingListScreen() {
   useFocusEffect(
     useCallback(() => {
       const showSub = Keyboard.addListener(
-        Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow",
+        "keyboardWillShow",
         () => setKeyboardVisible(true)
       );
       const hideSub = Keyboard.addListener(
-        Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide",
+        "keyboardWillHide",
         () => setKeyboardVisible(false)
       );
 
@@ -608,8 +607,8 @@ export default function ShoppingListScreen() {
   return (
     <KeyboardAvoidingView
       style={{ flex: 1 }}
-      behavior={Platform.OS === "ios" ? "padding" : "height"}
-      keyboardVerticalOffset={Platform.OS === "ios" ? insets.top : insets.bottom}
+      behavior="padding"
+      keyboardVerticalOffset={insets.top}
     >
       <View
         style={[

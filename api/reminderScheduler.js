@@ -1,5 +1,4 @@
 import * as Notifications from "expo-notifications";
-import { Platform } from "react-native";
 import {
   buildExpirationReminderSchedule,
   countItemsExpiringWithin,
@@ -7,22 +6,18 @@ import {
 import { createLatestTaskQueue } from "../utils/latestTaskQueue";
 
 const REMINDER_MARKER = "pantrio-local-reminder-v1";
-const ANDROID_CHANNEL_ID = "pantrio-reminders";
 const reminderTaskQueue = createLatestTaskQueue();
 
-if (Platform.OS !== "web") {
-  Notifications.setNotificationHandler({
-    handleNotification: async () => ({
-      shouldShowBanner: true,
-      shouldShowList: true,
-      shouldPlaySound: false,
-      shouldSetBadge: false,
-    }),
-  });
-}
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: false,
+    shouldSetBadge: false,
+  }),
+});
 
 async function cancelPantrioRemindersRaw() {
-  if (Platform.OS === "web") return;
   const scheduled = await Notifications.getAllScheduledNotificationsAsync();
   const cancellationResults = await Promise.allSettled(
     scheduled
@@ -54,7 +49,6 @@ async function ensurePermission() {
 }
 
 export async function requestReminderPermissions() {
-  if (Platform.OS === "web") return false;
   const current = await Notifications.getPermissionsAsync();
   if (current.granted) return true;
   if (!current.canAskAgain) return false;
@@ -63,8 +57,6 @@ export async function requestReminderPermissions() {
 }
 
 async function performReminderSync({ settings, fridgeItems }) {
-  if (Platform.OS === "web") return { scheduled: 0, permission: "unsupported" };
-
   await cancelPantrioRemindersRaw();
 
   const dailyEnabled = Boolean(settings?.notifications?.dailyReminders);
@@ -82,16 +74,7 @@ async function performReminderSync({ settings, fridgeItems }) {
     };
   }
 
-  if (Platform.OS === "android") {
-    await Notifications.setNotificationChannelAsync(ANDROID_CHANNEL_ID, {
-      name: "Pantrio reminders",
-      importance: Notifications.AndroidImportance.DEFAULT,
-    });
-  }
-
   const requests = [];
-  const triggerChannel =
-    Platform.OS === "android" ? { channelId: ANDROID_CHANNEL_ID } : {};
   const remindDays = settings?.expiration?.remindDays ?? 5;
 
   if (dailyEnabled) {
@@ -108,7 +91,6 @@ async function performReminderSync({ settings, fridgeItems }) {
         type: Notifications.SchedulableTriggerInputTypes.DAILY,
         hour: 9,
         minute: 0,
-        ...triggerChannel,
       },
     });
   }
@@ -129,7 +111,6 @@ async function performReminderSync({ settings, fridgeItems }) {
         trigger: {
           type: Notifications.SchedulableTriggerInputTypes.DATE,
           date: reminder.trigger,
-          ...triggerChannel,
         },
       });
     }

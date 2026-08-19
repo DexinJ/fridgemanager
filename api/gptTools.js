@@ -457,8 +457,11 @@ export function useGPTTools() {
       return {
         ok: true,
         proposalShown: true,
+        committed: false,
+        actionId,
         itemCount: safeItems.length,
-        message: "A single add-to-fridge confirmation card was shown.",
+        message:
+          "The add-to-fridge confirmation card is shown to the user. No items have been added to the fridge yet; the user must tap the card's button to confirm. Tell the user their items are ready to review and ask them to confirm on the card. Never say items were added or that the fridge was updated until the user confirms.",
       };
     },
     

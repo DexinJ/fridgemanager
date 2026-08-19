@@ -1,7 +1,6 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
-import { Platform } from "react-native";
 
 const SECURE_FIREBASE_KEY_PREFIX = "pantrio.firebase.auth.v1.";
 const SECURE_CHUNK_MARKER = "pantrio-secure-chunks-v1";
@@ -139,7 +138,6 @@ function warnAboutFallback(error) {
 async function secureStoreSupported() {
   if (!secureStoreAvailabilityPromise) {
     secureStoreAvailabilityPromise = (async () => {
-      if (Platform.OS === "web") return false;
       try {
         const available = await SecureStore.isAvailableAsync();
         if (!available) {

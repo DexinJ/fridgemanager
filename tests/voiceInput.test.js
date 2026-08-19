@@ -35,7 +35,6 @@ test("native transcription uploads retain the React Native file descriptor", asy
 
   const formData = await buildVoiceUploadFormData(
     "file:///cache/recording.m4a",
-    "ios",
     { FormDataImpl: FakeFormData }
   );
 
@@ -49,19 +48,4 @@ test("native transcription uploads retain the React Native file descriptor", asy
       },
     ],
   ]);
-});
-
-test("web transcription converts and normalizes a Safari MP4 recording", async () => {
-  const recording = new Blob(["voice bytes"], {
-    type: "video/mp4;codecs=mp4a.40.2",
-  });
-  const formData = await buildVoiceUploadFormData("blob:recording", "web", {
-    fetchImpl: async () => new Response(recording),
-  });
-  const uploadedFile = formData.get("file");
-
-  assert.equal(uploadedFile instanceof Blob, true);
-  assert.equal(uploadedFile.type, "audio/mp4");
-  assert.equal(uploadedFile.name, "recording.m4a");
-  assert.equal(await uploadedFile.text(), "voice bytes");
 });

@@ -9,6 +9,7 @@ import {
   View,
 } from "react-native";
 import ImageViewing from "./ImageViewer";
+import MarkdownText from "./MarkdownText";
 import { getLinkPreview } from "link-preview-js";
 import { GlobalContext } from "../context/GlobalContext";
 import {
@@ -38,6 +39,7 @@ function MessageBubble({ text, imageUri, isUser }) {
   const { settings, theme } = useContext(GlobalContext);
   const fontSize = settings?.ux?.fontSize || 16;
   const incognito = Boolean(settings?.privacy?.incognito);
+  const chatgptStyle = Boolean(settings?.chat?.chatgptStyle);
   const autoLoadPreview = shouldAutoLoadLinkPreview({ incognito });
 
   const [previewVisible, setPreviewVisible] = useState(false);
@@ -171,24 +173,39 @@ function MessageBubble({ text, imageUri, isUser }) {
 
   // --- Case 2: text + link previews (Google-ish cards OUTSIDE bubble) ---
   return (
-    <View style={[styles.messageGroup, isUser ? styles.userAlign : styles.aiAlign]}>
+    <View
+      style={[
+        styles.messageGroup,
+        chatgptStyle ? styles.messageGroupChatgpt : null,
+        isUser ? styles.userAlign : styles.aiAlign,
+      ]}
+    >
       {/* --- Bubble (text only) --- */}
       <View
         style={[
           styles.bubble,
           { backgroundColor: isUser ? theme.userBubble : theme.aiBubble },
           isUser ? styles.userBubble : styles.aiBubble,
+          chatgptStyle && !isUser ? styles.aiBubbleChatgpt : null,
         ]}
       >
         {displayText ? (
-          <Text selectable style={[styles.text, { fontSize, color: theme.textPrimary }]}>
-            {displayText}
-          </Text>
+          isUser ? (
+            <Text
+              selectable
+              style={[styles.text, { fontSize, color: theme.textPrimary }]}
+            >
+              {displayText}
+            </Text>
+          ) : (
+            <MarkdownText text={displayText} theme={theme} fontSize={fontSize} />
+          )
         ) : null}
       </View>
 
-      {/* --- Link preview cards OUTSIDE the bubble --- */}
-      {!!urls.length && (
+      {/* Link preview cards OUTSIDE the bubble: user messages only, since
+          assistant messages render preview cards inline via MarkdownText. */}
+      {isUser && !!urls.length && (
         <View style={[styles.linkList, isUser ? styles.userAlign : styles.aiAlign]}>
           {urls.map((url) => {
             const meta = metaByUrl.get(url);
@@ -200,7 +217,7 @@ function MessageBubble({ text, imageUri, isUser }) {
               style={[
                 styles.linkCard,
                 {
-                  backgroundColor: theme.card,
+                  backgroundColor: theme.inputBackground,
                   borderColor: theme.border ?? "rgba(0,0,0,0.12)",
                 },
               ]}
@@ -286,12 +303,22 @@ const styles = StyleSheet.create({
     maxWidth: "90%",
   },
 
+  messageGroupChatgpt: {
+    maxWidth: "100%",
+  },
+
   bubble: {
     maxWidth: "75%",
     padding: 10,
     borderRadius: 15,
     marginVertical: 5,
     flexShrink: 1,
+  },
+  aiBubbleChatgpt: {
+    maxWidth: "100%",
+    backgroundColor: "transparent",
+    alignSelf: "flex-start",
+    borderBottomLeftRadius: 0,
   },
   userBubble: {
     alignSelf: "flex-end",
@@ -308,7 +335,7 @@ const styles = StyleSheet.create({
   thumbnail: {
     width: 200,
     height: 200,
-    borderRadius: 12,
+    borderRadius: 10,
     marginTop: 6,
   },
 
@@ -322,18 +349,13 @@ const styles = StyleSheet.create({
     gap: 10, // if unsupported in your RN version, remove and add marginBottom to linkCard
   },
 
-  // --- Google-ish large card ---
+  // --- Link preview card (matches the markdown block style) ---
   linkCard: {
     width: "85%",
     maxWidth: 360,
-    borderRadius: 16,
+    borderRadius: 10,
     overflow: "hidden",
     borderWidth: 1,
-
-    shadowOpacity: 0.12,
-    shadowRadius: 10,
-    shadowOffset: { width: 0, height: 6 },
-    elevation: 3, 
   },
 
   linkBody: {

@@ -438,6 +438,7 @@ export default function SettingsScreen() {
   const [remindDays, setRemindDays] = useState(
     settings?.expiration?.remindDays ?? 5
   );
+  const customUrgency = settings?.expiration?.customUrgency === true;
   const [fontSizeDraft, setFontSizeDraft] = useState(null);
   const displayedFontSize = fontSizeDraft ?? settings?.ux?.fontSize ?? 16;
 
@@ -2326,6 +2327,27 @@ export default function SettingsScreen() {
             </View>
 
             <View style={stylesWithFont.settingRow}>
+              <View style={stylesWithFont.settingCopy}>
+                <Text style={stylesWithFont.label}>ChatGPT-style chat</Text>
+                <Text style={stylesWithFont.helpText}>
+                  Compact chat window with an inline composer.
+                </Text>
+              </View>
+
+              <Switch
+                accessibilityLabel="ChatGPT-style chat"
+                value={!!settings?.chat?.chatgptStyle}
+                onValueChange={(val) =>
+                  updateSetting("chat", "chatgptStyle", val)
+                }
+                trackColor={{
+                  true: theme.actionButton,
+                  false: theme.border,
+                }}
+              />
+            </View>
+
+            <View style={stylesWithFont.settingRow}>
               <View style={stylesWithFont.sliderSetting}>
                 <Text style={stylesWithFont.label}>
                   Font Size: {displayedFontSize}
@@ -2646,32 +2668,72 @@ export default function SettingsScreen() {
               </View>
             </View>
 
-            <TouchableOpacity
-              style={stylesWithFont.settingRow}
-              onPress={() =>
-                setShowUrgencyThresholds((visible) => !visible)
-              }
-              accessibilityRole="button"
-              accessibilityLabel="Advanced expiration thresholds"
-              accessibilityState={{ expanded: showUrgencyThresholds }}
-            >
+            <View style={stylesWithFont.settingRow}>
               <View style={stylesWithFont.settingCopy}>
-                <Text style={stylesWithFont.accountCardTitle}>
-                  Advanced expiration thresholds
+                <Text style={stylesWithFont.label}>
+                  Custom urgency thresholds
                 </Text>
                 <Text style={stylesWithFont.helpText}>
-                  Choose when items are labeled Eat first, Use soon, or longer
-                  lasting.
+                  {customUrgency
+                    ? "Use your own day ranges for urgency labels."
+                    : "Use the preset day ranges for urgency labels."}
                 </Text>
               </View>
-              <Ionicons
-                name={showUrgencyThresholds ? "chevron-up" : "chevron-down"}
-                size={fontSize * 1.1}
-                color={theme.textSecondary}
-              />
-            </TouchableOpacity>
 
-            {showUrgencyThresholds ? renderUrgencySliders() : null}
+              <Switch
+                accessibilityLabel="Custom urgency thresholds"
+                value={customUrgency}
+                onValueChange={(val) =>
+                  updateSetting("expiration", "customUrgency", val)
+                }
+                trackColor={{
+                  true: theme.accent,
+                  false: theme.border,
+                }}
+              />
+            </View>
+
+            {customUrgency ? (
+              <>
+                <TouchableOpacity
+                  style={stylesWithFont.settingRow}
+                  onPress={() =>
+                    setShowUrgencyThresholds((visible) => !visible)
+                  }
+                  accessibilityRole="button"
+                  accessibilityLabel="Advanced expiration thresholds"
+                  accessibilityState={{ expanded: showUrgencyThresholds }}
+                >
+                  <View style={stylesWithFont.settingCopy}>
+                    <Text style={stylesWithFont.accountCardTitle}>
+                      Advanced expiration thresholds
+                    </Text>
+                    <Text style={stylesWithFont.helpText}>
+                      Choose when items are labeled Eat first, Use soon, or
+                      longer lasting.
+                    </Text>
+                  </View>
+                  <Ionicons
+                    name={
+                      showUrgencyThresholds
+                        ? "chevron-up"
+                        : "chevron-down"
+                    }
+                    size={fontSize * 1.1}
+                    color={theme.textSecondary}
+                  />
+                </TouchableOpacity>
+
+                {showUrgencyThresholds ? renderUrgencySliders() : null}
+              </>
+            ) : (
+              <View style={stylesWithFont.settingRow}>
+                <Text style={stylesWithFont.helpText}>
+                  Preset: Eat first 2d · Use soon 7d · Lasts a while 30d ·
+                  Long keeper 180d
+                </Text>
+              </View>
+            )}
           </View>
         );
 

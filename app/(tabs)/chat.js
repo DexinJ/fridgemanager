@@ -2,7 +2,6 @@ import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import {
   Keyboard,
   KeyboardAvoidingView,
-  Platform,
   StyleSheet,
   View,
 } from "react-native";
@@ -72,11 +71,11 @@ export default function ChatScreen() {
   useFocusEffect(
     useCallback(() => {
       const showSub = Keyboard.addListener(
-        Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow",
+        "keyboardWillShow",
         () => setKeyboardVisible(true)
       );
       const hideSub = Keyboard.addListener(
-        Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide",
+        "keyboardWillHide",
         () => setKeyboardVisible(false)
       );
       return () => {
@@ -250,8 +249,8 @@ export default function ChatScreen() {
   return (
     <KeyboardAvoidingView
       style={{ flex: 1 }}
-      behavior={Platform.OS === "ios" ? "padding" : "height"}
-      keyboardVerticalOffset={Platform.OS === "ios" ? insets.top : insets.bottom}
+      behavior="padding"
+      keyboardVerticalOffset={insets.top}
     >
       <View
         style={[

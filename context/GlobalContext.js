@@ -273,9 +273,13 @@ export const GlobalProvider = ({
         aiBaseUrl: "https://api.openai.com/v1",
         aiModel: "gpt-4o-mini",
       },
+      chat: {
+        chatgptStyle: false,
+      },
       expiration: {
         expirationAlerts: false,
         remindDays: 5,
+        customUrgency: false,
         urgencyDays: DEFAULT_URGENCY_DAYS,
       },
       recipePreferences: createDefaultRecipePreferences(),
@@ -315,16 +319,18 @@ export const GlobalProvider = ({
     [storageHydration]
   );
 
-  const urgencyDays = useMemo(
-    () => ({
-      ...DEFAULT_URGENCY_DAYS,
-      ...(isPlainRecord(settings?.expiration?.urgencyDays)
-        ? settings.expiration.urgencyDays
-        : {}),
-      expired: 0,
-    }),
-    [settings?.expiration?.urgencyDays]
-  );
+  const urgencyDays = useMemo(() => {
+    const stored = isPlainRecord(settings?.expiration?.urgencyDays)
+      ? settings.expiration.urgencyDays
+      : {};
+    return settings?.expiration?.customUrgency === true
+      ? {
+          ...DEFAULT_URGENCY_DAYS,
+          ...stored,
+          expired: 0,
+        }
+      : { ...DEFAULT_URGENCY_DAYS, expired: 0 };
+  }, [settings?.expiration?.customUrgency, settings?.expiration?.urgencyDays]);
   const setUrgencyDays = useCallback((valueOrUpdater) => {
     setSettings((previous) => {
       const current = {

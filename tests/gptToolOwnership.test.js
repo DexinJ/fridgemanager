@@ -105,12 +105,15 @@ test("proposal tools acknowledge one confirmation card with semantic results", a
       },
     ],
   });
-  assert.deepEqual(JSON.parse(JSON.stringify(fridge)), {
-    ok: true,
-    proposalShown: true,
-    itemCount: 1,
-    message: "A single add-to-fridge confirmation card was shown.",
-  });
+  assert.equal(fridge.ok, true);
+  assert.equal(fridge.proposalShown, true);
+  assert.equal(fridge.committed, false);
+  assert.equal(fridge.itemCount, 1);
+  assert.equal(
+    fridge.message,
+    "The add-to-fridge confirmation card is shown to the user. No items have been added to the fridge yet; the user must tap the card's button to confirm. Tell the user their items are ready to review and ask them to confirm on the card. Never say items were added or that the fridge was updated until the user confirms."
+  );
+  assert.equal(fridge.actionId, messages[1].action.actionId);
   assert.equal(messages[1].action.kind, "add_all_to_fridge");
   assert.match(messages[1].action.actionId, /^fridge-proposal-/);
   assert.equal(messages[1].id, messages[1].action.actionId);

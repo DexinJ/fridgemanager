@@ -1,5 +1,4 @@
 import * as FileSystem from "expo-file-system/legacy";
-import { Platform } from "react-native";
 
 const ROOT_DIRECTORY = FileSystem.documentDirectory
   ? `${FileSystem.documentDirectory}pantrio-chat-attachments/`
@@ -26,7 +25,9 @@ export function isManagedChatAttachment(uri) {
 export async function persistChatAttachment(uid, sourceUri) {
   const normalizedSource = String(sourceUri || "").trim();
   if (!normalizedSource) throw new Error("The image file is missing.");
-  if (Platform.OS === "web" || !ROOT_DIRECTORY) return normalizedSource;
+  if (
+    !ROOT_DIRECTORY
+  ) return normalizedSource;
   if (isManagedChatAttachment(normalizedSource)) return normalizedSource;
 
   const directory = userDirectory(uid);
@@ -39,13 +40,13 @@ export async function persistChatAttachment(uid, sourceUri) {
 
 export async function deleteChatAttachments(uid) {
   const directory = userDirectory(uid);
-  if (!directory || Platform.OS === "web") return;
+  if (!directory) return;
   await FileSystem.deleteAsync(directory, { idempotent: true });
 }
 
 export async function pruneChatAttachments(uid, retainedUris = []) {
   const directory = userDirectory(uid);
-  if (!directory || Platform.OS === "web") return;
+  if (!directory) return;
 
   const directoryInfo = await FileSystem.getInfoAsync(directory);
   if (!directoryInfo.exists) return;

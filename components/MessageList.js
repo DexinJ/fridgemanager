@@ -8,7 +8,6 @@ import {
   ScrollView,
   Pressable,
   StyleSheet,
-  Platform,
   TextInput,
   Animated,
   Easing,
@@ -911,7 +910,7 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 18,
     overflow: "hidden",
     borderTopWidth: 1,
-    paddingBottom: Platform.OS === "ios" ? 0 : 0,
+    paddingBottom: 0,
   },
   header: {
     paddingHorizontal: 14,

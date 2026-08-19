@@ -41,7 +41,6 @@ Before running the app, install:
   are declared in `package.json`)
 * npm
 * Expo CLI or Expo Go
-* Android Studio for Android emulation
 * Xcode for iOS simulation on macOS
 * A Firebase project
 * A running Pantrio backend server
@@ -70,7 +69,6 @@ npx expo start
 You can then open the application using:
 
 * Expo Go
-* An Android emulator
 * An iOS simulator
 * A development build
 
@@ -164,7 +162,7 @@ Common providers include:
 * Apple
 
 The app uses the Firebase JavaScript SDK. Copy `.env.example` to `.env` and
-provide the Firebase Web app configuration used by `auth/firebaseClient.js`:
+provide the Firebase Web app configuration used by `auth/firebaseClient.native.js`:
 
 ```env
 EXPO_PUBLIC_FIREBASE_API_KEY=your_api_key
@@ -567,30 +565,6 @@ theme.modalBackground
 
 Avoid hardcoded colors when an equivalent theme value exists.
 
-## Running on Android
-
-Start Expo:
-
-```bash
-npx expo start
-```
-
-Run an Android development build:
-
-```bash
-npx expo run:android
-```
-
-Make sure the Android emulator or physical device can reach the backend server.
-
-For Android emulators, the host machine may be available through:
-
-```text
-http://10.0.2.2:3000
-```
-
-For physical devices, use the computer’s local network IP address.
-
 ## Running on iOS
 
 Start Expo:
@@ -619,12 +593,6 @@ eas login
 eas build:configure
 ```
 
-Build for Android:
-
-```bash
-eas build --profile development --platform android
-```
-
 Build for iOS:
 
 ```bash
@@ -633,12 +601,6 @@ eas build --profile development --platform ios
 
 ## Production Builds
 
-Build Android:
-
-```bash
-eas build --platform android
-```
-
 Build iOS:
 
 ```bash
@@ -646,10 +608,6 @@ eas build --platform ios
 ```
 
 Submit builds:
-
-```bash
-eas submit --platform android
-```
 
 ```bash
 eas submit --platform ios
@@ -667,12 +625,6 @@ Clear the Metro cache:
 
 ```bash
 npx expo start --clear
-```
-
-Run Android:
-
-```bash
-npx expo run:android
 ```
 
 Run iOS:
@@ -780,17 +732,14 @@ Your `.gitignore` should include:
 node_modules/
 .expo/
 dist/
-web-build/
 .env
 .env.*
 !.env.example
-*.jks
 *.p8
 *.p12
 *.key
 *.mobileprovision
 GoogleService-Info.plist
-google-services.json
 ```
 
 Private signing credentials and server credentials must never be committed.

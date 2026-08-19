@@ -16,8 +16,8 @@ import {
 } from "./gptTools";
 import {
   addMessage,
-  checkAndSummarize,
-  formatConversationMemory,
+  // checkAndSummarize,
+  // formatConversationMemory,
 } from "./memoryManager";
 import { getCustomAiProviderSettings } from "./aiProviderSettings";
 import { resolveAiProvider } from "./aiProviderPolicy";
@@ -30,6 +30,7 @@ import {
   RECOMMEND_RECIPES_TOOL,
 } from "./recipeAssistant";
 import { generateAppleIntelligenceToolTurn } from "../modules/apple-intelligence/src";
+import { insertAssistantAboveActionCard } from "../utils/chatMessageOrder";
 
 const DEFAULT_MODEL = "gpt-5";
 const REQUEST_TIMEOUT_MS = 180_000;
@@ -83,7 +84,7 @@ export const DIRECT_AI_TOOLS = [
   ["getFridgeContents", "Get all fridge items.", objectSchema({})],
   ["getShoppingListContents", "Get all shopping-list items.", objectSchema({})],
   ["streamlineLists", "Normalize and optionally retag list items.", objectSchema({ scope: { type: "string", enum: ["shopping", "fridge", "both"] }, retag: { type: "boolean" }, dryRun: { type: "boolean" } })],
-  ["proposeAddAllToFridge", "After the user attaches a fridge image, or explicitly asks to add a listed batch, show one confirmation card. Never use for recipes, recipe ingredients, meal ideas, or ordinary bullet lists.", objectSchema({ items: { type: "array", minItems: 1, items: proposedFridgeItemField }, title: stringField }, ["items"])],
+  ["proposeAddAllToFridge", "After the user attaches a fridge image, or explicitly asks to add a listed batch, show one confirmation card. Nothing is added to the fridge until the user confirms on the card. Never use for recipes, recipe ingredients, meal ideas, or ordinary bullet lists.", objectSchema({ items: { type: "array", minItems: 1, items: proposedFridgeItemField }, title: stringField }, ["items"])],
 ].map(([name, description, parameters]) => ({
   type: "function",
   function: { name, description, parameters },
@@ -277,10 +278,10 @@ const useGptRuntime = () => {
   } = useContext(GlobalContext);
   const {
     setMessages,
-    setSummary,
+    // setSummary,
     setReceiving,
     setWaiting,
-    getChatSnapshot,
+    // getChatSnapshot,
   } = useContext(ChatActionsContext);
   const { applyRealtimeState } = useAccountSession();
 
@@ -289,6 +290,7 @@ const useGptRuntime = () => {
   useEffect(() => {
     toolHandlersRef.current = toolHandlers;
   }, [toolHandlers]);
+  const pendingActionMessageIdRef = useRef(null);
 
   const wsRef = useRef(null);
   const wsReadyRef = useRef(false);
@@ -415,14 +417,15 @@ const useGptRuntime = () => {
       const prev = Array.isArray(previous) ? previous : [];
       const index = prev.findIndex((message) => message?.id === job.messageId);
       if (index < 0) {
-        return [
-          ...prev,
+        return insertAssistantAboveActionCard(
+          prev,
           {
             id: job.messageId,
             role: "assistant",
             content: [{ type: "output_text", text: pendingDelta }],
           },
-        ];
+          job.actionMessageId
+        );
       }
 
       const current = prev[index];
@@ -613,6 +616,12 @@ const useGptRuntime = () => {
           try {
             const resultObj = await handler(args);
             if (inflightRef.current.get(requestId) !== job) return;
+
+            // Remember the confirmation card for this request so the final
+            // assistant text can render above it instead of below it.
+            if (resultObj?.actionId) {
+              job.actionMessageId = resultObj.actionId;
+            }
 
             // Optional: show tool outcome in chat for debugging / transparency
             if (__DEV__ && resultObj?.__context) {
@@ -882,6 +891,9 @@ const useGptRuntime = () => {
           if (error?.code === "REQUEST_CANCELLED") throw error;
           result = { error: error?.message || "Tool failed" };
         }
+        if (result?.actionId) {
+          pendingActionMessageIdRef.current = result.actionId;
+        }
         conversation.push({
           role: "tool",
           tool_call_id: call.id,
@@ -988,6 +1000,9 @@ ${toolDescriptions}`;
         result = { error: error?.message || "Tool failed" };
       }
 
+      if (result?.actionId) {
+        pendingActionMessageIdRef.current = result.actionId;
+      }
       if (name === "recommendRecipes") recipeRecommendationCompleted = true;
       if (isolatedTool) toolsLockedAfterIsolatedAction = true;
       conversation.push({
@@ -1012,6 +1027,7 @@ ${toolDescriptions}`;
     selectedIngredients = [],
   }) => {
     const lifecycleGeneration = lifecycleGenerationRef.current;
+    pendingActionMessageIdRef.current = null;
     const normalizedText =
       typeof text === "string"
         ? text
@@ -1050,27 +1066,28 @@ ${toolDescriptions}`;
       settings?.advanced?.aiProvider,
       settings?.advanced?.useCustomAi
     );
-    const incognito = Boolean(settings?.privacy?.incognito);
-    const currentSummary = getChatSnapshot?.().summary || "";
-    let requestMessages = updatedMessages.slice(-20);
-    let requestSummary = incognito ? "" : currentSummary;
+    // const incognito = Boolean(settings?.privacy?.incognito);
+    // const currentSummary = getChatSnapshot?.().summary || "";
+    // let requestMessages = updatedMessages.slice(-20);
+    const requestMessages = updatedMessages.slice(-5);
+    // let requestSummary = incognito ? "" : currentSummary;
 
-    if (selectedProvider === "pantrio" && !incognito) {
-      const memory = await checkAndSummarize({
-        uid: storageOwnerUid,
-        messages: updatedMessages,
-        summary: currentSummary,
-        setSummary,
-        setMessages,
-        language,
-        signal: lifecycleAbortControllerRef.current.signal,
-      });
-      if (memory.quota) {
-        applyRealtimeState({ quota: memory.quota });
-      }
-      requestMessages = memory.messages;
-      requestSummary = memory.summary;
-    }
+    // if (selectedProvider === "pantrio" && !incognito) {
+    //   const memory = await checkAndSummarize({
+    //     uid: storageOwnerUid,
+    //     messages: updatedMessages,
+    //     summary: currentSummary,
+    //     setSummary,
+    //     setMessages,
+    //     language,
+    //     signal: lifecycleAbortControllerRef.current.signal,
+    //   });
+    //   if (memory.quota) {
+    //     applyRealtimeState({ quota: memory.quota });
+    //   }
+    //   requestMessages = memory.messages;
+    //   requestSummary = memory.summary;
+    // }
     assertCurrentLifecycle(lifecycleGeneration);
 
     // 2) Build messages for backend (now includes image parts)
@@ -1079,12 +1096,13 @@ ${toolDescriptions}`;
       fridgeItems,
       shoppingListItems,
     });
-    const memoryText = selectedProvider === "pantrio"
-      ? formatConversationMemory(requestSummary)
-      : "";
-    const systemText = memoryText
-      ? `${baseSystemText}\n\n${memoryText}`
-      : baseSystemText;
+    // const memoryText = selectedProvider === "pantrio"
+    //   ? formatConversationMemory(requestSummary)
+    //   : "";
+    // const systemText = memoryText
+    //   ? `${baseSystemText}\n\n${memoryText}`
+    //   : baseSystemText;
+    const systemText = baseSystemText;
     const img = normalizedImageUri;
     if (__DEV__ && img) {
       console.log("Attaching an image to the chat request");
@@ -1104,10 +1122,17 @@ ${toolDescriptions}`;
       });
       setWaiting(false);
       if (fullText) {
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", content: [{ type: "output_text", text: fullText }] },
-        ]);
+        setMessages((prev) =>
+          insertAssistantAboveActionCard(
+            prev,
+            {
+              id: `assistant-${makeId()}`,
+              role: "assistant",
+              content: [{ type: "output_text", text: fullText }],
+            },
+            pendingActionMessageIdRef.current
+          )
+        );
       }
       return fullText;
     }
@@ -1121,13 +1146,17 @@ ${toolDescriptions}`;
       });
       setWaiting(false);
       if (fullText) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "assistant",
-            content: [{ type: "output_text", text: fullText }],
-          },
-        ]);
+        setMessages((prev) =>
+          insertAssistantAboveActionCard(
+            prev,
+            {
+              id: `assistant-${makeId()}`,
+              role: "assistant",
+              content: [{ type: "output_text", text: fullText }],
+            },
+            pendingActionMessageIdRef.current
+          )
+        );
       }
       return fullText;
     }

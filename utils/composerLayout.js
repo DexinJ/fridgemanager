@@ -45,16 +45,3 @@ export function calculateComposerLayout({
     scrollEnabled: measuredHeight > maximumHeight,
   };
 }
-
-export function measureWebComposerContentHeight(input) {
-  if (!input?.style) return null;
-
-  const previousHeight = input.style.height;
-  input.style.height = "0px";
-  const measuredHeight = Number(input.scrollHeight);
-  input.style.height = previousHeight;
-
-  return Number.isFinite(measuredHeight) && measuredHeight > 0
-    ? measuredHeight
-    : null;
-}

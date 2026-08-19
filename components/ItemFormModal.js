@@ -5,7 +5,6 @@ import {
   Alert,
   Keyboard,
   Modal,
-  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -138,8 +137,8 @@ export default function ItemFormModal({
   useEffect(() => {
     if (!visible) return;
 
-    const showEvt = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
-    const hideEvt = Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
+    const showEvt = "keyboardWillShow";
+    const hideEvt = "keyboardWillHide";
 
     const subShow = Keyboard.addListener(showEvt, () => {
       if (focusedRef.current) {
@@ -394,7 +393,7 @@ export default function ItemFormModal({
               style={{ flex: 1 }}
               showsVerticalScrollIndicator
               keyboardShouldPersistTaps="handled"
-              keyboardDismissMode={Platform.OS === "ios" ? "on-drag" : "none"}
+              keyboardDismissMode="on-drag"
               contentContainerStyle={{ paddingBottom: 12 }}
             >
               <Text style={[styles.title, { fontSize: fontSize * 1.2, color: theme?.textPrimary }]}>
@@ -578,12 +577,8 @@ export default function ItemFormModal({
                       <DateTimePicker
                         value={expPickedDate}
                         mode="date"
-                        display={Platform.OS === "ios" ? "inline" : "default"}
+                        display="inline"
                         onChange={(event, date) => {
-                          if (Platform.OS !== "ios") {
-                            pickerOpeningRef.current = false;
-                            setPickerVisible(false);
-                          }
                           if (date) {
                             const local = startOfDayLocal(date);
                             if (local) {
@@ -594,18 +589,16 @@ export default function ItemFormModal({
                         }}
                       />
 
-                      {Platform.OS === "ios" && (
-                        <TouchableOpacity
-                          style={[styles.doneBtn, { backgroundColor: theme?.actionButton }]}
-                          activeOpacity={0.85}
-                          onPress={() => {
-                            pickerOpeningRef.current = false;
-                            setPickerVisible(false);
-                          }}
-                        >
-                          <Text style={{ color: "#fff", fontWeight: "900", fontSize }}>Done</Text>
-                        </TouchableOpacity>
-                      )}
+                      <TouchableOpacity
+                        style={[styles.doneBtn, { backgroundColor: theme?.actionButton }]}
+                        activeOpacity={0.85}
+                        onPress={() => {
+                          pickerOpeningRef.current = false;
+                          setPickerVisible(false);
+                        }}
+                      >
+                        <Text style={{ color: "#fff", fontWeight: "900", fontSize }}>Done</Text>
+                      </TouchableOpacity>
                     </View>
                   </Popover>
                 </>

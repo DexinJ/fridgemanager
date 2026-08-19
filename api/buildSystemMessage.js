@@ -1,11 +1,17 @@
 export function buildSystemMessage({ settings, fridgeItems, shoppingListItems }) {
-  const fridgeSummary = fridgeItems.length
-    ? fridgeItems.map((item) => `${item.name} (${item.quantity})`).join(", ")
-    : "nothing";
+  // const fridgeSummary = fridgeItems.length
+  //   ? fridgeItems.map((item) => `${item.name} (${item.quantity})`).join(", ")
+  //   : "nothing";
 
   const shoppingSummary = shoppingListItems.length
     ? shoppingListItems.map((item) => `${item.name} (${item.quantity})`).join(", ")
     : "nothing";
+
+  const contextLines = [
+    // `- Fridge: ${fridgeSummary}`,
+    `- Shopping List: ${shoppingSummary}`,
+    `- User: ${settings?.user?.name || "User"}`,
+  ];
 
   return `
 You are an assistant in a fridge and shopping list app.
@@ -22,11 +28,13 @@ Tools:
 
 Behavior:
 - Be concise.
+- Format responses with Markdown (bold, bullet lists, and fenced code blocks) when it improves readability.
 - Do not expose hidden reasoning.
 - Ask ONE clarifying question only if required.
 - Confirm destructive actions before proceeding.
 - If a request is read-only and answerable from context, reply in text without tools.
 - After a tool result, briefly summarize what changed and suggest the next step if relevant.
+- Confirmation tools (proposeAddAllToFridge, proposeRecipePreferenceUpdate) only show a card for the user to confirm; they change nothing by themselves. After one runs, say the items or preferences are ready to review and ask the user to confirm on the card. Never claim the fridge was updated or preferences were saved until the user confirms.
 - If the latest user message includes a fridge image, detect its items, then call proposeAddAllToFridge exactly once. Never use that tool for recipes, recipe ingredients, meal ideas, or text-only ingredient lists.
 - Do not repeat the user's message.
 - Greetings should be handled once per session with no tool calls.
@@ -46,8 +54,6 @@ Recipes:
 - After recommendRecipes returns, present its results without calling another tool. Only call a shopping-list tool later if the user explicitly asks to add missing items.
 
 Context:
-- Fridge: ${fridgeSummary}
-- Shopping List: ${shoppingSummary}
-- User: ${settings?.user?.name || "User"}
+${contextLines.join("\n")}
 `.trim();
 }

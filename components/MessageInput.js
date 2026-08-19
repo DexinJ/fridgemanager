@@ -11,7 +11,6 @@ import { useContext, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
-  Platform,
   StyleSheet,
   Text,
   TextInput,
@@ -30,7 +29,6 @@ import { useAccountSession } from "../context/AccountSessionContext";
 import {
   COMPOSER_BORDER_WIDTH,
   calculateComposerLayout,
-  measureWebComposerContentHeight,
 } from "../utils/composerLayout";
 import {
   buildVoiceUploadFormData,
@@ -48,23 +46,11 @@ const VOICE_RECORDING_PRESET = {
   sampleRate: 16_000,
   numberOfChannels: 1,
   bitRate: 32_000,
-  android: RecordingPresets.HIGH_QUALITY.android,
-  web: {
-    ...RecordingPresets.LOW_QUALITY.web,
-    bitsPerSecond: 32_000,
-  },
 };
 
 async function releaseRecordingFile(uri) {
   const normalizedUri = typeof uri === "string" ? uri.trim() : "";
   if (!normalizedUri) return;
-
-  if (Platform.OS === "web") {
-    if (normalizedUri.startsWith("blob:") && globalThis.URL?.revokeObjectURL) {
-      globalThis.URL.revokeObjectURL(normalizedUri);
-    }
-    return;
-  }
 
   await FileSystem.deleteAsync(normalizedUri, { idempotent: true }).catch(
     () => {}
@@ -78,6 +64,7 @@ export default function MessageInput({ value, onChangeText, onSend }) {
   const { height: viewportHeight } = useWindowDimensions();
 
   const fontSize = settings?.ux?.fontSize || 16;
+  const chatgptStyle = Boolean(settings?.chat?.chatgptStyle);
 
   const [composerContentHeight, setComposerContentHeight] = useState(0);
   const [voiceMode, setVoiceMode] = useState(false);
@@ -188,14 +175,7 @@ export default function MessageInput({ value, onChangeText, onSend }) {
   };
 
   const handleComposerTextChange = (nextValue) => {
-    if (Platform.OS === "web") {
-      const measuredHeight = measureWebComposerContentHeight(
-        composerInputRef.current
-      );
-      if (measuredHeight !== null) {
-        setComposerContentHeight(measuredHeight);
-      }
-    } else if (!nextValue) {
+    if (!nextValue) {
       setComposerContentHeight(0);
     }
 
@@ -378,7 +358,7 @@ export default function MessageInput({ value, onChangeText, onSend }) {
     );
 
     try {
-      const formData = await buildVoiceUploadFormData(uri, Platform.OS);
+      const formData = await buildVoiceUploadFormData(uri);
   
       // Get the current Firebase user
       const user = auth.currentUser;
@@ -481,19 +461,8 @@ export default function MessageInput({ value, onChangeText, onSend }) {
     await startRecording(attempt);
   };
 
-  const toggleVoiceRecording = async () => {
-    if (recordingSessionRef.current || audioRecorder.isRecording) {
-      recordingAttemptRef.current += 1;
-      await stopRecordingAndTranscribe();
-      return;
-    }
-
-    await beginRecording();
-  };
-
   const enterVoiceMode = () => {
     setVoiceMode(true);
-    void beginRecording();
   };
 
   const leaveVoiceMode = async () => {
@@ -530,19 +499,20 @@ export default function MessageInput({ value, onChangeText, onSend }) {
     : recordingStarting
       ? "Starting..."
       : recorderState.isRecording || recordingActive
-        ? "Tap to Transcribe"
+        ? "Release to Transcribe"
         : receiving
           ? "Waiting..."
-          : "Tap to Record";
+          : "Hold to Talk";
   const showSendButton = shouldShowSendButton(value);
 
   return (
     <View
       style={[
         styles.container,
+        chatgptStyle ? styles.containerChatgpt : null,
         {
           borderColor: theme.border,
-          backgroundColor: theme.card,
+          backgroundColor: chatgptStyle ? theme.inputBackground : theme.card,
         },
       ]}
     >
@@ -557,15 +527,17 @@ export default function MessageInput({ value, onChangeText, onSend }) {
             scrollEnabled={composerLayout.scrollEnabled}
             style={[
               styles.input,
+              chatgptStyle ? styles.inputChatgpt : null,
               {
                 fontSize,
-                height: composerLayout.height,
                 lineHeight: composerLayout.lineHeight,
                 maxHeight: composerLayout.maximumHeight,
                 minHeight: composerLayout.minimumHeight,
                 paddingVertical: composerLayout.paddingVertical,
                 color: theme.inputText,
-                backgroundColor: theme.inputBackground,
+                backgroundColor: chatgptStyle
+                  ? "transparent"
+                  : theme.inputBackground,
                 borderColor: theme.border,
               },
             ]}
@@ -579,7 +551,9 @@ export default function MessageInput({ value, onChangeText, onSend }) {
                 ? "Waiting for response..."
                 : transcribing
                   ? "Transcribing..."
-                  : "Type a message..."
+                  : chatgptStyle
+                    ? "Message Pantrio AI…"
+                    : "Type a message..."
             }
             placeholderTextColor={theme.textPlaceholder}
             submitBehavior="newline"
@@ -630,13 +604,14 @@ export default function MessageInput({ value, onChangeText, onSend }) {
                 opacity: receiving || recordingStarting ? 0.5 : 1,
               },
             ]}
-            onPress={toggleVoiceRecording}
-            disabled={receiving || transcribing || recordingStarting}
+            onPressIn={beginRecording}
+            onPressOut={stopRecordingAndTranscribe}
+            disabled={receiving || transcribing}
             accessibilityRole="button"
             accessibilityLabel={voiceButtonText}
-            accessibilityHint="Tap once to start recording, then tap again to place the transcript in the message field."
+            accessibilityHint="Press and hold to record, then release to place the transcript in the message field."
             accessibilityState={{
-              disabled: receiving || transcribing || recordingStarting,
+              disabled: receiving || transcribing,
               busy: transcribing || recordingStarting,
             }}
           >
@@ -696,12 +671,23 @@ const styles = StyleSheet.create({
     alignItems: "flex-end",
     borderTopWidth: 1,
   },
+  containerChatgpt: {
+    borderTopWidth: 0,
+    borderRadius: 24,
+    marginHorizontal: 10,
+    marginBottom: 8,
+    paddingVertical: 6,
+  },
   input: {
     flex: 1,
     borderWidth: COMPOSER_BORDER_WIDTH,
     borderRadius: 20,
     paddingHorizontal: 15,
     marginHorizontal: 5,
+  },
+  inputChatgpt: {
+    borderWidth: 0,
+    marginHorizontal: 2,
   },
   micButton: {
     padding: 10,

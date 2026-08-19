@@ -141,10 +141,6 @@ function hardenBuildProperties(plugins, productionBuild) {
       BUILD_PROPERTIES_PLUGIN,
       {
         ...options,
-        android: {
-          ...(options.android || {}),
-          usesCleartextTraffic: false,
-        },
       },
     ];
   });
@@ -208,21 +204,9 @@ module.exports = ({ config }) => {
         : {}),
     },
   };
-  const blockedPermissions = new Set(config.android?.blockedPermissions || []);
-  if (productionBuild) {
-    blockedPermissions.add("android.permission.SYSTEM_ALERT_WINDOW");
-  }
-
   return {
     ...config,
     ios,
-    android: {
-      ...(config.android || {}),
-      allowBackup: false,
-      ...(blockedPermissions.size
-        ? { blockedPermissions: [...blockedPermissions] }
-        : {}),
-    },
     plugins,
   };
 };

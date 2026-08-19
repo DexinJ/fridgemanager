@@ -51,6 +51,15 @@ function loadDirectAiTools() {
       },
     ],
     [
+      "../utils/chatMessageOrder",
+      {
+        insertAssistantAboveActionCard: (previous, message) => [
+          ...(Array.isArray(previous) ? previous : []),
+          message,
+        ],
+      },
+    ],
+    [
       "./memoryManager",
       {
         addMessage: () => [],

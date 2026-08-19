@@ -4,7 +4,6 @@ import {
   Animated,
   Dimensions,
   Easing,
-  Platform,
   Pressable,
   SafeAreaView,
   StatusBar,
@@ -112,15 +111,13 @@ export default function OnboardingScreen() {
     }, 220);
   }
 
-  const topPad = Platform.OS === "android" ? 6 : 0;
-
   return (
     <SafeAreaView style={[styles.safe, { backgroundColor: theme.background }]}>
       <StatusBar
         barStyle={theme.background === "#FFFFFF" ? "dark-content" : "light-content"}
       />
 
-      <View style={[styles.container, { backgroundColor: theme.background, paddingTop: topPad }]}>
+      <View style={[styles.container, { backgroundColor: theme.background }]}>
         {/* Header: Back + progress (NO SKIP) */}
         <View style={styles.headerRow}>
           <Pressable
