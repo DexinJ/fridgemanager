@@ -393,7 +393,11 @@ export default function SettingsScreen() {
     urgencyDays,
     setUrgencyDays,
   } = useContext(GlobalContext);
-  const { setMessages, setSummary } = useContext(ChatActionsContext);
+  const {
+    setMessages,
+    setSummary,
+    resetConversations,
+  } = useContext(ChatActionsContext);
 
   const { user, signOut, loggedIn, deleteAccount } = useAuth();
   const {
@@ -2810,12 +2814,14 @@ export default function SettingsScreen() {
                       {
                         text: "Clear",
                         style: "destructive",
-                        onPress: () =>
+                        onPress: () => {
                           clearChatData(
                             storageOwnerUid,
                             setMessages,
                             setSummary
-                          ),
+                          );
+                          resetConversations();
+                        },
                       },
                     ]
                   );

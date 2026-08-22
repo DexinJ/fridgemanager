@@ -21,6 +21,7 @@ import { loadChatData } from "../api/memoryManager";
 import { pruneChatAttachments } from "../api/chatAttachments";
 import { syncLocalReminders } from "../api/reminderScheduler";
 import { migrateLegacyCustomAiProviderSettings } from "../api/aiProviderSettings";
+import { cancelActiveChatWork } from "../api/chatLifecycle";
 import {
   getUserDataPurgeIntent,
   getUserStorageKeys,
@@ -565,7 +566,16 @@ export const GlobalProvider = ({
     [allowedFoodTypeLabels]
   );
 
-  // Conversation state
+  // Conversation state (multiple conversations)
+  const [conversations, setConversations] = useState([]);
+  const [activeConversationId, setActiveConversationIdState] = useState(null);
+  const activeConversationIdRef = useRef(null);
+  activeConversationIdRef.current = activeConversationId;
+  // In-memory payloads keyed by conversation id. Persistence of each
+  // conversation is a follow-up phase; the active conversation continues to
+  // use the existing chatMessages/chatSummary storage.
+  const conversationDataRef = useRef(new Map());
+  const [conversationsVisible, setConversationsVisible] = useState(false);
   const [messages, setMessagesState] = useState([]);
   const setMessages = useCallback((valueOrUpdater) => {
     setMessagesState((previous) => {
@@ -588,6 +598,65 @@ export const GlobalProvider = ({
   });
   chatStateRef.current = { messages, summary, receiving, waiting };
   const getChatSnapshot = useCallback(() => chatStateRef.current, []);
+
+  const saveActiveConversationToRef = useCallback(() => {
+    const activeId = activeConversationIdRef.current;
+    if (!activeId) return;
+    conversationDataRef.current.set(activeId, {
+      messages: chatStateRef.current.messages,
+      summary: chatStateRef.current.summary,
+    });
+  }, []);
+
+  const createConversation = useCallback(() => {
+    const id = uuidv4();
+    const now = new Date().toISOString();
+    saveActiveConversationToRef();
+    cancelActiveChatWork("Switched to a new conversation.");
+    setConversations((previous) => [
+      { id, title: "New chat", createdAt: now, updatedAt: now },
+      ...previous,
+    ]);
+    setActiveConversationIdState(id);
+    setMessages([]);
+    setSummary("");
+    setReceiving(false);
+    setWaiting(false);
+  }, [saveActiveConversationToRef, setMessages, setSummary]);
+
+  const selectConversation = useCallback(
+    (id) => {
+      if (!id || id === activeConversationIdRef.current) return;
+      saveActiveConversationToRef();
+      cancelActiveChatWork("Switched to another conversation.");
+      const data = conversationDataRef.current.get(id);
+      setActiveConversationIdState(id);
+      setMessages(data?.messages || []);
+      setSummary(data?.summary || "");
+      setReceiving(false);
+      setWaiting(false);
+    },
+    [saveActiveConversationToRef, setMessages, setSummary]
+  );
+
+  const resetConversations = useCallback(() => {
+    cancelActiveChatWork("Chat history was cleared.");
+    conversationDataRef.current.clear();
+    setConversations([]);
+    setActiveConversationIdState(null);
+    setMessages([]);
+    setSummary("");
+    setReceiving(false);
+    setWaiting(false);
+  }, [setMessages, setSummary]);
+
+  const activeConversationTitle = useMemo(() => {
+    if (!activeConversationId) return "Chat";
+    return (
+      conversations.find((item) => item.id === activeConversationId)?.title ||
+      "Chat"
+    );
+  }, [activeConversationId, conversations]);
 
   // System theme from device
   const systemScheme = useColorScheme();
@@ -868,6 +937,20 @@ export const GlobalProvider = ({
       if (!chatError) {
         setMessages(chatData.messages);
         setSummary(chatData.summary);
+        conversationDataRef.current.clear();
+        conversationDataRef.current.set("default", {
+          messages: chatData.messages,
+          summary: chatData.summary,
+        });
+        setConversations([
+          {
+            id: "default",
+            title: "Chat",
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          },
+        ]);
+        setActiveConversationIdState("default");
       }
       chatLastSavedAtRef.current = Date.now();
       hydratedStorageOwnerUidRef.current = storageOwnerUid;
@@ -911,8 +994,7 @@ export const GlobalProvider = ({
     if (leavingIncognito) {
       // Incognito messages belong only to that in-memory session. Clearing on
       // exit prevents them from being written when normal persistence resumes.
-      setMessages([]);
-      setSummary("");
+      resetConversations();
       return;
     }
 
@@ -943,6 +1025,7 @@ export const GlobalProvider = ({
   }, [
     incognitoEnabled,
     leavingIncognito,
+    resetConversations,
     setMessages,
     storageHydration.chat.resolved,
     storageHydration.settings.resolved,
@@ -1982,8 +2065,7 @@ export const GlobalProvider = ({
       setFridgeItemsRaw([]);
       setShoppingListItems([]);
       setSettings(defaultSettings);
-      setMessages([]);
-      setSummary("");
+      resetConversations();
       const result = {
         ok: true,
         pendingRetry: false,
@@ -2062,8 +2144,7 @@ export const GlobalProvider = ({
     if (purgeResult.outcomes.shopping) setShoppingListItems([]);
     if (purgeResult.outcomes.settings) setSettings(defaultSettings);
     if (purgeResult.outcomes.chat) {
-      setMessages([]);
-      setSummary("");
+      resetConversations();
     }
 
     const sharedPurgeError = purgeResult.ok
@@ -2225,8 +2306,29 @@ export const GlobalProvider = ({
       setReceiving,
       waiting,
       setWaiting,
+      conversations,
+      activeConversationId,
+      activeConversationTitle,
+      conversationsVisible,
+      setConversationsVisible,
+      createConversation,
+      selectConversation,
+      resetConversations,
     }),
-    [messages, receiving, setMessages, summary, waiting]
+    [
+      messages,
+      receiving,
+      setMessages,
+      summary,
+      waiting,
+      conversations,
+      activeConversationId,
+      activeConversationTitle,
+      conversationsVisible,
+      createConversation,
+      selectConversation,
+      resetConversations,
+    ]
   );
   const chatActionsContextValue = useMemo(
     () => ({
@@ -2235,8 +2337,18 @@ export const GlobalProvider = ({
       setReceiving,
       setWaiting,
       getChatSnapshot,
+      createConversation,
+      selectConversation,
+      resetConversations,
+      setConversationsVisible,
     }),
-    [getChatSnapshot, setMessages]
+    [
+      getChatSnapshot,
+      setMessages,
+      createConversation,
+      selectConversation,
+      resetConversations,
+    ]
   );
 
   return (

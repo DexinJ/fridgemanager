@@ -5,14 +5,46 @@ import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import "react-native-get-random-values";
 import { useAuth } from "../../auth/useAuth";
 import { GptProvider } from "../../api/gpt";
-import { PlainHeader } from "../../components/Header";
+import { IconHeader } from "../../components/Header";
 import {
   AccountSessionProvider,
   useAccountSession,
 } from "../../context/AccountSessionContext";
-import { GlobalContext, GlobalProvider } from "../../context/GlobalContext";
+import {
+  ChatContext,
+  GlobalContext,
+  GlobalProvider,
+} from "../../context/GlobalContext";
 import { AppleSubscriptionProvider } from "../../context/SubscriptionContext";
 import { canExposeAccountData } from "../../context/refreshPolicy";
+
+function ChatTabHeader() {
+  const {
+    activeConversationTitle,
+    createConversation,
+    setConversationsVisible,
+  } = useContext(ChatContext);
+
+  return (
+    <IconHeader
+      title={activeConversationTitle}
+      leftItems={[
+        {
+          icon: "menu-outline",
+          label: "Open conversations",
+          onPress: () => setConversationsVisible(true),
+        },
+      ]}
+      rightItems={[
+        {
+          icon: "add",
+          label: "New chat",
+          onPress: () => createConversation(),
+        },
+      ]}
+    />
+  );
+}
 
 function SessionBackedGlobalProvider({ authUser, children }) {
   const {
@@ -373,7 +405,7 @@ function ThemedTabs() {
       <Tabs.Screen
         name="chat"
         options={{
-          header: () => <PlainHeader title="Chat" />,
+          header: () => <ChatTabHeader />,
           title: "Chat",
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="chatbubble-outline" size={size} color={color} />

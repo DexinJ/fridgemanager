@@ -49,6 +49,7 @@
     "expo-updates": "~57.0.13",
     "firebase": "^12.7.0",
     "link-preview-js": "^4.0.0",
+    "markdown-it": "^10.0.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-native": "0.86.2",

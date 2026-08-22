@@ -1,13 +1,17 @@
+import { Ionicons } from "@expo/vector-icons";
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import {
   Keyboard,
   KeyboardAvoidingView,
   StyleSheet,
+  Text,
+  TouchableOpacity,
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useFocusEffect } from "expo-router";
 import { useGpt } from "../../api/gpt";
+import ConversationListModal from "../../components/ConversationListModal";
 import MessageInput from "../../components/MessageInput";
 import MessageList from "../../components/MessageList";
 import { ChatContext, GlobalContext } from "../../context/GlobalContext";
@@ -45,6 +49,40 @@ function getChatErrorMessage(error) {
   return "Pantrio AI could not complete that request.";
 }
 
+function ChatEmptyState({ theme, onNewChat }) {
+  return (
+    <View style={styles.emptyState}>
+      <Ionicons
+        name="chatbubbles-outline"
+        size={46}
+        color={theme.textSecondary}
+      />
+      <Text style={[styles.emptyTitle, { color: theme.textPrimary }]}>
+        Start a new chat
+      </Text>
+      <Text style={[styles.emptyBody, { color: theme.textSecondary }]}>
+        Ask Pantrio about meals, your fridge, or your shopping list.
+      </Text>
+      <TouchableOpacity
+        onPress={onNewChat}
+        accessibilityRole="button"
+        accessibilityLabel="Start a new chat"
+        style={[
+          styles.emptyButton,
+          { backgroundColor: theme.actionButton },
+        ]}
+      >
+        <Ionicons name="add" size={20} color={theme.actionButtonText} />
+        <Text
+          style={[styles.emptyButtonText, { color: theme.actionButtonText }]}
+        >
+          New chat
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+
 export default function ChatScreen() {
   const [input, setInput] = useState("");
   const insets = useSafeAreaInsets();
@@ -53,8 +91,18 @@ export default function ChatScreen() {
   const { streamMessage } = useGpt();
   const { theme, settings, addManyToFridge, updateRecipePreferences } =
     useContext(GlobalContext);
-  const { messages, setMessages, setWaiting } =
-    useContext(ChatContext);
+  const {
+    messages,
+    setMessages,
+    setWaiting,
+    waiting,
+    conversations,
+    activeConversationId,
+    conversationsVisible,
+    setConversationsVisible,
+    selectConversation,
+    createConversation,
+  } = useContext(ChatContext);
   const mountedRef = useRef(false);
   const sendGenerationRef = useRef(0);
   const appliedUiActionsRef = useRef(new Set());
@@ -262,10 +310,29 @@ export default function ChatScreen() {
         ]}
       >
         <View style={{ flex: 1 }}>
-          <MessageList messages={messages} onUiAction={handleUiAction} />
+          {messages.length === 0 && !waiting ? (
+            <ChatEmptyState theme={theme} onNewChat={createConversation} />
+          ) : (
+            <MessageList messages={messages} onUiAction={handleUiAction} />
+          )}
 
           <MessageInput value={input} onChangeText={setInput} onSend={handleSend} />
         </View>
+
+        <ConversationListModal
+          visible={conversationsVisible}
+          onClose={() => setConversationsVisible(false)}
+          conversations={conversations}
+          activeConversationId={activeConversationId}
+          onSelect={(id) => {
+            selectConversation(id);
+            setConversationsVisible(false);
+          }}
+          onNewChat={() => {
+            createConversation();
+            setConversationsVisible(false);
+          }}
+        />
       </View>
     </KeyboardAvoidingView>
   );
@@ -273,4 +340,34 @@ export default function ChatScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
+  emptyState: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 32,
+    gap: 10,
+  },
+  emptyTitle: {
+    fontSize: 18,
+    fontWeight: "700",
+    marginTop: 4,
+  },
+  emptyBody: {
+    fontSize: 14,
+    lineHeight: 20,
+    textAlign: "center",
+  },
+  emptyButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginTop: 14,
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+    borderRadius: 20,
+  },
+  emptyButtonText: {
+    fontSize: 15,
+    fontWeight: "700",
+  },
 });

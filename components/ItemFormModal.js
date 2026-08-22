@@ -254,7 +254,7 @@ export default function ItemFormModal({
       setExpDaysText("");
     } else {
       setName("");
-      setQuantity("");
+      setQuantity("1");
       setStorage("Fridge");
       setUrgency("Use soon");
       setFoodType("Produce");
@@ -327,7 +327,7 @@ export default function ItemFormModal({
     if (submitLockedRef.current) return;
 
     const n = String(name || "").trim();
-    const q = String(quantity || "").trim();
+    const q = String(quantity || "").trim() || (isEdit ? "" : "1");
 
     if (!n || !q) {
       Alert.alert(isEdit ? "Edit item" : "Add item", "Name and quantity are required.");
@@ -435,6 +435,7 @@ export default function ItemFormModal({
                 placeholderTextColor={theme?.textPlaceholder}
                 value={quantity}
                 onChangeText={setQuantity}
+                selectTextOnFocus
                 returnKeyType="done"
                 onFocus={() => focusAndScroll(quantityRef)}
               />

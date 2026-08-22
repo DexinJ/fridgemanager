@@ -15,6 +15,7 @@ import React, {
   useState,
 } from "react";
 import {
+  Alert,
   Keyboard,
   KeyboardAvoidingView,
   Modal,
@@ -152,7 +153,7 @@ export default function ShoppingListScreen() {
   const fontSize = settings?.ux?.fontSize || 16;
 
   const [newItemName, setNewItemName] = useState("");
-  const [newItemQuantity, setNewItemQuantity] = useState("");
+  const [newItemQuantity, setNewItemQuantity] = useState("1");
   const [checkedItems, setCheckedItems] = useState({});
   const [editMode, setEditMode] = useState(false);
   const [keyboardVisible, setKeyboardVisible] = useState(false);
@@ -280,13 +281,7 @@ export default function ShoppingListScreen() {
   }, [categoryByItemId, deriveItemCategoryLabel, shoppingListItems]);
 
   const handleAdd = () => {
-    if (
-      addLockedRef.current ||
-      !newItemName.trim() ||
-      !newItemQuantity.trim()
-    ) {
-      return;
-    }
+    if (addLockedRef.current || !newItemName.trim()) return;
     addLockedRef.current = true;
 
     const inferredLabel =
@@ -295,9 +290,10 @@ export default function ShoppingListScreen() {
     const categories = normalizeCategoriesArg(inferredLabel);
 
     try {
-      addToShoppingList(newItemName, newItemQuantity, categories);
+      addToShoppingList(newItemName, newItemQuantity.trim() || "1", categories);
+      addLockedRef.current = false;
       setNewItemName("");
-      setNewItemQuantity("");
+      setNewItemQuantity("1");
     } catch (error) {
       addLockedRef.current = false;
       throw error;
@@ -324,13 +320,54 @@ export default function ShoppingListScreen() {
     }
   };
 
+  // Confirm before deleting a single shopping-list item. `afterDelete` is
+  // invoked once the user confirms (e.g. closing the edit modal).
+  const confirmDeleteItem = useCallback(
+    (item, afterDelete) => {
+      if (!item?.id) return;
+      const label = String(item?.name || "").trim();
+      Alert.alert("Delete item", `Delete "${label || "this item"}"?`, [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete",
+          style: "destructive",
+          onPress: () => {
+            removeFromShoppingList(item.id);
+            afterDelete?.();
+          },
+        },
+      ]);
+    },
+    [removeFromShoppingList]
+  );
+
+  // Confirm before bulk-deleting checked shopping-list items.
+  const confirmDeleteItems = useCallback(
+    (ids) => {
+      const safeIds = (Array.isArray(ids) ? ids : []).filter(Boolean);
+      if (safeIds.length === 0) return;
+
+      Alert.alert("Delete items", `Delete ${safeIds.length} item(s)?`, [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete",
+          style: "destructive",
+          onPress: () => {
+            removeManyFromShoppingList(safeIds);
+            setCheckedItems({});
+          },
+        },
+      ]);
+    },
+    [removeManyFromShoppingList]
+  );
+
   const deleteSelectedItems = useCallback(() => {
     const ids = Object.keys(checkedItems).filter((id) => checkedItems[id]);
     if (ids.length === 0) return;
 
-    removeManyFromShoppingList(ids);
-    setCheckedItems({});
-  }, [checkedItems, removeManyFromShoppingList]);
+    confirmDeleteItems(ids);
+  }, [checkedItems, confirmDeleteItems]);
 
   // -------------------------
   // Pills: only show categories that have items
@@ -552,8 +589,7 @@ export default function ShoppingListScreen() {
 
   const deleteActiveItem = () => {
     if (!activeItem?.id) return;
-    removeFromShoppingList(activeItem.id);
-    closeItemMenu();
+    confirmDeleteItem(activeItem, closeItemMenu);
   };
 
   // -----------------------------
@@ -561,10 +597,10 @@ export default function ShoppingListScreen() {
   // -----------------------------
   const handleRowRightAction = useCallback(
     (item) => {
-      if (editMode) removeFromShoppingList(item.id);
+      if (editMode) confirmDeleteItem(item);
       else openItemMenu(item);
     },
-    [editMode, openItemMenu, removeFromShoppingList]
+    [editMode, openItemMenu, confirmDeleteItem]
   );
   const renderRow = useCallback(
     ({ item }) => (
@@ -698,6 +734,7 @@ export default function ShoppingListScreen() {
             placeholderTextColor={theme.textPlaceholder}
             value={newItemQuantity}
             onChangeText={setNewItemQuantity}
+            selectTextOnFocus
             returnKeyType="done"
             onSubmitEditing={handleAdd}
           />

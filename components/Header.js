@@ -24,6 +24,62 @@ export function PlainHeader({ title }) {
 }
 
 /**
+ * General-purpose icon header: centered title with optional icon-button
+ * groups on the left and right.
+ *
+ * Each item: { icon, label, onPress, color?, size? } where `label` is used as
+ * the accessibility label. Kept purely presentational so any screen can reuse
+ * it without chat-specific knowledge.
+ */
+export function IconHeader({ title, leftItems = [], rightItems = [] }) {
+  const { theme } = useContext(GlobalContext);
+  const insets = useSafeAreaInsets();
+  const { width } = useWindowDimensions();
+
+  const renderItem = ({ icon, label, onPress, color, size = 24 }) => (
+    <TouchableOpacity
+      key={label}
+      onPress={onPress}
+      hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+    >
+      <Ionicons name={icon} size={size} color={color || theme.accent} />
+    </TouchableOpacity>
+  );
+
+  return (
+    <View
+      style={[
+        styles.iconHeaderRow,
+        {
+          paddingTop: insets.top,
+          backgroundColor: theme.card,
+          borderBottomColor: theme.border,
+        },
+      ]}
+    >
+      <View style={styles.iconHeaderSide}>
+        {(Array.isArray(leftItems) ? leftItems : []).map(renderItem)}
+      </View>
+      <Text
+        style={[
+          styles.headerText,
+          styles.iconHeaderTitle,
+          { fontSize: width * 0.05, color: theme.textPrimary },
+        ]}
+        numberOfLines={1}
+      >
+        {title}
+      </Text>
+      <View style={styles.iconHeaderSide}>
+        {(Array.isArray(rightItems) ? rightItems : []).map(renderItem)}
+      </View>
+    </View>
+  );
+}
+
+/**
  * ✅ Minimal, backward-compatible upgrade:
  * - Existing screens can keep using: <HeaderWithButton title buttonLabel onPress />
  * - New optional props enable: [Left Button]  Title  [Right Button]
@@ -210,5 +266,24 @@ const styles = StyleSheet.create({
   rightBtnWrap: {
     maxWidth: 70, // optional: keeps "Done" / "Edit" tidy
     alignItems: "flex-end",
+  },
+  iconHeaderRow: {
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderBottomWidth: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  iconHeaderSide: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 18,
+    minWidth: 56,
+  },
+  iconHeaderTitle: {
+    flex: 1,
+    textAlign: "center",
+    paddingHorizontal: 8,
   },
 });
